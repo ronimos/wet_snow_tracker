@@ -140,7 +140,7 @@ class SnowpackProfile:
             used, otherwise they will be `numpy` arrays.
     """
 
-    def __init__(self, filename: str, _load_data: bool = True):
+    def __init__(self, filename: Path | str, _load_data: bool = True):
         """
         Initializes the reader and, by default, processes the specified file.
 
@@ -149,7 +149,9 @@ class SnowpackProfile:
             _load_data (bool, optional): If False, initializes an empty object
                 without reading the file. Used internally. Defaults to True.
         """
-        self.filename: str = filename
+        if isinstance(filename, str):
+            filename = Path(filename)
+        self.filename: Path = filename
         self.metadata: Dict = {}
         self.data: Optional[xr.Dataset] = None
         if _load_data:

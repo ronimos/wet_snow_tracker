@@ -14,12 +14,10 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import plotly.graph_objects as go
 from PIL import Image
+from typing import Any
 
 # Import our new config functions
-from .param_config import (
-                            DEV, INPUT_PATH, 
-                            get_png_path, get_html_path
-                            )
+from .param_config import get_png_path, get_html_path
 
 def _create_thumbnail(png_path: Path, thumb_path: Path, max_size: tuple = (400, 267)):
     """Creates a smaller, web-optimized thumbnail from a larger PNG."""
@@ -32,7 +30,7 @@ def _create_thumbnail(png_path: Path, thumb_path: Path, max_size: tuple = (400, 
     except FileNotFoundError:
         logging.warning("Could not create thumbnail, source image not found at %s", png_path)
 
-def plot_summary_matplotlib(df: pd.DataFrame, file_path: Path, **kwargs):
+def plot_summary_matplotlib(df: pd.DataFrame, file_stem: str, metadata: dict[str, Any]):
     """Generates a static plot using Matplotlib and saves it as a PNG file."""
     fig, ax = plt.subplots(figsize=(14, 8))
 
@@ -48,14 +46,13 @@ def plot_summary_matplotlib(df: pd.DataFrame, file_path: Path, **kwargs):
             df.index,
             df['wet_front_lwc_height'],
             df['highest_wet_point'],
-            where=df['wet_front_lwc_height'].notna().tolist(), # Use tolist() to satisfy linters
+            where=df['wet_front_lwc_height'].notna().tolist(),
             color='cyan', alpha=0.7, interpolate=True, label='Wet Layer Extent'
         )
 
-    station_name = kwargs.get('stationName', file_path.stem)
-    location = (kwargs.get("latitude"), kwargs.get('longitude'))
-    elevation = kwargs.get("altitude")
-    aspect = "Flat" if kwargs.get("slopeAngle") == "0.00" else kwargs.get("slopeAzi")
+    location = (metadata.get("latitude"), metadata.get('longitude'))
+    elevation = metadata.get("altitude")
+    aspect = "Flat" if metadata.get("slopeAngle") == "0.00" else metadata.get("slopeAzi")
     title = f"Wetting Front Tracking\nLocation: {location}, Elevation: {elevation}m, Aspect: {aspect}"
     ax.set_title(title, fontsize=16)
     ax.set_xlabel('Date', fontsize=12)
@@ -72,18 +69,17 @@ def plot_summary_matplotlib(df: pd.DataFrame, file_path: Path, **kwargs):
     fig.autofmt_xdate()
 
     plt.tight_layout()
-    output_filename = get_png_path(station_name)
+    output_filename = get_png_path(file_stem)
     plt.savefig(output_filename, dpi=300)
-    logging.info("Plot saved to: %s", output_filename)
     plt.close(fig)
 
 
-def plot_summary_plotly(df: pd.DataFrame, file_path: Path, **kwargs):
+def plot_summary_plotly(df: pd.DataFrame, file_stem: str, metadata: dict[str, Any]):
     """Generates an interactive plot using Plotly and saves it as an HTML file."""
     fig = go.Figure()
-    station_name = kwargs.get('stationName', file_path.stem)
 
     if 'wet_front_lwc_height' in df.columns and 'highest_wet_point' in df.columns:
+        # This logic creates the shaded area for wet layer extent
         valid_data = df['wet_front_lwc_height'].notna()
         starts = df.index[valid_data & ~valid_data.shift(1).fillna(False)]
         ends = df.index[valid_data & ~valid_data.shift(-1).fillna(False)]
@@ -120,20 +116,25 @@ def plot_summary_plotly(df: pd.DataFrame, file_path: Path, **kwargs):
     if 'wet_front_lwc_height' in df.columns:
         fig.add_trace(go.Scatter(x=df.index, y=df['wet_front_lwc_height'], name='Deepest Wet Front (LWC > 3%)', mode='lines', line=dict(color='red')))
 
-    elevation = kwargs.get("altitude")
-    aspect = "Flat" if kwargs.get("slopeAngle") == "0.00" else kwargs.get("slopeAzi")
-    title = f"Wetting Front Tracking<br>Location: {station_name}, Elevation: {elevation}m, Aspect: {aspect}"
+    location = (metadata.get("latitude"), metadata.get('longitude'))
+    elevation = metadata.get("altitude")
+    aspect = "Flat" if metadata.get("slopeAngle") == "0.00" else metadata.get("slopeAzi")
+    
+    # Create the base title string, exactly like in Matplotlib
+    base_title = f"Wetting Front Tracking\nLocation: {location}, Elevation: {elevation}m, Aspect: {aspect}"
+    
+    # Convert the newline character to an HTML break tag for Plotly
+    plotly_title = base_title.replace('\n', '<br>')
 
     fig.update_layout(
-        title=title,
+        title=plotly_title,
         xaxis_title='Date',
         yaxis_title='Height (cm)',
         legend_title_text='Metrics',
         template='plotly_white'
     )
-    output_filename = get_html_path(station_name)
+    output_filename = get_html_path(file_stem)
     fig.write_html(output_filename)
-    logging.info("Interactive plot saved to: %s", output_filename)
 
 def _load_and_clean_geojson(geojson_path: Path) -> dict | None:
     """Loads and filters a GeoJSON file to remove features with null geometries."""
@@ -175,87 +176,72 @@ def create_folium_map(results_list: list, map_output_path: Path, geojson_path: P
         logging.warning("GeoJSON is empty. Cannot create map.")
         return
         
-    # Create a lookup dictionary from the analysis results
-    # Key: pro_file_path, Value: analysis result dictionary
-    results_lookup = {Path(res['pro_file_path']).name: res for res in results_list}
+    results_lookup = {res['pro_file_path']: res for res in results_list}
 
-    # Center the map on the center of all polygons
-    bounds = polygons_gdf.to_crs("EPSG:4326").total_bounds
-    if len(bounds) == 4:
-        west, south, east, north = bounds
-        map_center_y = (south + north) / 2
-        map_center_x = (west + east) / 2
-        m = folium.Map(location=[map_center_y, map_center_x], zoom_start=8)
-    else: # Fallback if there's no data or bounds are invalid
-        m = folium.Map(location=[40, -105], zoom_start=6) # Default to a central US location
-
-    tooltips = []
-    popups = []
-    for _, row in polygons_gdf.iterrows():
-        pro_path = row['pro_file_path']
-        result = results_lookup.get(Path(pro_path).name)
+    # --- NEW: Helper functions for vectorized operations ---
+    def get_tooltip_html(pro_path):
+        result = results_lookup.get(pro_path)
+        if not result: 
+            return ""
         
-        tooltip_html = "No analysis data available."
-        popup_html = "No analysis data available."
-
-        if result:
-            station_name = result['station_name']
-            
-            # Prepare tooltip content (image)
-            png_path = get_png_path(station_name)
-            thumb_path = png_path.parent / f"{png_path.stem}_thumb.png"
-            _create_thumbnail(png_path, thumb_path)
-            if thumb_path.exists():
-                encoded = base64.b64encode(open(thumb_path, 'rb').read()).decode()
-                tooltip_html = f'<img src="data:image/png;base64,{encoded}" width="400">'
-
-            # Prepare popup content (link)
-            html_path = get_html_path(station_name)
-            if html_path.exists():
-                popup_html = (f"<b>{station_name}</b><br>"
-                              f'<a href="./{html_path.name}" target="_blank">Open Interactive Plot</a>')
+        file_stem = result['file_stem']
+        png_path = get_png_path(file_stem)
+        thumb_path = png_path.parent / f"{png_path.stem}_thumb.png"
+        _create_thumbnail(png_path, thumb_path)
         
-        tooltips.append(tooltip_html)
-        popups.append(popup_html)
-    
-    polygons_gdf['tooltip'] = tooltips
-    polygons_gdf['popup'] = popups
+        if thumb_path.exists():
+            encoded = base64.b64encode(open(thumb_path, 'rb').read()).decode()
+            return f'<img src="data:image/png;base64,{encoded}" width="400">'
+        return ""
 
-    # --- Style and tooltip/popup function ---
+    def get_popup_html(pro_path):
+        result = results_lookup.get(pro_path)
+        if not result: 
+            return ""
+
+        file_stem = result['file_stem']
+        html_path = get_html_path(file_stem)
+        if html_path.exists():
+            return (f"<b>{result['station_name']}</b><br>"
+                    f'<a href="./{html_path.name}" target="_blank">Open Interactive Plot</a>')
+        return ""
+
+    # --- Use .map() to create the new columns efficiently ---
+    polygons_gdf['tooltip_html'] = polygons_gdf['pro_file_path'].map(get_tooltip_html)
+    polygons_gdf['popup_html'] = polygons_gdf['pro_file_path'].map(get_popup_html)
+
+    map_center = polygons_gdf.to_crs("EPSG:4326").union_all().centroid
+    m = folium.Map(location=[map_center.y, map_center.x] if map_center else [40, -105], zoom_start=8)
+
+    folium.TileLayer('OpenTopoMap', name='Topographic').add_to(m)
+    folium.TileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+                     attr='Esri', name='Satellite').add_to(m)
+
     def style_function(feature):
-        pro_path = Path(feature['properties']['pro_file_path']).name
+        pro_path = feature['properties']['pro_file_path']
         result = results_lookup.get(pro_path)
         
-        color = "gray" # Default color
+        color = "gray"
         if result:
             time_to_loc = result.get('time_to_loc')
             if time_to_loc is None or time_to_loc > 72 or time_to_loc < 0:
                 color = 'gray'
             elif time_to_loc <= 24:
                 color = 'red'
-            else: # 24 < time_to_loc <= 72
+            else:
                 color = 'orange'
         
-        return {
-            "fillColor": color,
-            "color": "black",
-            "weight": 1,
-            "fillOpacity": 0.6,
-        }
+        return {"fillColor": color, "color": "black", "weight": 1, "fillOpacity": 0.6}
 
-    # --- Create tooltips and popups ---
     gjson = GeoJson(
         polygons_gdf,
         style_function=style_function,
-        name='Highway Avalanche Paths'
+        name='Avalanche Path Risk',
+        tooltip=GeoJsonTooltip(fields=['tooltip_html'], aliases=['']),
+        popup=GeoJsonPopup(fields=['popup_html'], aliases=[''])
     )
 
-    # Use GeoJsonTooltip and GeoJsonPopup to read from the GeoDataFrame columns
-    GeoJsonTooltip(fields=['tooltip'], labels=False).add_to(gjson)
-    GeoJsonPopup(fields=['popup'], labels=False).add_to(gjson)
-
     gjson.add_to(m)
-
     folium.LayerControl().add_to(m)
     m.save(str(map_output_path))
     logging.info("Summary map saved to: %s", map_output_path)
