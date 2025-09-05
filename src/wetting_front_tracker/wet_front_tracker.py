@@ -34,7 +34,7 @@ Last Updated: August 25, 2025
 
 import pandas as pd
 import logging
-from .snowpack_reader import SnowpackProfile
+from typing import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +63,7 @@ def largest_fc_dh_gs_diff(df: pd.DataFrame):
                        layer is found.
     """
     if df.empty or "grain_type" not in df or "gs_difference" not in df:
-        return None
+        return None, None
 
     # SNOWPACK grain codes for FC and DH range from 400 to 599.
     mask_type = ((df['grain_type'] >= 400) & (df['grain_type'] < 600))
@@ -72,11 +72,11 @@ def largest_fc_dh_gs_diff(df: pd.DataFrame):
     candidates = df[mask_type & mask_diff]
 
     if candidates.empty:
-        return None
+        return None, None
 
     # Find the layer with the maximum grain size difference among candidates.
     best = candidates.loc[candidates['gs_difference'].idxmax()]
-    return float(best['gs_difference']), float(best['height'])
+    return best['gs_difference'].astype(float), best['height'].astype(float)
 
 def largest_fc_dh_gs_diff_bottom_half(df: pd.DataFrame):
     """
@@ -142,7 +142,7 @@ def wet_front_form(df: pd.DataFrame):
 
     # The deepest layer is the one with the minimum height.
     deepest = candidates.loc[candidates['height'].idxmin()]
-    return int(deepest['grain_type']), float(deepest['height'])
+    return deepest['grain_type'].astype(float), deepest['height'].astype(float)
 
 def wet_front_lwc(df: pd.DataFrame):
     """
@@ -172,58 +172,101 @@ def wet_front_lwc(df: pd.DataFrame):
         return None
 
     # The deepest layer is the one with the minimum height.
-    deepest = candidates.loc[candidates['height'].idxmin()]
-    return float(deepest['lwc']), float(deepest['height'])
+    deepest_idx = candidates['height'].idxmin()
+    deepest = candidates.loc[deepest_idx]
+    return deepest['lwc'].astype(float), deepest['height'].astype(float)
 
 # ---------------------------------------------------------------------------
 # LWC Above Weak Layer
 # ---------------------------------------------------------------------------
 
-def lwc_above_weak(df: pd.DataFrame, weak_layer_func=largest_fc_dh_gs_diff):
+def lwc_above_weak(df: pd.DataFrame, weak_layer_func: Callable) -> tuple[float | None, float | None]:
     """
-    Checks the layer immediately above a detected weak layer for high LWC.
+    Calculates the LWC at the interface directly above a specified weak layer.
 
-    This function simulates a critical process in wet slab avalanche formation:
-    percolating water being impeded by a layer boundary (like a crust or a
-    change in density at a weak layer), causing water to pool. This pooling
-    dramatically lubricates the weak layer and reduces its shear strength.
-
-    The function is modular: it accepts another function (`weak_layer_func`)
-    to first identify the weak layer of interest before checking for water above it.
+    This function first identifies the weak layer using the provided function,
+    then finds the layer immediately on top of it and returns its LWC and height.
 
     Args:
-        df (pd.DataFrame): The daily snow profile data.
-        weak_layer_func (callable, optional): The function to use for finding
-            the weak layer. Defaults to `largest_fc_dh_gs_diff`, which searches
-            the entire snowpack. In practice, this is often swapped with
-            `largest_fc_dh_gs_diff_bottom_half`.
+        df (pd.DataFrame): A single day's snow profile.
+        weak_layer_func (callable): A function that returns the properties
+                                    of the weak layer.
 
     Returns:
-        tuple or None: A tuple containing (`lwc`, `height`) of the layer
-                       immediately above the weak layer if its LWC is > 3%,
-                       otherwise None. Returns None if no weak layer is found.
+        tuple[float | None, float | None]: A tuple containing the LWC and height
+                                           of the layer above the weak layer,
+                                           or (None, None) if not found.
     """
-    # Step 1: Find the weak layer using the provided function.
-    weak_layer_result = weak_layer_func(df)
+    gs_diff, weak_layer_height = weak_layer_func(df)
 
-    if not weak_layer_result:
-        return None # No weak layer found, so no interface to check.
+    if weak_layer_height is None:
+        return None, None
 
-    # The height of the weak layer is the second element in the returned tuple.
-    weak_layer_height = weak_layer_result[1]
+    # Find all layers that are physically above the weak layer
+    layers_above = df[df['height'] > weak_layer_height]
 
-    # Step 2: Isolate the single layer immediately above the weak layer.
-    # We find all layers with greater height, sort them by height, and take the first one.
-    above = df[df['height'] > weak_layer_height].sort_values("height").head(1)
+    if layers_above.empty:
+        return None, None
 
-    if above.empty or "lwc" not in above:
-        return None # No layer exists above the weak layer.
+    # From those layers, find the one with the minimum height (the one right on top)
+    interface_layer_idx = layers_above['height'].idxmin()
+    
+    # Return the specific LWC and height values (scalars) from that single layer
+    return df.loc[interface_layer_idx]['lwc'], df.loc[interface_layer_idx]['height']
 
-    # Step 3: Check if the LWC in that layer exceeds the 3% threshold.
-    lwc_val = above["lwc"].iloc[0]
-    if lwc_val > 0.03:
-        # If it's wet, return its LWC and height.
-        return float(lwc_val), float(above["height"].iloc[0])
+def find_time_to_loc(summary_df: pd.DataFrame) -> float | None:
+    """
+    Finds the time in hours until the wet front reaches the weak layer.
 
-    # If the layer is not wet enough, return None.
-    return None
+    This function observes the simulation data to find the first timestamp where
+    the wet front height is at or above the weak layer height.
+
+    Args:
+        summary_df (pd.DataFrame): The daily summary data for a station, indexed
+                                   by timestamp.
+
+    Returns:
+        float | None: The time in hours from the start of the analysis.
+                      Returns -1.0 if the front has already passed at the start.
+                      Returns None if the front never reaches the layer.
+    """
+    # Ensure the necessary columns exist
+    if 'wet_front_lwc_height' not in summary_df or 'weak_layer_height' not in summary_df:
+        return None
+
+    # Drop any rows where the values are missing to ensure a clean comparison
+    valid_df = summary_df[['wet_front_lwc_height', 'weak_layer_height']].dropna()
+    if valid_df.empty:
+        return None
+
+    # Check if the front has already passed at the very first timestep
+    if valid_df['wet_front_lwc_height'].iloc[0] >= valid_df['weak_layer_height'].iloc[0]:
+        return -1.0  # Special value for "already passed"
+
+    # Find all future times when the front is at or past the weak layer
+    intersection_times = valid_df[valid_df['wet_front_lwc_height'] >= valid_df['weak_layer_height']]
+
+    # If it never reaches, return None
+    if intersection_times.empty:
+        return None
+
+    # Get the timestamp of the first intersection event
+    first_intersection_time = intersection_times.index[0]
+    start_time = valid_df.index[0]
+    
+    # Calculate the time difference in hours
+    return (first_intersection_time - start_time).total_seconds() / 3600
+
+
+def get_total_snow_depth(df: pd.DataFrame) -> float:
+    """Calculates the total snow depth (HS) for a single daily profile."""
+    return 0 if df.empty or "height" not in df else df['height'].max()
+
+
+def get_highest_wet_point(df: pd.DataFrame) -> float | None:
+    """Finds the height of the uppermost 'wet' layer in a daily profile."""
+    if df.empty or "grain_type" not in df or "lwc" not in df:
+        return None
+    mask = ((df['grain_type'] >= 770) & (df['grain_type'] < 780)) | (df['lwc'] > 0.03)
+    wet_layers = df[mask]
+    return None if wet_layers.empty else float(wet_layers['height'].max())

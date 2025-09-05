@@ -157,9 +157,7 @@ class SnowpackProfile:
 
     def __len__(self) -> int:
         """Returns the number of profiles (timestamps) in the dataset."""
-        if self.data is None:
-            return 0
-        return len(self.data.timestamp)
+        return 0 if self.data is None else len(self.data.timestamp)
 
     def __repr__(self) -> str:
         """Provides a developer-friendly representation of the object."""
@@ -178,7 +176,8 @@ class SnowpackProfile:
         with open(self.filename, 'r') as f:
             for line in f: # No tqdm here for production speed
                 line = line.strip()
-                if not line: continue
+                if not line: 
+                    continue
                 if line == '[STATION_PARAMETERS]': 
                     in_header, in_data = True, False
                 elif line == '[DATA]': 
@@ -190,12 +189,14 @@ class SnowpackProfile:
                 elif in_data:
                     is_new_ts, timestamp_key = self._is_new_timestamp_line(line)
                     if is_new_ts:
-                        if current_ts_data: temp_profiles.append(current_ts_data)
+                        if current_ts_data: 
+                            temp_profiles.append(current_ts_data)
                         current_ts_data = {'timestamp': timestamp_key}
                     else:
                         self._parse_data_line(line, current_ts_data)
 
-        if current_ts_data: temp_profiles.append(current_ts_data)
+        if current_ts_data: 
+            temp_profiles.append(current_ts_data)
         if not temp_profiles:
             logger.warning(f"No data was parsed from file: {self.filename}")
             return
@@ -211,9 +212,10 @@ class SnowpackProfile:
         valid_indices = ~pd.isna(timestamps)
         profiles = [p for i, p in enumerate(profiles) if valid_indices[i]]
         timestamps = timestamps.dropna()
-        if not profiles: return
+        if not profiles: 
+            return
 
-        all_params = sorted(list(set(key for p in profiles for key in p if key != 'timestamp')))
+        all_params = sorted({key for p in profiles for key in p if key != 'timestamp'})
         max_layers = max((len(p.get('height', [])) for p in profiles), default=0)
         data_vars = {param: (("timestamp", "layer_index"), np.full((len(profiles), max_layers), np.nan, dtype=np.float32)) for param in all_params}
 
@@ -246,8 +248,7 @@ class SnowpackProfile:
     def _parse_data_line(self, line: str, current_ts_data: Dict):
         """Parses a single data line containing layer data for a parameter."""
         parts = line.split(',')
-        param_name = PARAM_CODES.get(parts[0])
-        if param_name:
+        if (param_name := PARAM_CODES.get(parts[0])):
             current_ts_data[param_name] = np.array(parts[2:], dtype=float)
 
     def _compute_and_add_depth(self):
@@ -255,7 +256,7 @@ class SnowpackProfile:
         Calculates the depth of each layer from the snow surface and adds it
         to the dataset.
         """
-        if 'height' not in self.data.data_vars:
+        if self.data is None or 'height' not in self.data.data_vars:
             logger.warning("Cannot calculate depth without 'height' variable.")
             return
         
@@ -287,8 +288,8 @@ class SnowpackProfile:
         meaningless surface `rc_flat` value to a large number.
         """
         required_vars = {'density', 'grain_size', 'shear_strength', 'height'}
-        if not required_vars.issubset(self.data.data_vars):
-            logger.warning(f"Skipping rc_flat calculation due to missing variables.")
+        if self.data is None or not required_vars.issubset(self.data.data_vars):
+            logger.warning("Skipping rc_flat calculation due to missing variables or empty dataset.")
             return
 
         # --- Physical Constants ---
@@ -410,12 +411,10 @@ class SnowpackProfile:
                     for var_name, data_array in self.data.data_vars.items():
                         cpu_data[var_name] = (data_array.dims, data_array.get())
                     
-                    coords_dict = {}
-                    for coord_name, coord_val in self.data.coords.items():
-                        if hasattr(coord_val.data, 'get'):
-                             coords_dict[coord_name] = (coord_val.dims, coord_val.data.get())
-                        else:
-                             coords_dict[coord_name] = coord_val
+                    coords_dict = {
+                        coord_name: (coord_val.dims, coord_val.data.get()) if hasattr(coord_val.data, 'get') else coord_val
+                        for coord_name, coord_val in self.data.coords.items()
+                    }
                     cpu_data = cpu_data.assign_coords(coords_dict)
                     data_to_save = cpu_data
                 
@@ -643,18 +642,26 @@ class SnowpackProfile:
                         continue
                     
                     op, value_str = match.groups()
-                    try: value = float(value_str)
+                    try: 
+                        value = float(value_str)
                     except ValueError:
                         logger.warning(f"Could not convert value '{value_str}' to float. Skipping.")
                         continue
                     
-                    if op == '<': condition_mask = (df[param] < value)
-                    elif op == '>': condition_mask = (df[param] > value)
-                    elif op == '<=': condition_mask = (df[param] <= value)
-                    elif op == '>=': condition_mask = (df[param] >= value)
-                    elif op == '==': condition_mask = (df[param] == value)
-                    elif op == '!=': condition_mask = (df[param] != value)
-                    else: raise ValueError(f"Unsupported operator '{op}' in criteria.")
+                    if op == '<': 
+                        condition_mask = (df[param] < value)
+                    elif op == '>': 
+                        condition_mask = (df[param] > value)
+                    elif op == '<=': 
+                        condition_mask = (df[param] <= value)
+                    elif op == '>=': 
+                        condition_mask = (df[param] >= value)
+                    elif op == '==': 
+                        condition_mask = (df[param] == value)
+                    elif op == '!=': 
+                        condition_mask = (df[param] != value)
+                    else: 
+                        raise ValueError(f"Unsupported operator '{op}' in criteria.")
                 
                 criteria_masks[param] = condition_mask.fillna(False)
                 score += criteria_masks[param].astype(int) * weight
@@ -690,10 +697,7 @@ class SnowpackProfile:
                 
                 # --- Add the actual parameter values from the found layer ---
                 for param, _ in ordered_criteria:
-                    if param in target_layer:
-                        daily_result[param] = target_layer[param]
-                    else:
-                        daily_result[param] = None
+                    daily_result[param] = target_layer[param] if param in target_layer else None
             
             results_list.append(daily_result)
 
@@ -807,7 +811,7 @@ if __name__ == '__main__':
                     continue
                 
                 # For each day, get a profile for that single day to analyze the slab
-                single_day_profile = reader.slice(start_date=date, end_date=date)
+                single_day_profile = reader.slice(start_date=str(date), end_date=str(date))
                 
                 slab_summary = single_day_profile.get_profile_summary(
                     from_height=weak_layer_height,
