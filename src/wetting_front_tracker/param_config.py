@@ -11,6 +11,11 @@ load_dotenv()
 # Detect if running on Windows (development) or another OS (production)
 IS_DEV_ENVIRONMENT = os.name == 'nt'
 
+# --- TESTING SUITE FLAG ---
+# Set this to True to use a small subset of polygons for faster debugging.
+# Set it to False to run the full analysis.
+USE_TEST_DATA = True 
+
 # --- PATH DEFINITIONS ---
 # Use a more robust method to define paths relative to this config file
 CONFIG_FILE_PATH = Path(__file__).resolve()
@@ -31,6 +36,7 @@ PRO_FILES_BASE_PATH_DEV = DATA_PATH / "input"
 
 # Centralized File Paths
 INPUT_POLYGONS_GEOJSON = REFERENCE_PATH / 'HighwayPaths.geojson'
+INPUT_POLYGONS_GEOJSON_TEST = REFERENCE_PATH / 'HighwayPaths_test.geojson' # New test file path
 SNOWPACK_LOCATIONS_CSV = REFERENCE_PATH / 'snowpack_locations_with_metadata.csv'
 DEM_TIF = PROCESSED_DATA_PATH / 'dem.tif'
 ASPECT_POLYGONS_GEOJSON = PROCESSED_DATA_PATH / 'aspect_polygons.geojson'
@@ -49,17 +55,16 @@ OPENTOPO_API_KEY = os.getenv("OPENTOPO_API_KEY", "YOUR_API_KEY_HERE")
 DEM_DATASETS = [
     {
         "name": "USGS10m",
-        "api_endpoint": "https://portal.opentopography.org/API/usgsdem",
-        "bounds": [-124.73, 24.96, -66.95, 49.37],  # Contiguous US
-        "param_name": "datasetName"
+        "url": "https://portal.opentopography.org/API/usgsdem",
+        "bbox": [-124.73, 24.96, -66.95, 49.37],  # Contiguous US
     },
     {
         "name": "SRTMGL1",
-        "api_endpoint": "https://portal.opentopography.org/API/globaldem",
-        "bounds": [-180, -90, 180, 90], # Global
-        "param_name": "demtype"
+        "url": "https://portal.opentopography.org/API/globaldem",
+        "bbox": [-180, -90, 180, 90], # Global
     }
 ]
+
 
 # --- Functions to generate standardized output paths ---
 def get_png_path(file_stem: str) -> Path:

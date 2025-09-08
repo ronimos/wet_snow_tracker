@@ -12,6 +12,7 @@ import rasterio
 from rasterio.merge import merge
 from rasterio.features import shapes
 from shapely.geometry import shape, MultiPolygon, Polygon, LinearRing, mapping, box
+from shapely import union_all
 from numba import njit
 from tqdm import tqdm
 from typing import Optional
@@ -42,7 +43,7 @@ def _chaikin_iteration(coords, ratio=0.25):
         
     return new_coords
 
-def chaikin_smooth(geometry, iterations=2):
+def chaikin_smooth(geometry, iterations=5):
     """
     Applies Chaikin's corner-cutting algorithm to smooth a polygon.
     """
@@ -100,9 +101,9 @@ def _download_tile(api_key: str, bounds: tuple, output_path: Path, dataset: dict
     """
     Downloads a single DEM tile from the OpenTopography API.
     """
-    base_url = dataset['url']
+    base_url = dataset['api_endpoint']
     west, south, east, north = bounds
-    params = {'datasetName': dataset['name'], 'south': south, 'north': north,
+    params = {dataset['param_name']: dataset['name'], 'south': south, 'north': north,
               'west': west, 'east': east, 'outputFormat': 'GTiff', 'API_Key': api_key}
 
     response = requests.get(base_url, params=params)
@@ -143,7 +144,7 @@ def _select_dem_dataset(bounds: tuple) -> dict:
     centroid_lon, centroid_lat = (west + east) / 2, (south + north) / 2
 
     for dem in DEM_DATASETS:
-        bb = dem['bbox']
+        bb = dem['bounds']
         if bb[0] <= centroid_lon <= bb[2] and bb[1] <= centroid_lat <= bb[3]:
             logging.info(f"Selected DEM dataset: {dem['name']} for location ({centroid_lat:.2f}, {centroid_lon:.2f})")
             return dem
@@ -205,48 +206,40 @@ def download_dem_for_polygons(polygons_gdf: gpd.GeoDataFrame, api_key: str, outp
         tile_paths[0].rename(output_path)
 
 
-def _merge_small_polygons(gdf: gpd.GeoDataFrame, min_area_m2: float, min_area_ratio: float) -> gpd.GeoDataFrame:
+def _filter_small_polygons(
+    gdf: gpd.GeoDataFrame,
+    min_area_m2: float,
+    min_area_ratio: float
+) -> gpd.GeoDataFrame:
     """
-    Finds and merges small/insignificant polygons with their largest neighbor.
+    Removes small sliver polygons based on absolute area and relative area percentage.
     """
-    if 'original_id' not in gdf.columns or 'original_area' not in gdf.columns:
-        logging.warning("Missing 'original_id' or 'original_area' columns. Cannot perform advanced merge.")
+    if 'original_area' not in gdf.columns:
+        logging.warning("Missing 'original_area' column. Cannot perform ratio-based filtering.")
         return gdf
 
-    processed_gdf = gdf.copy()
-    processed_gdf['current_area'] = processed_gdf.geometry.area
+    initial_count = len(gdf)
     
-    area_condition = processed_gdf['current_area'] < min_area_m2
-    ratio_condition = (processed_gdf['current_area'] / processed_gdf['original_area']) < min_area_ratio
+    # The CRS should already be projected from previous steps, allowing for area calculation.
+    if gdf.crs.is_geographic:
+        logging.warning("Reprojecting to calculate area accurately.")
+        gdf['current_area'] = gdf.to_crs("EPSG:3857").geometry.area
+    else:
+        gdf['current_area'] = gdf.geometry.area
     
-    small_polygons_indices = processed_gdf[area_condition | ratio_condition].index
-    
-    logging.info(f"Found {len(small_polygons_indices)} small/insignificant polygons to merge.")
+    # Conditions for KEEPING a polygon:
+    # 1. Its area is greater than the absolute minimum.
+    area_condition = gdf['current_area'] >= min_area_m2
+    # 2. Its area is greater than the minimum percentage of its original parent polygon.
+    ratio_condition = (gdf['current_area'] / gdf['original_area']) >= min_area_ratio
 
-    for index in tqdm(small_polygons_indices, desc="Merging Small Polygons"):
-        if index not in processed_gdf.index:
-            continue
-            
-        small_poly_row = processed_gdf.loc[index]
-        small_poly_geom = small_poly_row.geometry
-        original_id = small_poly_row.original_id
-        
-        possible_neighbors = processed_gdf[
-            (processed_gdf.index != index) &
-            (processed_gdf.geometry.touches(small_poly_geom)) &
-            (processed_gdf['original_id'] == original_id)
-        ]
-        
-        if not possible_neighbors.empty:
-            largest_neighbor_index = possible_neighbors.geometry.area.idxmax()
-            largest_neighbor_geom = processed_gdf.loc[largest_neighbor_index, 'geometry']
-            
-            merged_geom = gpd.GeoSeries([largest_neighbor_geom, small_poly_geom]).unary_union
-            
-            processed_gdf.loc[largest_neighbor_index, 'geometry'] = merged_geom
-            processed_gdf.drop(index, inplace=True)
-            
-    return processed_gdf.drop(columns=['current_area'])
+    # Keep polygons that meet EITHER condition.
+    gdf_to_keep = gdf[area_condition & ratio_condition].copy()
+    
+    final_count = len(gdf_to_keep)
+    logging.info(f"Filtered out {initial_count - final_count} small polygons based on area thresholds.")
+    
+    return gdf_to_keep.drop(columns=['current_area'])
 
 
 def _ensure_dem_exists(polygons_gdf: gpd.GeoDataFrame, dem_path: Path):
@@ -271,69 +264,38 @@ def _calculate_aspect_from_dem(dem_path: Path, polygons_gdf: gpd.GeoDataFrame) -
         
         elevation = clipped_dem.squeeze().values
         gy, gx = np.gradient(elevation)
-        aspect_rad = np.arctan2(-gy, gx)
-        aspect_deg = np.degrees(aspect_rad)
-        aspect = (aspect_deg + 360) % 360
+        aspect_rad = np.arctan2(gy, -gx)
         
-        return aspect, clipped_dem, polygons_in_dem_crs
+        aspect_deg_trig = np.degrees(aspect_rad)
+        aspect_deg_cart = (90.0 - aspect_deg_trig + 360) % 360
+        
+        return aspect_deg_cart, clipped_dem, polygons_in_dem_crs
 
 def _process_aspect_polygons(aspect_raster, clipped_dem, polygons_in_dem_crs) -> Optional[gpd.GeoDataFrame]:
     """
-    Vectorizes an aspect raster, intersects it with polygons, and cleans the result.
+    Vectorizes an aspect raster, intersects, filters, and cleans the result.
     """
-    polygons_in_dem_crs['original_id'] = range(len(polygons_in_dem_crs))
-    polygons_in_dem_crs['original_area'] = polygons_in_dem_crs.geometry.area
+    # Calculate the area of the original polygons for ratio-based filtering.
+    if polygons_in_dem_crs.crs.is_geographic:
+        polygons_in_dem_crs['original_area'] = polygons_in_dem_crs.to_crs("EPSG:3857").geometry.area
+    else:
+        polygons_in_dem_crs['original_area'] = polygons_in_dem_crs.geometry.area
 
-    all_aspect_polys = []
-    aspect_bins = {
-        "N": (315, 45), "E": (45, 135),
-        "S": (135, 225), "W": (225, 315),
-    }
+    # This function now correctly splits polygons by aspect while retaining attributes.
+    aspect_gdf = _extract_aspect_polygons(aspect_raster, clipped_dem, polygons_in_dem_crs)
 
-    # Use the faster gpd.union_all()
-    original_geom_unary = gpd.union_all(polygons_in_dem_crs.geometry)
-
-    for aspect_name, (lower, upper) in tqdm(aspect_bins.items(), desc="Processing Aspects"):
-        mask = (aspect_raster > lower) | (aspect_raster <= upper) if aspect_name == "N" else (aspect_raster > lower) & (aspect_raster <= upper)
-        
-        aspect_shapes = shapes(mask.astype(np.uint8), mask=mask, transform=clipped_dem.rio.transform())
-        aspect_geoms = [shape(s) for s, v in aspect_shapes if v == 1]
-        if not aspect_geoms:
-            continue
-        
-        # Use the faster shapely.union_all()
-        aspect_multipolygon = union_all(aspect_geoms)
-
-        final_geom = original_geom_unary.intersection(aspect_multipolygon)
-        
-        if not final_geom.is_empty:
-            geoms = final_geom.geoms if final_geom.geom_type == 'MultiPolygon' else [final_geom]
-            for poly in geoms:
-                all_aspect_polys.append({
-                    'geometry': poly, 
-                    'aspect': aspect_name,
-                })
-
-    if not all_aspect_polys:
+    if aspect_gdf is None or aspect_gdf.empty:
         return None
-        
-    aspect_gdf = gpd.GeoDataFrame(all_aspect_polys, crs=clipped_dem.rio.crs)
-    final_gdf = gpd.sjoin(aspect_gdf, polygons_in_dem_crs, how="inner", predicate="intersects")
-    
-    final_gdf = _merge_small_polygons(final_gdf, min_area_m2=400.0, min_area_ratio=0.20)
-    
-    logging.info("Smoothing polygon corners...")
-    tqdm.pandas(desc="Smoothing Polygons")
-    final_gdf['geometry'] = final_gdf['geometry'].progress_apply(lambda geom: chaikin_smooth(geom, iterations=2))
-    
-    # --- FIX: Add a zero-buffer operation to repair invalid geometries ---
-    logging.info("Repairing any invalid geometries...")
-    final_gdf['geometry'] = final_gdf.geometry.buffer(0)
 
-    logging.info("Simplifying geometries to reduce file size...")
-    final_gdf['geometry'] = final_gdf.simplify(tolerance=10, preserve_topology=True)
-
-    final_gdf = final_gdf.drop(columns=['original_id', 'original_area', 'index_right'])
+    # Filter out the small sliver polygons created during the aspect split.
+    filtered_gdf = _filter_small_polygons(
+        aspect_gdf, 
+        min_area_m2=1600.0, 
+        min_area_ratio=0.1
+    )
+    
+    # Post-process the final, filtered geometries.
+    final_gdf = _postprocess_geometries(filtered_gdf)
 
     return final_gdf.to_crs("EPSG:4326")
 
@@ -358,6 +320,100 @@ def prepare_aspect_polygons(input_geojson: Path, output_geojson: Path):
         final_gdf.to_file(output_geojson, driver='GeoJSON')
     else:
         logging.warning("No new polygons were generated after aspect classification.")
+        
+def _extract_aspect_polygons(aspect_raster, clipped_dem, polygons_in_dem_crs) -> Optional[gpd.GeoDataFrame]:
+    """
+    Extracts polygons for each aspect bin, intersecting them with each source polygon
+    individually to prevent creating overlapping features.
+    """
+    aspect_bins = {
+        "N": (315, 45),
+        "E": (45, 135),
+        "S": (135, 225),
+        "W": (225, 315),
+    }
+
+    # Vectorize the entire aspect raster once for efficiency
+    all_aspect_geoms = {}
+    for aspect_name, (lower, upper) in aspect_bins.items():
+        mask = _build_aspect_mask(aspect_raster, lower, upper, aspect_name)
+        if aspect_geoms := _vectorize_aspect(mask, clipped_dem):
+            all_aspect_geoms[aspect_name] = union_all(aspect_geoms)
+
+    final_polygons = []
+    # Iterate over each source polygon to process it individually
+    for _, source_poly_row in tqdm(polygons_in_dem_crs.iterrows(), total=len(polygons_in_dem_crs), desc="Splitting by Aspect"):
+        source_geom = source_poly_row.geometry
+        
+        for aspect_name, aspect_union_geom in all_aspect_geoms.items():
+            # Intersect the source polygon with the union of all polygons for that aspect
+            intersected = source_geom.intersection(aspect_union_geom)
+
+            if intersected.is_empty:
+                continue
+
+            # Handle both Polygon and MultiPolygon results
+            geoms = intersected.geoms if hasattr(intersected, 'geoms') else [intersected]
+
+            # Create new features, carrying over attributes from the source polygon
+            for poly in geoms:
+                if not poly.is_empty:
+                    properties = source_poly_row.to_dict()
+                    properties['geometry'] = poly
+                    properties['aspect'] = aspect_name
+                    final_polygons.append(properties)
+
+    if not final_polygons:
+        return None
+
+    # Create the final GeoDataFrame
+    final_gdf = gpd.GeoDataFrame(final_polygons, crs=clipped_dem.rio.crs)
+    return _filter_valid_geometries(final_gdf)
+
+
+def _build_aspect_mask(aspect_raster, lower: float, upper: float, aspect_name: str) -> np.ndarray:
+    """Create a boolean mask for the aspect bin."""
+    if aspect_name == "N":
+        return (aspect_raster > lower) | (aspect_raster <= upper)
+    return (aspect_raster > lower) & (aspect_raster <= upper)
+
+
+def _vectorize_aspect(mask: np.ndarray, clipped_dem) -> list:
+    """Convert raster mask into shapely geometries."""
+    aspect_shapes = shapes(mask.astype(np.uint8), mask=mask, transform=clipped_dem.rio.transform())
+    return [shape(s) for s, v in aspect_shapes if v == 1]
+
+
+def _filter_valid_geometries(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Keep only Polygon and MultiPolygon geometries."""
+    initial_count = len(gdf)
+    gdf = gdf[gdf.geometry.geom_type.isin(['Polygon', 'MultiPolygon'])].copy()
+    removed_count = initial_count - len(gdf)
+    if removed_count > 0:
+        logging.info(f"Removed {removed_count} non-polygonal geometries (e.g., points or lines).")
+    return gdf
+
+
+def _postprocess_geometries(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Smooth, simplify, and repair geometries."""
+    
+    # Removed for now
+    #logging.info("Smoothing polygon corners...")
+    #tqdm.pandas(desc="Smoothing Polygons")
+    #gdf['geometry'] = gdf['geometry'].progress_apply(lambda geom: chaikin_smooth(geom))
+
+    #logging.info("Simplifying geometries to reduce file size...")
+    #gdf['geometry'] = gdf.simplify(tolerance=0.001, preserve_topology=True)
+
+    logging.info("Repairing any invalid geometries...")
+    gdf['geometry'] = gdf.geometry.buffer(0)
+
+    # Clean up columns that are no longer relevant after filtering.
+    columns_to_drop = ['original_area']
+    gdf = gdf.drop(columns=[col for col in columns_to_drop if col in gdf.columns], errors='ignore')
+    
+    return gdf
+
 
 def _convert_deg_to_cardinal_from_map(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -398,7 +454,7 @@ def link_polygons_to_pro_files(polygons_path: Path, locations_path: Path, output
         crs="EPSG:4326"
     )
 
-    projected_crs = "EPSG:3857"
+    projected_crs = "EPSG:3587"
     polygons_proj = polygons_gdf.to_crs(projected_crs)
     locations_proj = locations_gdf.to_crs(projected_crs)
 
