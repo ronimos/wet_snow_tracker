@@ -300,11 +300,13 @@ def _process_aspect_polygons(aspect_raster, clipped_dem, polygons_in_dem_crs) ->
     return final_gdf.to_crs("EPSG:4326")
 
 
-def prepare_aspect_polygons(input_geojson: Path, output_geojson: Path):
+def prepare_aspect_polygons(input_geojson: Path, 
+                            output_geojson: Path,
+                            force_update: bool = False):
     """
     Orchestrates the workflow to split input polygons by terrain aspect.
     """
-    if output_geojson.exists():
+    if output_geojson.exists() and not force_update:
         logging.info(f"Aspect-classified GeoJSON already exists: {output_geojson}")
         return
 

@@ -31,9 +31,10 @@ Key Functions:
 Authors: Itai and Ron
 Last Updated: August 25, 2025
 """
-
+import numpy as np
 import pandas as pd
 import logging
+from datetime import datetime
 from typing import Callable
 
 logger = logging.getLogger(__name__)
@@ -214,48 +215,52 @@ def lwc_above_weak(df: pd.DataFrame, weak_layer_func: Callable) -> tuple[float |
     # Return the specific LWC and height values (scalars) from that single layer
     return df.loc[interface_layer_idx]['lwc'], df.loc[interface_layer_idx]['height']
 
-def find_time_to_loc(summary_df: pd.DataFrame) -> float | None:
+def find_time_to_loc(summary_df: pd.DataFrame, reference_date: datetime) -> float | None:
     """
-    Finds the time in hours until the wet front reaches the weak layer.
+    Calculates the time (in hours) for the wetting front to reach the weak layer,
+    measured from a specific reference date.
 
-    This function observes the simulation data to find the first timestamp where
-    the wet front height is at or above the weak layer height.
+    This function finds the first time the front penetrates the LOC and calculates
+    the time difference from the reference date. The result can be positive (future)
+    or negative (past).
 
     Args:
-        summary_df (pd.DataFrame): The daily summary data for a station, indexed
-                                   by timestamp.
+        summary_df: A pandas DataFrame with a DateTimeIndex and columns for
+                    'wet_front_lwc_height' and 'weak_layer_height'.
+        reference_date: The central date for the analysis.
 
     Returns:
-        float | None: The time in hours from the start of the analysis.
-                      Returns -1.0 if the front has already passed at the start.
-                      Returns None if the front never reaches the layer.
+        The time in hours from the reference date until the wetting front
+        reaches the weak layer. Returns NaN if it never reaches the layer.
     """
-    # Ensure the necessary columns exist
+    if summary_df is None or summary_df.empty or reference_date is None:
+        return np.nan
+
+    # 1. Ensure required columns exist
     if 'wet_front_lwc_height' not in summary_df or 'weak_layer_height' not in summary_df:
-        return None
+        return np.nan
 
-    # Drop any rows where the values are missing to ensure a clean comparison
-    valid_df = summary_df[['wet_front_lwc_height', 'weak_layer_height']].dropna()
-    if valid_df.empty:
-        return None
+    # 2. Find all timestamps where the wetting front is at or below the weak layer
+    penetration_df = summary_df[
+        summary_df['wet_front_lwc_height'].notna() &
+        summary_df['weak_layer_height'].notna() &
+        (summary_df['wet_front_lwc_height'] <= summary_df['weak_layer_height'])
+    ]
 
-    # Check if the front has already passed at the very first timestep
-    if valid_df['wet_front_lwc_height'].iloc[0] >= valid_df['weak_layer_height'].iloc[0]:
-        return -1.0  # Special value for "already passed"
+    # 3. If the front never penetrates the weak layer, we can't calculate a time.
+    if penetration_df.empty:
+        return np.nan
 
-    # Find all future times when the front is at or past the weak layer
-    intersection_times = valid_df[valid_df['wet_front_lwc_height'] >= valid_df['weak_layer_height']]
-
-    # If it never reaches, return None
-    if intersection_times.empty:
-        return None
-
-    # Get the timestamp of the first intersection event
-    first_intersection_time = intersection_times.index[0]
-    start_time = valid_df.index[0]
+    # 4. Find the penetration event closest to the reference date (past or future).
+    #    Calculate the absolute time difference for each event.
+    penetration_df['time_diff'] = (penetration_df.copy().index - reference_date).total_seconds()
     
-    # Calculate the time difference in hours
-    return (first_intersection_time - start_time).total_seconds() / 3600
+    #    Find the index of the event with the smallest absolute difference.
+    closest_event_time = penetration_df.loc[penetration_df['time_diff'].abs().idxmin()].name
+
+    # 5. Calculate the final time_to_loc in hours from the reference date.
+    #    This value will be negative for past events and positive for future events.
+    return (closest_event_time - reference_date).total_seconds() / 3600.0
 
 
 def get_total_snow_depth(df: pd.DataFrame) -> float:

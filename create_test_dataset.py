@@ -7,7 +7,7 @@ REFERENCE_PATH = PROJECT_ROOT / 'data' / 'reference'
 INPUT_FILE = REFERENCE_PATH / 'HighwayPaths.geojson'
 OUTPUT_FILE = REFERENCE_PATH / 'HighwayPaths_test.geojson'
 
-def create_test_suite_data(num_polygons: int = 10):
+def create_test_suite_data(num_polygons: int = 50):
     """
     Reads the main polygon GeoJSON file, takes a small subset of polygons,
     and saves them to a new file for testing purposes.

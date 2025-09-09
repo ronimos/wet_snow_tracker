@@ -1,5 +1,3 @@
-import base64
-import json
 import folium
 from folium import GeoJson, GeoJsonTooltip, GeoJsonPopup
 import logging
@@ -11,6 +9,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import plotly.graph_objects as go
+from datetime import datetime, timedelta
 from PIL import Image
 from typing import Any
 
@@ -18,8 +17,6 @@ from .param_config import get_png_path, get_html_path, RESULTS_PATH
 
 def _create_thumbnail(png_path: Path, thumb_path: Path, max_size: tuple = (800, 534)):
     """Creates a smaller, web-optimized thumbnail from a larger PNG."""
-    if thumb_path.exists():
-        return
     try:
         with Image.open(png_path) as img:
             img.thumbnail(max_size)
@@ -27,7 +24,7 @@ def _create_thumbnail(png_path: Path, thumb_path: Path, max_size: tuple = (800, 
     except FileNotFoundError:
         logging.warning("Could not create thumbnail, source image not found at %s", png_path)
 
-def plot_summary_matplotlib(df: pd.DataFrame, file_stem: str, metadata: dict[str, Any]):
+def plot_summary_matplotlib(df: pd.DataFrame, file_stem: str, metadata: dict[str, Any], central_date: datetime | None = None):
     """Generates a static plot using Matplotlib and saves it as a PNG file."""
     fig, ax = plt.subplots(figsize=(14, 8))
 
@@ -47,6 +44,23 @@ def plot_summary_matplotlib(df: pd.DataFrame, file_stem: str, metadata: dict[str
             color='cyan', alpha=0.7, interpolate=True, label='Wet Layer Extent'
         )
 
+    # Add vertical line for the central date if it exists
+    if central_date:
+        ax.axvline(x=central_date, color='purple', linestyle='--', linewidth=2, label='Central Date')
+        # Add the date as text next to the line for clarity
+        y_bottom, y_top = ax.get_ylim()
+        y_pos = y_bottom + (y_top - y_bottom) * 0.05  # Position text 5% from the bottom
+        ax.text(
+            central_date + timedelta(hours=4),  # Offset text slightly to the right
+            y_pos,
+            central_date.strftime('%Y-%m-%d'),
+            rotation=90,
+            verticalalignment='bottom',
+            color='purple',
+            fontsize=10
+        )
+
+
     location = (metadata.get("latitude"), metadata.get('longitude'))
     elevation = metadata.get("altitude")
     aspect = "Flat" if metadata.get("slopeAngle") == "0.00" else metadata.get("slopeAzi")
@@ -57,9 +71,12 @@ def plot_summary_matplotlib(df: pd.DataFrame, file_stem: str, metadata: dict[str
     ax.grid(True, which='both', linestyle='--', linewidth=0.5)
 
     handles, labels = ax.get_legend_handles_labels()
-    order = ['Total Snow Depth (HS)', 'Wet Layer Extent', 'Deepest Wet Front (LWC > 3%)', 'Weak Layer Height (LOC)']
-    ax.legend([handles[labels.index(key)] for key in order if key in labels],
-              [key for key in order if key in labels])
+    # Add 'Central Date' to the desired legend order
+    order = ['Total Snow Depth (HS)', 'Wet Layer Extent', 'Deepest Wet Front (LWC > 3%)', 'Weak Layer Height (LOC)', 'Central Date']
+    # Filter the ordered list to only include labels that are actually present in the plot
+    ordered_handles = [handles[labels.index(key)] for key in order if key in labels]
+    ordered_labels = [key for key in order if key in labels]
+    ax.legend(ordered_handles, ordered_labels)
 
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
     ax.xaxis.set_major_locator(mdates.DayLocator(interval=7))
@@ -158,10 +175,19 @@ def create_folium_map(results_list: list, map_output_path: Path, geojson_path: P
 
     # --- VECTORIZED PROPERTY CREATION ---
     def get_color(time_to_loc):
-        if pd.isna(time_to_loc) or time_to_loc > 72 or time_to_loc < 0: return 'gray'
-        elif time_to_loc <= 24: return 'red'
-        else: 
-            return 'orange'
+        if pd.isna(time_to_loc):
+            return 'gray'
+        
+        time = float(time_to_loc)
+
+        if -24 <= time < 0:
+            return 'purple'  # Recently saturated (within the last 24 hours)
+        elif 0 <= time <= 24:
+            return 'red'     # Imminent threat (next 24 hours)
+        elif 24 < time <= 72:
+            return 'orange'  # Watch (24-72 hours away)
+        else:
+            return 'gray'    # Low threat or past event
 
     def get_tooltip_html(row):
         """Builds an HTML string with polygon info and a plot thumbnail."""
@@ -203,7 +229,8 @@ def create_folium_map(results_list: list, map_output_path: Path, geojson_path: P
     folium.TileLayer('OpenTopoMap', name='Topographic').add_to(m)
     folium.TileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
                      attr='Esri', name='Satellite').add_to(m)
-
+    folium.TileLayer('OpenStreetMap', name='Street View').add_to(m)
+    
     def style_function(x): 
         return {
         "fillColor": x['properties']['color'],
