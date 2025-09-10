@@ -61,7 +61,7 @@ from .prepare_geodata import (link_polygons_to_pro_files,
                               prepare_aspect_polygons)
 from .snowpack_reader import SnowpackProfile
 from .wet_front_tracker import (find_time_to_loc, get_highest_wet_point,
-                                get_total_snow_depth,
+                                get_total_snow_depth, lwc_above_weak,
                                 largest_fc_dh_gs_diff_bottom_half, wet_front_lwc)
 
 
@@ -123,49 +123,73 @@ def _unpack_and_prepare_summary(summary_df: pd.DataFrame) -> pd.DataFrame:
     
     return summary_df
 
-def _persist_loc_height(summary_df: pd.DataFrame) -> pd.DataFrame:
+def _persist_loc_height(summary_df: pd.DataFrame, reference_date: datetime) -> pd.DataFrame:
     """
-    Applies a persistence model to the weak layer height (LOC).
+    Identifies the primary weak layer just before the most recent melt event
+    and carries its height forward dynamically.
 
-    This function implements a more physically realistic model for how the weak
-    layer behaves during a melt event. It iterates through the time series, and
-    if the wetting front is observed to reach or pass the last known LOC height,
-    this function carries that height forward in time. This simulates the layer
-    persisting at that depth until the total snowpack melts below that level.
+    This function finds the start of the most recent melt event relative to a
+    reference date, locks onto the last known weak layer before it, and then
+    tracks that layer. If a new weak layer is detected at a higher elevation,
+    the lock is updated to that new, higher layer.
 
     Args:
-        summary_df: The prepared summary DataFrame with numeric height columns.
+        summary_df: The prepared summary DataFrame.
+        reference_date: The central date for the analysis (e.g., today).
 
     Returns:
-        A DataFrame where the `weak_layer_height` column has been adjusted to
-        reflect the persistence logic.
+        A DataFrame with `weak_layer_height` adjusted for persistence.
     """
-    if 'weak_layer_height' not in summary_df.columns or summary_df.empty:
+    if 'weak_layer_height' not in summary_df.columns or 'wet_front_lwc_height' not in summary_df.columns:
         return summary_df
 
-    new_loc_heights = []
-    last_valid_loc = np.nan
-    for row in summary_df.itertuples():
-        current_loc = getattr(row, 'weak_layer_height', np.nan)
-        current_wet_front = getattr(row, 'wet_front_lwc_height', np.nan)
-        current_hs = getattr(row, 'hs', np.nan)
-        
-        if pd.notna(current_loc):
-            last_valid_loc = current_loc
+    # 1. Identify the start times of all melt events in the entire dataset.
+    is_wet = summary_df['wet_front_lwc_height'].notna()
+    event_starts = is_wet & ~is_wet.shift(1, fill_value=False)
+    all_start_times = summary_df.index[event_starts]
 
-        # Condition to persist the LOC height
-        if (
-            pd.notna(last_valid_loc) and
-            pd.notna(current_wet_front) and
-            pd.notna(current_hs) and
-            current_wet_front <= last_valid_loc and
-            current_hs >= last_valid_loc
-        ):
-            new_loc_heights.append(last_valid_loc)
-        else:
-            new_loc_heights.append(current_loc)
+    # 2. Find the most recent melt event that started AT OR BEFORE the reference date.
+    relevant_start_times = all_start_times[all_start_times <= reference_date]
+
+    if relevant_start_times.empty:
+        # No melt event started by the reference date, so no persistence is applied.
+        return summary_df
     
-    summary_df['weak_layer_height'] = new_loc_heights
+    trigger_time = relevant_start_times[-1]  # This is the start of the most recent melt event.
+
+    # 3. Find the LOC to lock onto just before this trigger time.
+    lookback_window_end = trigger_time
+    lookback_window_start = lookback_window_end - timedelta(days=2)
+    pre_melt_df = summary_df.loc[lookback_window_start:lookback_window_end]
+    
+    initial_lock_height = pre_melt_df['weak_layer_height'].dropna().iloc[-1] if pre_melt_df['weak_layer_height'].notna().any() else np.nan
+
+    if pd.isna(initial_lock_height):
+        # A melt event is starting, but no weak layer was found right before it.
+        return summary_df
+        
+    # 4. Apply persistence logic from the trigger time onwards.
+    persisted_loc = summary_df['weak_layer_height'].copy()
+    wet_season_mask = summary_df.index >= trigger_time
+    
+    # Create a series of LOCs for the wet season, anchored by our determined lock height.
+    wet_loc_series = summary_df.loc[wet_season_mask, 'weak_layer_height']
+    anchored_series = pd.concat([pd.Series([initial_lock_height]), wet_loc_series.reset_index(drop=True)])
+    
+    # The running maximum handles the "or higher if it moved up" logic.
+    running_max_loc = anchored_series.cummax().iloc[1:].values
+    
+    persisted_loc.loc[wet_season_mask] = running_max_loc
+
+    # 5. Forward-fill to track the layer even on days it's not detected.
+    persisted_loc_filled = persisted_loc.ffill()
+
+    # 6. The layer is eliminated when total snow depth (hs) is below its height.
+    persisted_loc_filled[summary_df['hs'] < persisted_loc_filled] = np.nan
+
+    # 7. Overwrite the original column.
+    summary_df['weak_layer_height'] = persisted_loc_filled
+    
     return summary_df
 
 def process_single_profile(pro_file_path: Path, aspect: str, start_date_arg: str | None = None, end_date_arg: str | None = None, central_date_arg: datetime | None = None) -> dict[str, Any] | None:
@@ -195,7 +219,7 @@ def process_single_profile(pro_file_path: Path, aspect: str, start_date_arg: str
         profile, file_stem = _initialize_and_validate_profile(pro_file_path, aspect)
         if not profile:
             return None
-
+        
         time_coords = pd.to_datetime(profile.data.timestamp.values)
         min_date_in_data, max_date_in_data = time_coords.min(), time_coords.max()
 
@@ -205,6 +229,7 @@ def process_single_profile(pro_file_path: Path, aspect: str, start_date_arg: str
                 "weak_layer": largest_fc_dh_gs_diff_bottom_half,
                 "wet_front_lwc": wet_front_lwc,
                 "highest_wet_point": get_highest_wet_point,
+                "lwc_above_weak": lambda df: lwc_above_weak(df, largest_fc_dh_gs_diff_bottom_half)
             },
             start_date=min_date_in_data.strftime('%Y-%m-%d'),
             end_date=max_date_in_data.strftime('%Y-%m-%d'),
@@ -214,28 +239,39 @@ def process_single_profile(pro_file_path: Path, aspect: str, start_date_arg: str
             return None
 
         prepared_summary = _unpack_and_prepare_summary(raw_summary)
-        summary_full = _persist_loc_height(prepared_summary)
+        
+        # Apply the robust persistence logic
+        summary_full = _persist_loc_height(prepared_summary, central_date_arg)
 
         # Generate plots and calculate final metrics
-        plot_summary_plotly(summary_full, file_stem, profile.metadata)
         
-        # Use explicit boolean masking with datetime objects for robust filtering,
-        # which avoids issues with string-based .loc slicing.
+        # --- Data Slicing for Plots ---
+        # Explicit boolean masking for robust filtering.
         if start_date_arg is None or end_date_arg is None:
-            logging.error("Analysis window start/end dates are missing. Cannot create Matplotlib plot.")
-            summary_matplotlib = pd.DataFrame() # Ensure it's an empty df
-        else:
-            start_dt = pd.to_datetime(start_date_arg)
-            end_dt = pd.to_datetime(end_date_arg)
-            is_in_window = (summary_full.index >= start_dt) & (summary_full.index <= end_dt)
-            summary_matplotlib = summary_full[is_in_window]
+            logging.error("Analysis window start/end dates are missing. Cannot create plots.")
+            return None # Can't proceed without a valid window
+        
+        start_dt, end_dt = pd.to_datetime(start_date_arg), pd.to_datetime(end_date_arg)
+        
+        # Data for line plots (daily summary)
+        is_in_window = (summary_full.index >= start_dt) & (summary_full.index <= end_dt)
+        summary_for_plot = summary_full[is_in_window]
 
-        if not summary_matplotlib.empty:
-            plot_summary_matplotlib(summary_matplotlib, file_stem, profile.metadata, central_date=central_date_arg)
+        # Data for LWC colormesh (potentially higher temporal resolution)
+        # Select only the needed variables for efficiency
+        full_season_plot_data = profile.data[['lwc', 'height']]
+        is_in_lwc_window = (full_season_plot_data.timestamp >= start_dt) & (full_season_plot_data.timestamp <= end_dt)
+        lwc_data_for_plot = full_season_plot_data.sel(timestamp=is_in_lwc_window)
+
+
+        if not summary_for_plot.empty:
+            plot_summary_matplotlib(summary_for_plot, file_stem, profile.metadata, lwc_data_for_plot, central_date=central_date_arg)
+            plot_summary_plotly(summary_for_plot, file_stem, profile.metadata)
+            
         else:
             logging.warning(
                 f"No snowpack data found for {file_stem} in the analysis window "
-                f"({start_date_arg} to {end_date_arg}). Matplotlib plot will be skipped."
+                f"({start_date_arg} to {end_date_arg}). Plots will be skipped."
             )
 
         time_to_loc = find_time_to_loc(summary_full, reference_date=central_date_arg)
