@@ -253,7 +253,8 @@ def find_time_to_loc(summary_df: pd.DataFrame, reference_date: datetime) -> floa
 
     # 4. Find the penetration event closest to the reference date (past or future).
     #    Calculate the absolute time difference for each event.
-    penetration_df['time_diff'] = (penetration_df.copy().index - reference_date).total_seconds()
+    penetration_df = penetration_df.copy()
+    penetration_df['time_diff'] = (penetration_df.index - reference_date).total_seconds()
     
     #    Find the index of the event with the smallest absolute difference.
     closest_event_time = penetration_df.loc[penetration_df['time_diff'].abs().idxmin()].name

@@ -14,7 +14,7 @@ IS_DEV_ENVIRONMENT = os.name == 'nt'
 # --- TESTING SUITE FLAG ---
 # Set this to True to use a small subset of polygons for faster debugging.
 # Set it to False to run the full analysis.
-USE_TEST_DATA = False 
+USE_TEST_DATA = True 
 
 # --- PATH DEFINITIONS ---
 # Use a more robust method to define paths relative to this config file
@@ -38,6 +38,7 @@ PRO_FILES_BASE_PATH_DEV = DATA_PATH / "input"
 INPUT_POLYGONS_GEOJSON = REFERENCE_PATH / 'Paths.geojson'
 INPUT_POLYGONS_GEOJSON_TEST = REFERENCE_PATH / 'Paths_test.geojson' # New test file path
 SNOWPACK_LOCATIONS_CSV = REFERENCE_PATH / 'snowpack_locations_with_metadata.csv'
+SNOWPACK_VIEWER_LOCATIONS_CSV = REFERENCE_PATH / 'snowpack_viewer_locations.csv'
 DEM_TIF = PROCESSED_DATA_PATH / 'dem.tif'
 ASPECT_POLYGONS_GEOJSON = PROCESSED_DATA_PATH / 'aspect_polygons.geojson'
 LINKED_POLYGONS_GEOJSON = PROCESSED_DATA_PATH / 'linked_aspect_polygons.geojson'

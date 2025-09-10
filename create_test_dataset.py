@@ -4,10 +4,10 @@ from pathlib import Path
 # Define paths relative to the project root
 PROJECT_ROOT = Path(__file__).resolve().parent
 REFERENCE_PATH = PROJECT_ROOT / 'data' / 'reference'
-INPUT_FILE = REFERENCE_PATH / 'HighwayPaths.geojson'
-OUTPUT_FILE = REFERENCE_PATH / 'HighwayPaths_test.geojson'
+INPUT_FILE = REFERENCE_PATH / 'Paths.geojson'
+OUTPUT_FILE = REFERENCE_PATH / 'Paths_test.geojson'
 
-def create_test_suite_data(num_polygons: int = 50):
+def create_test_suite_data(num_polygons: int = 15):
     """
     Reads the main polygon GeoJSON file, takes a small subset of polygons,
     and saves them to a new file for testing purposes.
@@ -16,7 +16,7 @@ def create_test_suite_data(num_polygons: int = 50):
 
     if not INPUT_FILE.exists():
         print(f"ERROR: Input file not found at {INPUT_FILE}")
-        print("Please ensure the original 'HighwayPaths.geojson' exists.")
+        print("Please ensure the original 'Paths.geojson' exists.")
         return
 
     try:
