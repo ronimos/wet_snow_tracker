@@ -25,6 +25,9 @@ PROJECT_ROOT = SRC_PATH.parent
 # Core Directories
 DATA_PATH = PROJECT_ROOT / 'data'
 RESULTS_PATH = PROJECT_ROOT / 'results'
+ASSETS_SUBFOLDER_NAME = "plot_assets"
+ASSETS_PATH = RESULTS_PATH / ASSETS_SUBFOLDER_NAME
+
 REFERENCE_PATH = DATA_PATH / 'reference'
 PROCESSED_DATA_PATH = DATA_PATH / 'processed'
 
@@ -46,7 +49,7 @@ SUMMARY_MAP_HTML = RESULTS_PATH / "summary_map.html"
 PRO_FILE_MANIFEST = PROCESSED_DATA_PATH / "pro_file_manifest.txt"
 
 # Directory Creation
-for path in [DATA_PATH, RESULTS_PATH, REFERENCE_PATH, PROCESSED_DATA_PATH]:
+for path in [DATA_PATH, RESULTS_PATH, REFERENCE_PATH, PROCESSED_DATA_PATH, ASSETS_PATH]:
     path.mkdir(parents=True, exist_ok=True)
 
 # --- API KEY CONFIGURATION ---
@@ -70,11 +73,11 @@ DEM_DATASETS = [
 # --- Functions to generate standardized output paths ---
 def get_png_path(file_stem: str) -> Path:
     """Generates the output path for the Matplotlib PNG plot."""
-    return RESULTS_PATH / f"{file_stem}_wetting_front.png"
+    return ASSETS_PATH / f"{file_stem}_wetting_front.png"
 
 def get_html_path(file_stem: str) -> Path:
     """Generates the output path for the Plotly HTML plot."""
-    return RESULTS_PATH / f"{file_stem}_wetting_front.html"
+    return ASSETS_PATH / f"{file_stem}_wetting_front.html"
 
 
 # --- SNOWPACK PARAMETERS ---

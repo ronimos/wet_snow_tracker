@@ -1,41 +1,57 @@
 """
 main.py
+=======
 
-This script serves as the main entry point for the Wetting Front Tracker application.
-It orchestrates the entire workflow, from preparing geospatial data to analyzing
-snowpack files and generating a final summary map.
+This script serves as the main entry point and orchestrator for the Wetting 
+Front Tracker application. It manages the end-to-end workflow, from command-line
+argument parsing and geospatial data preparation to the parallelized analysis of
+snowpack files and the final generation of a summary map.
 
-The workflow consists of these main steps:
-1.  **Geodata Preparation (Optional):** If the `--regenerate-data` flag is used
-    or if processed files are missing, the script will:
-    a. Download and mosaic Digital Elevation Model (DEM) tiles.
-    b. Split input avalanche path polygons by terrain aspect (N, E, S, W).
-    c. Filter out small, insignificant polygon fragments.
-    d. Link the final polygons to the most relevant SNOWPACK (.pro) model output
-       files based on location and aspect.
+Workflow Overview:
+------------------
+1.  **Initialization:** The script begins by parsing command-line arguments, which
+    allow the user to specify a central analysis date, force data regeneration,
+    or define a custom time window for the analysis. It establishes the primary
+    time window (e.g., 7 days before and 72 hours after the central date).
 
-2.  **Snowpack Analysis:** The script now reads the `linked_aspect_polygons.geojson`
-    file and processes each polygon individually. For each polygon, it:
-    a. Extracts snowpack properties over time from the linked .pro file.
-    b. Tracks the depth of the wetting front (where Liquid Water Content > 3%).
-    c. Calculates the `time_to_loc`: the time (in hours) for the wetting front
-       to reach the identified weak layer, relative to a central analysis date.
+2.  **Geodata Preparation (Conditional):** If the `--regenerate-data` flag is used,
+    or if essential processed geodata files are missing, it triggers the
+    `prepare_geodata` module. This step downloads DEMs, splits input avalanche
+    path polygons by terrain aspect, and links each resulting polygon to its
+    most relevant SNOWPACK (.pro) model output file.
 
-3.  **Visualization:** For each processed polygon, the script generates:
-    a. An interactive HTML plot (Plotly) showing the full time-series analysis.
-    b. A static PNG plot (Matplotlib) showing a specific time window.
-    Finally, it creates a single summary map (`summary_map.html`) that displays all
-    the processed avalanche polygons, colored by their `time_to_loc` to indicate risk.
+3.  **Task Generation:** It reads the `linked_aspect_polygons.geojson` file, which
+    contains the geometries and the path to the corresponding .pro file for each
+    polygon to be analyzed. It creates a list of tasks, with each task
+    containing the necessary information to process one polygon.
+
+4.  **Parallel Snowpack Analysis:** Using Python's `multiprocessing` library, the
+    script distributes the analysis tasks across all available CPU cores. For
+    each polygon, a worker process:
+    a. Reads the linked .pro file into a `SnowpackProfile` object.
+    b. Calculates a time series of key snowpack metrics (e.g., weak layer
+       height, wetting front depth, total snow depth).
+    c. Applies a persistence logic to track the primary weak layer (LOC)
+       through melt events.
+    d. Calculates the final `time_to_loc` metric: the time (in hours) for the
+       wetting front to reach the weak layer relative to the central date.
+    e. Generates a static Matplotlib plot and an interactive Plotly plot for
+       the analysis time window.
+
+5.  **Aggregation and Final Visualization:** After all worker processes are complete,
+    the main script collects the results. It merges the analysis results (like
+    `time_to_loc`) back into the GeoDataFrame and calls the `plotting` module to
+    create the final `summary_map.html`. This map displays all polygons,
+    color-coded by their risk level, with tooltips and links to the detailed plots.
 
 Usage:
-    To run the full analysis with default settings (last 7 days to next 72 hours):
-    $ python -m src.wetting_front_tracker.main
-
-    To run for a specific central date:
-    $ python -m src.wetting_front_tracker.main --date YYYY-MM-DD
-
-    To force regeneration of all geospatial data:
-    $ python -m src.wetting_front_tracker.main --regenerate-data
+------
+- To run with default settings:
+  `python -m src.wetting_front_tracker.main`
+- To specify a central date:
+  `python -m src.wetting_front_tracker.main --date YYYY-MM-DD`
+- To force regeneration of all geodata:
+  `python -m src.wetting_front_tracker.main --regenerate-data`
 """
 import argparse
 import logging
@@ -170,10 +186,10 @@ def _persist_loc_height(summary_df: pd.DataFrame, reference_date: datetime) -> p
         
     # 4. Apply persistence logic from the trigger time onwards.
     persisted_loc = summary_df['weak_layer_height'].copy()
-    wet_season_mask = summary_df.index >= trigger_time
+    wet_season_mask: pd.Series = summary_df.index >= trigger_time
     
     # Create a series of LOCs for the wet season, anchored by our determined lock height.
-    wet_loc_series = summary_df.loc[wet_season_mask, 'weak_layer_height']
+    wet_loc_series: pd.Series = summary_df.loc[wet_season_mask, 'weak_layer_height']
     anchored_series = pd.concat([pd.Series([initial_lock_height]), wet_loc_series.reset_index(drop=True)])
     
     # The running maximum handles the "or higher if it moved up" logic.
@@ -217,7 +233,7 @@ def process_single_profile(pro_file_path: Path, aspect: str, start_date_arg: str
     """
     try:
         profile, file_stem = _initialize_and_validate_profile(pro_file_path, aspect)
-        if not profile:
+        if not profile or not profile.data or not file_stem:
             return None
         
         time_coords = pd.to_datetime(profile.data.timestamp.values)
@@ -241,7 +257,8 @@ def process_single_profile(pro_file_path: Path, aspect: str, start_date_arg: str
         prepared_summary = _unpack_and_prepare_summary(raw_summary)
         
         # Apply the robust persistence logic
-        summary_full = _persist_loc_height(prepared_summary, central_date_arg)
+        referance_date = central_date_arg or datetime.now()
+        summary_full = _persist_loc_height(prepared_summary, referance_date)
 
         # Generate plots and calculate final metrics
         
@@ -266,7 +283,7 @@ def process_single_profile(pro_file_path: Path, aspect: str, start_date_arg: str
 
         if not summary_for_plot.empty:
             plot_summary_matplotlib(summary_for_plot, file_stem, profile.metadata, lwc_data_for_plot, central_date=central_date_arg)
-            plot_summary_plotly(summary_for_plot, file_stem, profile.metadata)
+            plot_summary_plotly(summary_for_plot, file_stem, profile.metadata, central_date=central_date_arg)
             
         else:
             logging.warning(
@@ -274,12 +291,13 @@ def process_single_profile(pro_file_path: Path, aspect: str, start_date_arg: str
                 f"({start_date_arg} to {end_date_arg}). Plots will be skipped."
             )
 
-        time_to_loc = find_time_to_loc(summary_full, reference_date=central_date_arg)
+        time_to_loc = find_time_to_loc(summary_full, reference_date=referance_date)
 
         return {
             "station_name": profile.metadata.get('stationName', file_stem),
             "file_stem": file_stem,
             "time_to_loc": time_to_loc,
+            "central_date_str": central_date_arg.strftime('%Y-%m-%d %H:%M') if central_date_arg else None
         }
 
     except Exception as e:
@@ -304,6 +322,34 @@ def worker_wrapper(task_tuple: tuple) -> dict[str, Any] | None:
     """
     return process_single_profile(*task_tuple)
 
+def _get_closest_synoptic_time(reference_time: datetime) -> datetime:
+    """
+    Finds the closest standard synoptic time (00, 06, 12, 18 UTC) to a given datetime.
+
+    This ensures that the analysis is centered on a standard meteorological
+    reporting time, providing consistency.
+
+    Args:
+        reference_time (datetime): The input time (e.g., current time or a
+                                     user-specified time).
+
+    Returns:
+        datetime: The datetime object representing the closest synoptic time.
+    """
+    base_date = reference_time.date()
+    # Create candidate times on the same day as the reference time
+    candidates = [
+        datetime.combine(base_date, datetime.min.time()).replace(hour=h)
+        for h in [0, 6, 12, 18]
+    ]
+    # To be thorough, also check the last synoptic time of the previous day
+    # and the first of the next day.
+    candidates.insert(0, candidates[0] - timedelta(hours=6))
+    candidates.append(candidates[1] + timedelta(days=1))
+
+    # Find the candidate with the minimum absolute time difference
+    return min(candidates, key=lambda dt: abs(reference_time - dt))
+
 def parse_args() -> argparse.Namespace:
     """
     Sets up and parses command-line arguments for the script.
@@ -312,7 +358,7 @@ def parse_args() -> argparse.Namespace:
     regeneration and setting the analysis time window.
 
     Returns:
-        An argparse.Namespace object containing the parsed command-line arguments.
+        argparse.Namespace: An object containing the parsed command-line arguments.
     """
     parser = argparse.ArgumentParser(
         description="Run wet snow tracker analysis on SNOWPACK .pro files.",
@@ -324,10 +370,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "-d", "--date", dest="central_date",
-        help="Central date for analysis (YYYY-MM-DD). Overrides start/end."
+        help="Central date and time for analysis (e.g., 'YYYY-MM-DD HH:MM' or 'YYYY-MM-DD'). "
+             "Rounds to the closest synoptic time (00, 06, 12, 18)."
     )
-    parser.add_argument("-s", "--start", dest="start_date", help="Start date for analysis.")
-    parser.add_argument("-e", "--end", dest="end_date", help="End date for analysis.")
+    parser.add_argument("-s", "--start", dest="start_date", help="Start date for analysis (overrides default window).")
+    parser.add_argument("-e", "--end", dest="end_date", help="End date for analysis (overrides default window).")
     return parser.parse_args()
 
 
@@ -339,23 +386,33 @@ def main():
     and the parallel processing of snowpack files before generating the
     final summary map.
     """
-    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+    logging.basicConfig(level=logging.WARNING, format='%(levelname)s: %(message)s')
     args = parse_args()
 
     # --- Date Handling ---
-    now = datetime.now()
     if args.central_date:
         try:
-            central_date = datetime.strptime(args.central_date, '%Y-%m-%d')
-            start_date = (central_date - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
-            end_date = (central_date + timedelta(hours=72)).strftime('%Y-%m-%d %H:%M:%S')
+            # First, try parsing with both date and time
+            initial_ref_time = datetime.strptime(args.central_date, '%Y-%m-%d %H:%M')
         except ValueError:
-            logging.error("Invalid date format. Use YYYY-MM-DD.")
-            return
+            try:
+                # If that fails, try parsing with date only (time defaults to noon)
+                date_only = datetime.strptime(args.central_date, '%Y-%m-%d')
+                initial_ref_time = date_only.replace(hour=12)
+            except ValueError:
+                logging.error("Invalid date format. Use 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM'.")
+                return
     else:
-        start_date = args.start_date or (now - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
-        end_date = args.end_date or (now + timedelta(hours=72)).strftime('%Y-%m-%d %H:%M:%S')
-        central_date = now
+        # If no date is provided, use the current time
+        initial_ref_time = datetime.now()
+
+    # Find the closest synoptic time to use as the central reference
+    central_date = _get_closest_synoptic_time(initial_ref_time)
+    logging.info(f"Input time '{initial_ref_time.strftime('%Y-%m-%d %H:%M')}' rounded to closest synoptic time: {central_date.strftime('%Y-%m-%d %H:%M')}")
+
+    # Define analysis window based on the rounded central date
+    start_date = args.start_date or (central_date - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
+    end_date = args.end_date or (central_date + timedelta(hours=72)).strftime('%Y-%m-%d %H:%M:%S')
 
     if args.regenerate_data or not LINKED_POLYGONS_GEOJSON.exists():
         logging.info("Regenerating all processed data...")
@@ -369,7 +426,7 @@ def main():
     try:
         linked_gdf = gpd.read_file(LINKED_POLYGONS_GEOJSON)
     except Exception as e:
-        logging.error(f"Could not read {LINKED_POLYGONS_GEOJSON}. Run with --regenerate-data.", exc_info=True)
+        logging.error(f"Could not read {LINKED_POLYGONS_GEOJSON}. Run with --regenerate-data. ({e})", exc_info=True)
         return
 
     # --- Task Generation ---
@@ -378,7 +435,7 @@ def main():
     for poly in linked_gdf.itertuples(index=False):
         original_path = poly.pro_file_path
         aspect = poly.aspect
-        effective_path = Path(original_path)
+        effective_path = Path(str(original_path))
         if IS_DEV_ENVIRONMENT:
             try:
                 relative_part = effective_path.relative_to(prod_base)
@@ -393,16 +450,15 @@ def main():
     with multiprocessing.Pool(processes=os.cpu_count()) as pool:
         results = list(tqdm(pool.map(worker_wrapper, tasks), total=len(tasks)))
 
-    valid_results = [res for res in results if res is not None]
-    if valid_results:
+    if valid_results := [res for res in results if res is not None]:
         logging.info("All polygons processed. Creating summary map...")
         results_df = pd.DataFrame(valid_results)
         # The order is preserved by pool.map, so we can concatenate horizontally
-        final_gdf = pd.concat([
+        final_gdf = gpd.GeoDataFrame(pd.concat([
             linked_gdf.reset_index(drop=True), 
             results_df.reset_index(drop=True)
-        ], axis=1)
-        create_folium_map(final_gdf, SUMMARY_MAP_HTML)
+        ], axis=1))
+        create_folium_map(final_gdf, SUMMARY_MAP_HTML, central_date)
     else:
         logging.info("No valid results were generated, skipping map creation.")
 

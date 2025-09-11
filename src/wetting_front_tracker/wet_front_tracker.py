@@ -215,62 +215,90 @@ def lwc_above_weak(df: pd.DataFrame, weak_layer_func: Callable) -> tuple[float |
     # Return the specific LWC and height values (scalars) from that single layer
     return df.loc[interface_layer_idx]['lwc'], df.loc[interface_layer_idx]['height']
 
+
 def find_time_to_loc(summary_df: pd.DataFrame, reference_date: datetime) -> float | None:
     """
     Calculates the time (in hours) for the wetting front to reach the weak layer,
     measured from a specific reference date.
 
-    This function finds the first time the front penetrates the LOC and calculates
-    the time difference from the reference date. The result can be positive (future)
-    or negative (past).
+    Finds the penetration event closest to the reference date. The result can be 
+    positive (future) or negative (past).
 
     Args:
-        summary_df: A pandas DataFrame with a DateTimeIndex and columns for
+        summary_df: A pandas DataFrame with a DateTimeIndex and columns:
                     'wet_front_lwc_height' and 'weak_layer_height'.
         reference_date: The central date for the analysis.
 
     Returns:
-        The time in hours from the reference date until the wetting front
-        reaches the weak layer. Returns NaN if it never reaches the layer.
+        Time in hours from reference date until wetting front reaches weak layer.
+        Returns NaN if the front never reaches the layer or input is invalid.
     """
     if summary_df is None or summary_df.empty or reference_date is None:
         return np.nan
 
-    # 1. Ensure required columns exist
+    # Ensure required columns exist
     if 'wet_front_lwc_height' not in summary_df or 'weak_layer_height' not in summary_df:
         return np.nan
 
-    # 2. Find all timestamps where the wetting front is at or below the weak layer
+    # Ensure index is a DatetimeIndex
+    if not isinstance(summary_df.index, pd.DatetimeIndex):
+        summary_df = summary_df.copy()
+        summary_df.index = pd.to_datetime(summary_df.index)
+
+    # Find all timestamps where wetting front is at or below weak layer
     penetration_df = summary_df[
         summary_df['wet_front_lwc_height'].notna() &
         summary_df['weak_layer_height'].notna() &
         (summary_df['wet_front_lwc_height'] <= summary_df['weak_layer_height'])
     ]
 
-    # 3. If the front never penetrates the weak layer, we can't calculate a time.
     if penetration_df.empty:
         return np.nan
 
-    # 4. Find the penetration event closest to the reference date (past or future).
-    #    Calculate the absolute time difference for each event.
-    penetration_df = penetration_df.copy()
-    penetration_df['time_diff'] = (penetration_df.index - reference_date).total_seconds()
-    
-    #    Find the index of the event with the smallest absolute difference.
-    closest_event_time = penetration_df.loc[penetration_df['time_diff'].abs().idxmin()].name
+    # Calculate time difference from reference date in seconds
+    time_diffs = (penetration_df.index - reference_date).to_series().dt.total_seconds()
 
-    # 5. Calculate the final time_to_loc in hours from the reference date.
-    #    This value will be negative for past events and positive for future events.
-    return (closest_event_time - reference_date).total_seconds() / 3600.0
+    # Handle empty or NaN differences
+    valid_diffs = time_diffs.dropna()
+    if valid_diffs.empty:
+        return np.nan
 
+    # Find the event closest to the reference date
+    closest_idx = valid_diffs.abs().idxmin()
+
+    # Return time to LOC in hours
+    return float(valid_diffs.loc[closest_idx]) / 3600.0
 
 def get_total_snow_depth(df: pd.DataFrame) -> float:
-    """Calculates the total snow depth (HS) for a single daily profile."""
+    """
+    Calculates the total snow depth (HS) for a single daily profile.
+
+    This is a simple helper function designed to be passed to `get_profile_summary`.
+
+    Args:
+        df (pd.DataFrame): A DataFrame for a single day's snow profile.
+
+    Returns:
+        float: The maximum height value in the profile, or 0 if empty.
+    """
     return 0 if df.empty or "height" not in df else df['height'].max()
 
 
 def get_highest_wet_point(df: pd.DataFrame) -> float | None:
-    """Finds the height of the uppermost 'wet' layer in a daily profile."""
+    """
+    Finds the height of the uppermost 'wet' layer in a daily profile.
+
+    A layer is considered 'wet' if its grain type indicates melt forms or if
+    its LWC is above a 3% threshold. This function identifies the top of the
+    wet snow region in the snowpack.
+
+    Args:
+        df (pd.DataFrame): A DataFrame for a single day's snow profile.
+
+    Returns:
+        Optional[float]: The height of the highest wet layer, or None if no
+                         wet layers are found.
+    """
     if df.empty or "grain_type" not in df or "lwc" not in df:
         return None
     mask = ((df['grain_type'] >= 770) & (df['grain_type'] < 780)) | (df['lwc'] > 0.03)

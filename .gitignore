@@ -2,5 +2,6 @@
 /data/
 /results/
 /.venv/
+/src/wet_snow_tracker/temp.ipynb
 /src/wet_snow_tracker/__pycache__/*pyc
 /src/wetting_front_tracker/__pycache__/*pyc
