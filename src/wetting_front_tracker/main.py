@@ -283,7 +283,7 @@ def process_single_profile(pro_file_path: Path, aspect: str, start_date_arg: str
 
         if not summary_for_plot.empty:
             plot_summary_matplotlib(summary_for_plot, file_stem, profile.metadata, lwc_data_for_plot, central_date=central_date_arg)
-            plot_summary_plotly(summary_for_plot, file_stem, profile.metadata, central_date=central_date_arg)
+            plot_summary_plotly(summary_full, file_stem, profile.metadata, central_date=central_date_arg)
             
         else:
             logging.warning(

@@ -372,12 +372,12 @@ class SnowpackProfile:
         if self.data is None or self.data.timestamp.size == 0:
             return self
 
-        # Normalize the dataset's timestamps to midnight for a clean date comparison
-        timestamps = pd.to_datetime(self.data.timestamp.values).normalize()
+        # Use the full timestamps without normalization
+        timestamps = pd.to_datetime(self.data.timestamp.values)
         
-        # Create boolean masks, normalizing the boundary dates as well
-        start_mask = timestamps >= pd.to_datetime(start_date).normalize() if start_date else True
-        end_mask = timestamps <= pd.to_datetime(end_date).normalize() if end_date else True
+        # Create boolean masks using full timestamps
+        start_mask = timestamps >= pd.to_datetime(start_date) if start_date else True
+        end_mask = timestamps <= pd.to_datetime(end_date) if end_date else True
 
         combined_mask = start_mask & end_mask
         
@@ -542,6 +542,88 @@ class SnowpackProfile:
         if not summary_list:
             return pd.DataFrame()
         return pd.DataFrame(summary_list).set_index('date')
+
+
+    def get_full_timeseries_summary(
+        self,
+        parameters_to_calculate: Dict[str, Any],
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None
+    ) -> pd.DataFrame:
+        """
+        Extracts summary statistics for every available timestamp in the profile.
+
+        Unlike get_profile_summary, this method does not downsample to a daily
+        (noon) resolution. It processes every single profile (e.g., every 6 hours)
+        in the specified date range.
+
+        Args:
+            parameters_to_calculate (Dict[str, Any]): A dictionary mapping a
+                new column name to a callable function that accepts a DataFrame
+                and returns a scalar or tuple.
+            start_date (Optional[str]): Start date for the summary.
+            end_date (Optional[str]): End date for the summary.
+
+        Returns:
+            pd.DataFrame: A DataFrame with a 'timestamp' index and columns for
+            each requested summary statistic, at the original temporal resolution.
+        """
+        sliced_profile = self.slice(start_date, end_date)
+        if sliced_profile.data is None or sliced_profile.data.timestamp.size == 0:
+            return pd.DataFrame()
+        
+        data_in_range = sliced_profile.data
+        
+        # Safely convert to CPU-based pandas DataFrame
+        if GPU_AVAILABLE:
+            full_df = data_in_range.as_numpy().to_dataframe().reset_index()
+        else:
+            full_df = data_in_range.to_dataframe().reset_index()
+
+        if full_df.empty:
+            return pd.DataFrame()
+
+        summary_list = []
+        # Group by each unique timestamp to process each profile individually
+        for ts, profile_layers_raw in tqdm(full_df.groupby('timestamp'), desc="Processing full timeseries", leave=False):
+            summary_row: Dict[str, Any] = {'timestamp': ts}
+            
+            profile_layers = profile_layers_raw.copy()
+
+            if not profile_layers.empty:
+                for name, calc in parameters_to_calculate.items():
+                    if not callable(calc):
+                        logging.warning(f"Calculation for '{name}' is not a callable function. Skipping.")
+                        continue
+                    
+                    try:
+                        result = calc(profile_layers)
+                        
+                        # Explicitly handle return types to ensure scalars are added to the dict
+                        if result is None:
+                            summary_row[name] = np.nan
+                        elif isinstance(result, tuple):
+                            # Unpack tuple into separate columns, handling None within the tuple
+                            val1 = result[0] if result[0] is not None else np.nan
+                            summary_row[f"{name}_value"] = val1
+                            if len(result) > 1:
+                                val2 = result[1] if result[1] is not None else np.nan
+                                summary_row[f"{name}_height"] = val2
+                        else:
+                            # The result is a single scalar value
+                            summary_row[name] = result
+
+                    except Exception as e:
+                        logging.warning(f"Custom function for '{name}' at {ts} failed: {e}")
+                        # If a function fails, ensure a NaN is recorded for type consistency
+                        summary_row[name] = np.nan
+            
+            summary_list.append(summary_row)
+
+        if not summary_list:
+            return pd.DataFrame()
+            
+        return pd.DataFrame(summary_list).set_index('timestamp')
 
 
     def find_layer_by_criteria(

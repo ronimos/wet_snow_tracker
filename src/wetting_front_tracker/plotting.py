@@ -49,7 +49,7 @@ import xarray as xr
 import plotly.graph_objects as go
 from PIL import Image
 from typing import Any, Dict, Optional
-from branca.element import Template, MacroElement # type: ignore
+from branca.element import Template, MacroElement, Element # type: ignore
 
 from .param_config import get_png_path, get_html_path, RESULTS_PATH, ASSETS_SUBFOLDER_NAME  
 
@@ -594,6 +594,59 @@ def create_folium_map(final_gdf: gpd.GeoDataFrame, map_output_path: Path, centra
     m.get_root().add_child(macro)
 
     folium.LayerControl().add_to(m)    
+    
+    # Inject persistence JS
+    js = """
+        <script>
+        document.addEventListener("DOMContentLoaded", function() {
+            var mapObj = Object.values(window).find(v => v instanceof L.Map);
+            if (!mapObj) return;
+
+            // === Restore last view ===
+            var lastView = localStorage.getItem('preferredView');
+            if (lastView) {
+                try {
+                    var view = JSON.parse(lastView);
+                    mapObj.setView(view.center, view.zoom);
+                } catch(e) {}
+            }
+
+            // === Restore last basemap ===
+            var lastBase = localStorage.getItem('preferredBaseLayer');
+            if (lastBase) {
+                // Look for the layer control radio button matching this name
+                var labels = document.querySelectorAll('.leaflet-control-layers-base label');
+                labels.forEach(function(label) {
+                    if (label.textContent.trim() === lastBase) {
+                        var input = label.querySelector('input[type=radio]');
+                        if (input && !input.checked) {
+                            input.click(); // trigger Leaflet’s own logic
+                        }
+                    }
+                });
+            }
+
+            // === Save on base layer change ===
+            mapObj.on('baselayerchange', function(e) {
+                localStorage.setItem('preferredBaseLayer', e.name);
+            });
+
+            // === Save on move/zoom ===
+            function saveView() {
+                var center = mapObj.getCenter();
+                var zoom = mapObj.getZoom();
+                localStorage.setItem('preferredView', JSON.stringify({
+                    center: [center.lat, center.lng],
+                    zoom: zoom
+                }));
+            }
+            mapObj.on('moveend', saveView);
+            mapObj.on('zoomend', saveView);
+        });
+        </script>
+        """
+        
+    m.get_root().html.add_child(Element(js))   # type: ignore
     # --- Save map ---
     m.save(str(map_output_path))
     logging.info(f"Summary map saved to: {map_output_path}")
