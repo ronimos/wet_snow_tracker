@@ -122,15 +122,11 @@ def _unpack_and_prepare_summary(summary_df: pd.DataFrame) -> pd.DataFrame:
         A prepared DataFrame with unpacked columns and appropriate numeric
         data types, ready for further analysis.
     """
-    tuple_cols = {
-        "weak_layer": ['weak_layer_gs_diff', 'weak_layer_height'],
-        "wet_front_lwc": ['wet_front_lwc_value', 'wet_front_lwc_height'],
+    rename_map = {
+        "weak_layer_value": "weak_layer_gs_diff",
+        # "wet_front_lwc_value": "wet_front_lwc_value", # This is redundant
     }
-    for col, new_cols in tuple_cols.items():
-        if col in summary_df and summary_df[col].notna().any():
-            unpacked = pd.DataFrame(summary_df[col].dropna().tolist(), index=summary_df[col].dropna().index)
-            unpacked.columns = new_cols
-            summary_df = summary_df.join(unpacked)
+    summary_df.rename(columns=rename_map, inplace=True)
 
     numeric_cols = ['weak_layer_height', 'wet_front_lwc_height', 'hs']
     for col in numeric_cols:
@@ -159,51 +155,42 @@ def _persist_loc_height(summary_df: pd.DataFrame, reference_date: datetime) -> p
     if 'weak_layer_height' not in summary_df.columns or 'wet_front_lwc_height' not in summary_df.columns:
         return summary_df
 
-    # 1. Identify the start times of all melt events in the entire dataset.
     is_wet = summary_df['wet_front_lwc_height'].notna()
     event_starts = is_wet & ~is_wet.shift(1, fill_value=False)
     all_start_times = summary_df.index[event_starts]
 
-    # 2. Find the most recent melt event that started AT OR BEFORE the reference date.
     relevant_start_times = all_start_times[all_start_times <= reference_date]
 
     if relevant_start_times.empty:
-        # No melt event started by the reference date, so no persistence is applied.
         return summary_df
     
-    trigger_time = relevant_start_times[-1]  # This is the start of the most recent melt event.
+    trigger_time = relevant_start_times[-1]
 
-    # 3. Find the LOC to lock onto just before this trigger time.
     lookback_window_end = trigger_time
     lookback_window_start = lookback_window_end - timedelta(days=2)
     pre_melt_df = summary_df.loc[lookback_window_start:lookback_window_end]
     
-    initial_lock_height = pre_melt_df['weak_layer_height'].dropna().iloc[-1] if pre_melt_df['weak_layer_height'].notna().any() else np.nan
+    # FIX: Check if the filtered DataFrame is empty before accessing iloc[-1]
+    valid_pre_melt_locs = pre_melt_df['weak_layer_height'].dropna()
+    initial_lock_height = np.nan if valid_pre_melt_locs.empty else valid_pre_melt_locs.iloc[-1]
 
     if pd.isna(initial_lock_height):
-        # A melt event is starting, but no weak layer was found right before it.
         return summary_df
         
-    # 4. Apply persistence logic from the trigger time onwards.
     persisted_loc = summary_df['weak_layer_height'].copy()
     wet_season_mask: pd.Series = summary_df.index >= trigger_time
     
-    # Create a series of LOCs for the wet season, anchored by our determined lock height.
     wet_loc_series: pd.Series = summary_df.loc[wet_season_mask, 'weak_layer_height']
     anchored_series = pd.concat([pd.Series([initial_lock_height]), wet_loc_series.reset_index(drop=True)])
     
-    # The running maximum handles the "or higher if it moved up" logic.
     running_max_loc = anchored_series.cummax().iloc[1:].values
     
     persisted_loc.loc[wet_season_mask] = running_max_loc
 
-    # 5. Forward-fill to track the layer even on days it's not detected.
     persisted_loc_filled = persisted_loc.ffill()
 
-    # 6. The layer is eliminated when total snow depth (hs) is below its height.
     persisted_loc_filled[summary_df['hs'] < persisted_loc_filled] = np.nan
 
-    # 7. Overwrite the original column.
     summary_df['weak_layer_height'] = persisted_loc_filled
     
     return summary_df
@@ -236,10 +223,16 @@ def process_single_profile(pro_file_path: Path, aspect: str, start_date_arg: str
         if not profile or not profile.data or not file_stem:
             return None
         
-        time_coords = pd.to_datetime(profile.data.timestamp.values)
-        min_date_in_data, max_date_in_data = time_coords.min(), time_coords.max()
+        if central_date_arg:
+            min_date_in_data = central_date_arg - timedelta(days=7)
+            max_date_in_data = central_date_arg + timedelta(hours=72)
+        else:
+            # Use the full time range from the data for the analysis
+            min_date_in_data = pd.to_datetime(profile.data.timestamp.values[0])
+            max_date_in_data = pd.to_datetime(profile.data.timestamp.values[-1])
 
-        raw_summary = profile.get_profile_summary(
+        # MODIFICATION: Use the high-resolution summary function
+        raw_summary = profile.get_full_timeseries_summary(
             parameters_to_calculate={
                 "hs": get_total_snow_depth, 
                 "weak_layer": largest_fc_dh_gs_diff_bottom_half,
@@ -247,10 +240,10 @@ def process_single_profile(pro_file_path: Path, aspect: str, start_date_arg: str
                 "highest_wet_point": get_highest_wet_point,
                 "lwc_above_weak": lambda df: lwc_above_weak(df, largest_fc_dh_gs_diff_bottom_half)
             },
-            start_date=min_date_in_data.strftime('%Y-%m-%d'),
-            end_date=max_date_in_data.strftime('%Y-%m-%d'),
+            start_date=str(min_date_in_data),
+            end_date=str(max_date_in_data),
         ).copy()
-
+        
         if raw_summary.empty:
             return None
 
@@ -280,10 +273,13 @@ def process_single_profile(pro_file_path: Path, aspect: str, start_date_arg: str
         is_in_lwc_window = (full_season_plot_data.timestamp >= start_dt) & (full_season_plot_data.timestamp <= end_dt)
         lwc_data_for_plot = full_season_plot_data.sel(timestamp=is_in_lwc_window)
 
+        station_metadata = profile.metadata
+        del profile
+
 
         if not summary_for_plot.empty:
-            plot_summary_matplotlib(summary_for_plot, file_stem, profile.metadata, lwc_data_for_plot, central_date=central_date_arg)
-            plot_summary_plotly(summary_full, file_stem, profile.metadata, central_date=central_date_arg)
+            plot_summary_matplotlib(summary_for_plot, file_stem, station_metadata, lwc_data_for_plot, central_date=central_date_arg)
+            plot_summary_plotly(summary_full, file_stem, station_metadata, central_date=central_date_arg)
             
         else:
             logging.warning(
@@ -294,7 +290,7 @@ def process_single_profile(pro_file_path: Path, aspect: str, start_date_arg: str
         time_to_loc = find_time_to_loc(summary_full, reference_date=referance_date)
 
         return {
-            "station_name": profile.metadata.get('stationName', file_stem),
+            "station_name": station_metadata.get('stationName', file_stem),
             "file_stem": file_stem,
             "time_to_loc": time_to_loc,
             "central_date_str": central_date_arg.strftime('%Y-%m-%d %H:%M') if central_date_arg else None
@@ -371,7 +367,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-d", "--date", dest="central_date",
         help="Central date and time for analysis (e.g., 'YYYY-MM-DD HH:MM' or 'YYYY-MM-DD'). "
-             "Rounds to the closest synoptic time (00, 06, 12, 18)."
+             "Rounds to the closest synoptic time (00, 06, 12, 18).",
+             default="2025-05-09 12:00"  # Default to a future date for demonstration
     )
     parser.add_argument("-s", "--start", dest="start_date", help="Start date for analysis (overrides default window).")
     parser.add_argument("-e", "--end", dest="end_date", help="End date for analysis (overrides default window).")
@@ -386,7 +383,13 @@ def main():
     and the parallel processing of snowpack files before generating the
     final summary map.
     """
-    logging.basicConfig(level=logging.WARNING, format='%(levelname)s: %(message)s')
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        filename="wetting_front_tracker.log",
+        filemode="w"   # overwrite each run; use "a" to append
+    )    
+    
     args = parse_args()
 
     # --- Date Handling ---
@@ -447,8 +450,9 @@ def main():
         tasks.append((effective_path, aspect, start_date, end_date, central_date))
 
     logging.info(f"Starting parallel processing on {len(tasks)} polygons...")
-    with multiprocessing.Pool(processes=os.cpu_count()) as pool:
-        results = list(tqdm(pool.map(worker_wrapper, tasks), total=len(tasks)))
+    worker_count = max(1, os.cpu_count() - 1) if os.cpu_count() is not None else 1 # # type: ignore
+    with multiprocessing.Pool(processes=worker_count) as pool:
+        results = list(tqdm(pool.map(worker_wrapper, tasks, chunksize=1), total=len(tasks)))
 
     if valid_results := [res for res in results if res is not None]:
         logging.info("All polygons processed. Creating summary map...")

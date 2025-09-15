@@ -52,11 +52,11 @@ try:
     import cupy as xp
     _ = xp.arange(1)
     GPU_AVAILABLE = True
-    print("✅ GPU detected. Using cupy for accelerated calculations.")
+    logging.info("✅ GPU detected. Using cupy for accelerated calculations.")
 except (ImportError, RuntimeError):
     import numpy as xp
     GPU_AVAILABLE = False
-    print("ℹ️ No GPU or cupy found. Falling back to CPU using numpy.")
+    logging.info("ℹ️ No GPU or cupy found. Falling back to CPU using numpy.")
 # ---
 
 import pandas as pd
@@ -219,7 +219,12 @@ class SnowpackProfile:
 
         all_params = sorted({key for p in profiles for key in p if key != 'timestamp'})
         max_layers = max((len(p.get('height', [])) for p in profiles), default=0)
-        data_vars = {param: (("timestamp", "layer_index"), np.full((len(profiles), max_layers), np.nan, dtype=np.float32)) for param in all_params}
+        
+        # ✅ Use xp directly to create either numpy or cupy arrays from the start
+        data_vars = {
+            param: (("timestamp", "layer_index"), xp.full((len(profiles), max_layers), xp.nan, dtype=xp.float32)) 
+            for param in all_params
+        }
 
         for i, profile in enumerate(profiles):
             num_layers = len(profile.get('height', []))
@@ -227,15 +232,17 @@ class SnowpackProfile:
                 if param in profile:
                     values = profile.get(param)
                     if values is not None:
-                        arr[i, :num_layers] = np.array(values)[:num_layers]
+                        # ✅ Populate with the correct array type
+                        arr[i, :num_layers] = xp.array(values, dtype=xp.float32)[:num_layers]
 
-        if GPU_AVAILABLE:
-            for param, (dims, arr) in data_vars.items():
-                data_vars[param] = (dims, xp.asarray(arr))
+        # The second loop is no longer needed.
         
-        self.data = xr.Dataset(data_vars, coords={'timestamp': timestamps, 'layer_index': np.arange(max_layers)})
+        # For the coordinates, we still want a NumPy array for compatibility with xarray
+        layer_index_coords = np.arange(max_layers)
+        
+        self.data = xr.Dataset(data_vars, coords={'timestamp': timestamps, 'layer_index': layer_index_coords})
         self.data = self.data.sortby('timestamp')
-
+        
     def _parse_header_line(self, line: str):
         """Parses a single line from the [STATION_PARAMETERS] section."""
         for key, value in HEADER_MAP.items():
@@ -289,6 +296,13 @@ class SnowpackProfile:
         It corrects the data at the source by setting the physically
         meaningless surface `rc_flat` value to a large number.
         """
+        def _compute_term(term_under):
+            term_data = term_under.data.copy()
+            term_data[term_data <= 0] = xp.nan
+            term_sqrt = xp.sqrt(term_data)
+            return xr.DataArray(term_sqrt, dims=term_under.dims, coords=term_under.coords)
+
+            
         required_vars = {'density', 'grain_size', 'shear_strength', 'height'}
         if self.data is None or not required_vars.issubset(self.data.data_vars):
             logger.warning("Skipping rc_flat calculation due to missing variables or empty dataset.")
@@ -330,15 +344,17 @@ class SnowpackProfile:
         term1_under = A * (density / RHO_ICE * gs / GS_0)**B
         term2_under = 2 * tau_p * e_prime * dsl_over_sigman
 
-        term1_data = term1_under.data.copy()
-        term1_data[term1_data <= 0] = xp.nan
-        term1_sqrt = xp.sqrt(term1_data)
-        term1 = xr.DataArray(term1_sqrt, dims=term1_under.dims, coords=term1_under.coords)
+        term1 = _compute_term(term1_under)
+        #term1_data = term1_under.data.copy()
+        #term1_data[term1_data <= 0] = xp.nan
+        #term1_sqrt = xp.sqrt(term1_data)
+        #term1 = xr.DataArray(term1_sqrt, dims=term1_under.dims, coords=term1_under.coords)
 
-        term2_data = term2_under.data.copy()
-        term2_data[term2_data <= 0] = xp.nan
-        term2_sqrt = xp.sqrt(term2_data)
-        term2 = xr.DataArray(term2_sqrt, dims=term2_under.dims, coords=term2_under.coords)
+        term2 = _compute_term(term2_under)
+        #term2_data = term2_under.data.copy()
+        #term2_data[term2_data <= 0] = xp.nan
+        #term2_sqrt = xp.sqrt(term2_data)
+        #term2 = xr.DataArray(term2_sqrt, dims=term2_under.dims, coords=term2_under.coords)
         
         rc_flat_combined = term1 * term2
         rc_flat_filled_data = xp.nan_to_num(rc_flat_combined.data, nan=9999.0)
@@ -491,9 +507,9 @@ class SnowpackProfile:
                 profile_layers = profile_layers.sort_values('height').copy()
                 profile_layers['thickness'] = profile_layers['height'].diff()
                 base_h = from_height if (from_height is not None and above_or_below == 'above') else 0
-                if not profile_layers.empty:
-                    first_row_index = profile_layers.index[0]
-                    profile_layers.loc[first_row_index, 'thickness'] = np.float32(profile_layers['height'].iloc[0] - base_h)
+            if not profile_layers.empty:
+                first_row_index = profile_layers.index[0]
+                profile_layers.loc[first_row_index, 'thickness'] = np.float32(profile_layers['height'].iloc[0] - base_h)
 
             for name, calc in parameters_to_calculate.items():
                 if callable(calc):
@@ -544,6 +560,7 @@ class SnowpackProfile:
         return pd.DataFrame(summary_list).set_index('date')
 
 
+# In snowpack_reader.py
     def get_full_timeseries_summary(
         self,
         parameters_to_calculate: Dict[str, Any],
@@ -551,72 +568,77 @@ class SnowpackProfile:
         end_date: Optional[str] = None
     ) -> pd.DataFrame:
         """
-        Extracts summary statistics for every available timestamp in the profile.
+        Calculates summary statistics for every available timestamp in the profile.
 
-        Unlike get_profile_summary, this method does not downsample to a daily
-        (noon) resolution. It processes every single profile (e.g., every 6 hours)
-        in the specified date range.
+        This method processes every profile (e.g., every 6 hours) within the
+        specified date range without downsampling. It is memory-optimized to
+        iterate through the xarray dataset one timestamp at a time, making it
+        suitable for large datasets. If both start_date and end_date are None,
+        it processes the entire available time series.
 
         Args:
-            parameters_to_calculate (Dict[str, Any]): A dictionary mapping a
-                new column name to a callable function that accepts a DataFrame
-                and returns a scalar or tuple.
-            start_date (Optional[str]): Start date for the summary.
-            end_date (Optional[str]): End date for the summary.
+            parameters_to_calculate (Dict[str, Any]):
+                A dictionary where keys are descriptive names for the output
+                columns and values are callable functions. Each function accepts
+                a pandas DataFrame for a single profile and should return either
+                a single scalar value or a tuple of (value, height).
+
+            start_date (Optional[str]):
+                The start date for the analysis window (e.g., "YYYY-MM-DD").
+                If None, the summary starts from the beginning of the data.
+
+            end_date (Optional[str]):
+                The end date for the analysis window (e.g., "YYYY-MM-DD").
+                If None, the summary continues to the end of the data.
 
         Returns:
-            pd.DataFrame: A DataFrame with a 'timestamp' index and columns for
-            each requested summary statistic, at the original temporal resolution.
-        """
+            pd.DataFrame:
+                A DataFrame with a 'timestamp' index and columns for each
+                requested summary statistic, at the original temporal resolution
+                of the data.
+        """        
         sliced_profile = self.slice(start_date, end_date)
         if sliced_profile.data is None or sliced_profile.data.timestamp.size == 0:
             return pd.DataFrame()
-        
+
         data_in_range = sliced_profile.data
-        
-        # Safely convert to CPU-based pandas DataFrame
-        if GPU_AVAILABLE:
-            full_df = data_in_range.as_numpy().to_dataframe().reset_index()
-        else:
-            full_df = data_in_range.to_dataframe().reset_index()
-
-        if full_df.empty:
-            return pd.DataFrame()
-
         summary_list = []
-        # Group by each unique timestamp to process each profile individually
-        for ts, profile_layers_raw in tqdm(full_df.groupby('timestamp'), desc="Processing full timeseries", leave=False):
-            summary_row: Dict[str, Any] = {'timestamp': ts}
+
+        # ✅ Iterate through each timestamp in the xarray.Dataset directly
+        for ts_val in data_in_range.timestamp.values:
+            summary_row: Dict[str, Any] = {'timestamp': ts_val}
             
-            profile_layers = profile_layers_raw.copy()
+            # Select data for just one timestamp (a very small slice)
+            single_profile_ds = data_in_range.sel(timestamp=ts_val)
 
-            if not profile_layers.empty:
-                for name, calc in parameters_to_calculate.items():
-                    if not callable(calc):
-                        logging.warning(f"Calculation for '{name}' is not a callable function. Skipping.")
-                        continue
-                    
-                    try:
-                        result = calc(profile_layers)
-                        
-                        # Explicitly handle return types to ensure scalars are added to the dict
-                        if result is None:
-                            summary_row[name] = np.nan
-                        elif isinstance(result, tuple):
-                            # Unpack tuple into separate columns, handling None within the tuple
-                            val1 = result[0] if result[0] is not None else np.nan
-                            summary_row[f"{name}_value"] = val1
-                            if len(result) > 1:
-                                val2 = result[1] if result[1] is not None else np.nan
-                                summary_row[f"{name}_height"] = val2
-                        else:
-                            # The result is a single scalar value
-                            summary_row[name] = result
+            # ✅ Convert only this tiny slice to a pandas DataFrame for analysis
+            # This is far more memory-efficient.
+            if GPU_AVAILABLE:
+                profile_layers = single_profile_ds.as_numpy().to_dataframe().reset_index()
+            else:
+                profile_layers = single_profile_ds.to_dataframe().reset_index()
+            
+            if profile_layers.empty:
+                continue
 
-                    except Exception as e:
-                        logging.warning(f"Custom function for '{name}' at {ts} failed: {e}")
-                        # If a function fails, ensure a NaN is recorded for type consistency
+            for name, calc in parameters_to_calculate.items():
+                if not callable(calc):
+                    logging.warning(f"Calculation for '{name}' is not a callable function. Skipping.")
+                    continue
+                
+                try:
+                    result = calc(profile_layers)
+                    if result is None:
                         summary_row[name] = np.nan
+                    elif isinstance(result, tuple):
+                        summary_row[f"{name}_value"] = result[0] if result[0] is not None else np.nan
+                        if len(result) > 1:
+                            summary_row[f"{name}_height"] = result[1] if result[1] is not None else np.nan
+                    else:
+                        summary_row[name] = result
+                except Exception as e:
+                    logging.warning(f"Custom function for '{name}' at {ts_val} failed: {e}")
+                    summary_row[name] = np.nan
             
             summary_list.append(summary_row)
 
@@ -624,7 +646,6 @@ class SnowpackProfile:
             return pd.DataFrame()
             
         return pd.DataFrame(summary_list).set_index('timestamp')
-
 
     def find_layer_by_criteria(
         self,
@@ -828,6 +849,7 @@ def read_snowpack(pro_file_path: str) -> Optional[SnowpackProfile]:
         return None
           
 
+    
 if __name__ == '__main__':
     # --- Example Usage ---
     # This block demonstrates a multi-step analysis using the new slice() method.
@@ -851,20 +873,20 @@ if __name__ == '__main__':
     if pro_path:
         try:
             reader = SnowpackProfile(pro_path)
-            print(f"\n{str(reader)}\n")
+            logging.info(f"\n{str(reader)}\n")
 
             # --- Example 1: Get a summary for a specific date range ---
-            print("--- Example 1: Getting summary for February 2025 ---")
+            logging.info("--- Example 1: Getting summary for February 2025 ---")
             feb_profile = reader.slice(start_date='2025-02-01', end_date='2025-02-28')
             
             summary_df = feb_profile.get_profile_summary(
                 parameters_to_calculate={'height-max': ('height', 'max')}
             )
-            print("Max snow height for each day in February:")
-            print(summary_df.head())
+            logging.info("Max snow height for each day in February:")
+            logging.info(summary_df.head())
 
             # --- Example 2: Find layers by criteria in the sliced data ---
-            print("\n--- Example 2: Finding weak layers in February 2025 ---")
+            logging.info("\n--- Example 2: Finding weak layers in February 2025 ---")
             weak_layer_criteria = {
                 'depth': '30 to 100',
                 'rc_flat': '< 0.2',
@@ -873,13 +895,13 @@ if __name__ == '__main__':
             found_layers_df = feb_profile.find_layer_by_criteria(criteria=weak_layer_criteria)
             
             if not found_layers_df.empty:
-                print("Found layers matching criteria in February:")
-                print(found_layers_df)
+                logging.info("Found layers matching criteria in February:")
+                logging.info(found_layers_df)
             else:
                 logger.info("No layers found matching criteria in February.")
 
             # --- Example 3: Chained analysis to find slab properties above a weak layer ---
-            print("\n--- Example 3: Chained analysis for slab properties ---")
+            logging.info("\n--- Example 3: Chained analysis for slab properties ---")
             
             # First, get the location of the weakest layer for each day in our sliced profile
             weak_layer_locations = feb_profile.get_profile_summary(
@@ -911,10 +933,10 @@ if __name__ == '__main__':
             if slab_analysis_results:
                 slab_df = pd.concat(slab_analysis_results)
                 final_df = weak_layer_locations.join(slab_df, how='inner')
-                print("\nCombined Daily Weak Layer and Slab Analysis for February:")
-                print(final_df.head())
+                logging.info("\nCombined Daily Weak Layer and Slab Analysis for February:")
+                logging.info(final_df.head())
             else:
-                print("\nCould not perform slab analysis.")
+                logging.info("\nCould not perform slab analysis.")
 
         except Exception as e:
             logger.error(f"An error occurred during analysis: {e}", exc_info=True)

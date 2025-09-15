@@ -50,7 +50,7 @@ import plotly.graph_objects as go
 from PIL import Image
 from typing import Any, Dict, Optional
 from branca.element import Template, MacroElement, Element # type: ignore
-
+from datetime import datetime
 from .param_config import get_png_path, get_html_path, RESULTS_PATH, ASSETS_SUBFOLDER_NAME  
 
 def _create_thumbnail(png_path: Path, thumb_path: Path, max_size: tuple[int, int] = (800, 534)) -> None:
@@ -596,6 +596,7 @@ def create_folium_map(final_gdf: gpd.GeoDataFrame, map_output_path: Path, centra
     folium.LayerControl().add_to(m)    
     
     # Inject persistence JS
+
     js = """
         <script>
         document.addEventListener("DOMContentLoaded", function() {
@@ -611,20 +612,22 @@ def create_folium_map(final_gdf: gpd.GeoDataFrame, map_output_path: Path, centra
                 } catch(e) {}
             }
 
-            // === Restore last basemap ===
-            var lastBase = localStorage.getItem('preferredBaseLayer');
-            if (lastBase) {
-                // Look for the layer control radio button matching this name
-                var labels = document.querySelectorAll('.leaflet-control-layers-base label');
-                labels.forEach(function(label) {
-                    if (label.textContent.trim() === lastBase) {
-                        var input = label.querySelector('input[type=radio]');
-                        if (input && !input.checked) {
-                            input.click(); // trigger Leaflet’s own logic
+            // === Restore last basemap (with a delay) ===
+            // We use a short timeout to ensure the layer control has been added to the map
+            setTimeout(function() {
+                var lastBase = localStorage.getItem('preferredBaseLayer');
+                if (lastBase) {
+                    var labels = document.querySelectorAll('.leaflet-control-layers-base label');
+                    labels.forEach(function(label) {
+                        if (label.textContent.trim() === lastBase) {
+                            var input = label.querySelector('input[type=radio]');
+                            if (input && !input.checked) {
+                                input.click(); // trigger Leaflet’s own logic
+                            }
                         }
-                    }
-                });
-            }
+                    });
+                }
+            }, 500); // 500ms delay
 
             // === Save on base layer change ===
             mapObj.on('baselayerchange', function(e) {
@@ -645,8 +648,7 @@ def create_folium_map(final_gdf: gpd.GeoDataFrame, map_output_path: Path, centra
         });
         </script>
         """
-        
     m.get_root().html.add_child(Element(js))   # type: ignore
     # --- Save map ---
     m.save(str(map_output_path))
-    logging.info(f"Summary map saved to: {map_output_path}")
+    print(f"Summary map saved to: {map_output_path} at {datetime.now().strftime("%Y-%n-%d %H:%M")}")

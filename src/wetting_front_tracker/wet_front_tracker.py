@@ -132,14 +132,14 @@ def wet_front_form(df: pd.DataFrame):
                        deepest wet grain form, or None if not found.
     """
     if df.empty or "grain_type" not in df:
-        return None
+        return None, None
 
     # SNOWPACK grain codes for wet forms range from 770 to 779.
     mask = (df['grain_type'] >= 770) & (df['grain_type'] < 780)
     candidates = df[mask]
 
     if candidates.empty:
-        return None
+        return None, None
 
     # The deepest layer is the one with the minimum height.
     deepest = candidates.loc[candidates['height'].idxmin()]
@@ -164,13 +164,13 @@ def wet_front_lwc(df: pd.DataFrame):
                        sufficiently wet layer, or None if not found.
     """
     if df.empty or "lwc" not in df:
-        return None
+        return None, None
 
     mask = df['lwc'] >= 0.04
     candidates = df[mask]
 
     if candidates.empty:
-        return None
+        return None, None
 
     # The deepest layer is the one with the minimum height.
     deepest_idx = candidates['height'].idxmin()

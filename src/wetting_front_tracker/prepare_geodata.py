@@ -59,7 +59,7 @@ from .param_config import (OPENTOPO_API_KEY,
                            INPUT_POLYGONS_GEOJSON, LINKED_POLYGONS_GEOJSON,
                            PRO_FILE_MANIFEST, SNOWPACK_LOCATIONS_CSV)
 
-logging.basicConfig(level=logging.WARNING, format='%(levelname)s: %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
 
 @njit
