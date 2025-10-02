@@ -339,7 +339,9 @@ def _configure_plot_aesthetics(fig: Figure,
 def plot_summary_matplotlib(df: pd.DataFrame, file_stem: str, 
                             metadata: dict[str, Any], 
                             lwc_plot_data: xr.Dataset | None = None, 
-                            central_date: datetime | None = None) -> None:
+                            central_date: datetime | None = None,
+                            assets_dir: Path | None = None,
+                            ) -> None:
     """ 
     Generates and saves a static PNG plot of the snowpack analysis.
 
@@ -351,6 +353,7 @@ def plot_summary_matplotlib(df: pd.DataFrame, file_stem: str,
         df (pd.DataFrame): The summary DataFrame with daily analysis results.
         file_stem (str): A unique identifier used to name the output file.
         metadata (Dict[str, Any]): Metadata about the snowpack profile.
+        assets_dir (Path): The directory where plot assets are stored.
         lwc_plot_data (Optional[xr.Dataset]): The full-resolution LWC data for
                                               the colormesh background.
         central_date (Optional[datetime]): The reference date for the analysis,
@@ -367,14 +370,17 @@ def plot_summary_matplotlib(df: pd.DataFrame, file_stem: str,
 
     _plot_line_series(ax, df, central_date)
     _configure_plot_aesthetics(fig, ax, metadata, c, central_date)
-    
-    plt.savefig(get_png_path(file_stem), dpi=300)
+    if assets_dir is not None:
+        plt.savefig(get_png_path(file_stem, assets_dir), dpi=300)
+    else:
+        logging.warning("Assets directory not provided; cannot save tooltip Matplotlib plot.")   
     plt.close(fig)
         
 def plot_summary_plotly(df: pd.DataFrame, 
                         file_stem: str, 
                         metadata: dict[str, Any], 
-                        central_date: Optional[datetime] = None
+                        central_date: Optional[datetime] = None,
+                        assets_dir: Path | None = None,
 ) -> None:
     """
     Generates an interactive HTML page containing a Plotly plot of the analysis.
@@ -386,6 +392,7 @@ def plot_summary_plotly(df: pd.DataFrame,
     Args:
         df (pd.DataFrame): The summary DataFrame with daily analysis results.
         file_stem (str): A unique identifier used to name the output file.
+        assets_dir (Path): The directory where plot assets are stored.
         metadata (Dict[str, Any]): Metadata about the snowpack profile.
         central_date (Optional[datetime]): The central analysis date for the title.
     """
@@ -439,12 +446,17 @@ def plot_summary_plotly(df: pd.DataFrame,
         fig.update_yaxes(range=[0, df['hs'].max() * 1.1])
     
     full_html = _generate_html_from_template(fig.to_html(full_html=False, include_plotlyjs='cdn'), metadata, central_date)
-    
-    with open(get_html_path(file_stem), 'w') as f:
-        f.write(full_html)
+    if assets_dir is not None:
+        with open(get_html_path(file_stem, assets_dir), 'w') as f:
+            f.write(full_html)
+    else:
+        logging.warning("Assets directory not provided; cannot save Plotly HTML.")
 
 
-def create_folium_map(final_gdf: gpd.GeoDataFrame, map_output_path: Path, central_date: datetime) -> None:
+def create_folium_map(final_gdf: gpd.GeoDataFrame, 
+                      map_output_path: Path, 
+                      central_date: datetime,
+                      assets_dir: Path) -> None:
     """
     Creates a Folium summary map with polygons colored by risk level.
 
@@ -458,6 +470,7 @@ def create_folium_map(final_gdf: gpd.GeoDataFrame, map_output_path: Path, centra
                                       geometries and all associated analysis results.
         map_output_path (Path): The path to save the final summary_map.html file.
         central_date (datetime): The central analysis date for the map title.
+        assets_dir (Path): The directory where plot assets are stored.
     """
     if final_gdf.empty:
         logging.warning("GeoDataFrame is empty. Cannot create map.")
@@ -473,23 +486,25 @@ def create_folium_map(final_gdf: gpd.GeoDataFrame, map_output_path: Path, centra
         if pd.isna(time_to_loc): 
             return 'gray'
         time = float(time_to_loc)
-        if time < -48:
-            return 'green'
-        elif -48 <= time < -24:
+        if 48 <= time <= 72:
             return 'yellow'
-        elif -24 <= time <= 0:
-            return 'purple'
-        elif 0 < time <= 24: 
-            return 'red'
-        elif 24 < time <= 72: 
+        elif 24 <= time < 48:
             return 'orange'
-        else: 
+        elif 0 <= time < 24:
+            return 'darkred'
+        elif -24 <= time < 0:
+            return 'red'
+        elif -48 <= time < -24:
+            return 'lightblue'
+        elif -72 <= time < -48:
+            return 'darkblue'
+        else:
             return 'gray'
 
     def get_tooltip_html(row):
         if pd.isna(row['file_stem']): 
             return ""
-        png_path = get_png_path(row['file_stem'])
+        png_path = get_png_path(row['file_stem'], assets_dir)
         thumb_path = png_path.parent / f"{png_path.stem}_thumb.png"
         _create_thumbnail(png_path, thumb_path)
         image_path = f"{ASSETS_SUBFOLDER_NAME}/{thumb_path.name}"
@@ -502,7 +517,7 @@ def create_folium_map(final_gdf: gpd.GeoDataFrame, map_output_path: Path, centra
     def get_popup_html(row):
         if pd.isna(row['file_stem']): 
             return ""
-        html_path = get_html_path(row['file_stem'])
+        html_path = get_html_path(row['file_stem'], assets_dir)
         link_path = f"{ASSETS_SUBFOLDER_NAME}/{html_path.name}"
         date_str = f"Analysis Date: {row['central_date_str']}<br>" if pd.notna(row['central_date_str']) else ""
         return (f"<b>{row['station_name']}</b><br>"
@@ -539,14 +554,17 @@ def create_folium_map(final_gdf: gpd.GeoDataFrame, map_output_path: Path, centra
     date_str = central_date.strftime('%Y-%m-%d %H:%M') if central_date else ""
     title_html = f'<h3 align="center" style="font-size:16px"><b>Wetting Front Analysis | {date_str}</b></h3>'
     legend_html = """
-        <b>Expected  Wetting Front Time at LOC</b><br>
-        <i style="background:red"></i> 0 to 24h<br>
-        <i style="background:orange"></i> 24 to 72h<br>
-        <i style="background:purple"></i> -24 to 0h (Recent)<br>
-        <i style="background:yellow"></i> -48 to -24h (Past)<br>
-        <i style="background:green"></i> &gt; 48h ago (Past)<br>
-        <i style="background:gray"></i> Other / No Data
-    """
+     <b>Time for Wetting Front to Reach LOC</b><br>
+     <i style="background:darkred"></i> 0 to 24h (Imminent)<br>
+     <i style="background:orange"></i> 24 to 48h<br>
+     <i style="background:yellow"></i> 48 to 72h<br>
+     <hr style='border-top: 1px solid grey; margin-top: 5px; margin-bottom: 5px;'>
+     <i style="background:red"></i> -24 to 0h (Recent)<br>
+     <i style="background:lightblue"></i> -48 to -24h (Past)<br>
+     <i style="background:darkblue"></i> -72 to -48h (Past)<br>
+     <hr style='border-top: 1px solid grey; margin-top: 5px; margin-bottom: 5px;'>
+     <i style="background:gray"></i> Other / No Data
+"""
 
     template = f"""
     {{% macro script(this, kwargs) %}}
@@ -651,4 +669,4 @@ def create_folium_map(final_gdf: gpd.GeoDataFrame, map_output_path: Path, centra
     m.get_root().html.add_child(Element(js))   # type: ignore
     # --- Save map ---
     m.save(str(map_output_path))
-    print(f"Summary map saved to: {map_output_path} at {datetime.now().strftime("%Y-%n-%d %H:%M")}")
+    print(f"Summary map saved to: {map_output_path} at {datetime.now().strftime("%Y-%m-%d %H:%M")}")

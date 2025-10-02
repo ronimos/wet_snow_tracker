@@ -59,18 +59,20 @@ import multiprocessing
 import os
 from pathlib import Path
 from typing import Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import geopandas as gpd
 import numpy as np
 from tqdm import tqdm
+import json
 
-from .param_config import (
-    ASPECT_POLYGONS_GEOJSON, INPUT_POLYGONS_GEOJSON, LINKED_POLYGONS_GEOJSON,
-    SUMMARY_MAP_HTML, IS_DEV_ENVIRONMENT, PRO_FILES_BASE_PATH_PROD, 
-    PRO_FILES_BASE_PATH_DEV, SNOWPACK_LOCATIONS_CSV
-)
+from .param_config import (ASSETS_PATH, INPUT_POLYGONS_GEOJSON,
+                           INPUT_POLYGONS_GEOJSON_TEST, ASPECT_POLYGONS_GEOJSON,
+                           LINKED_POLYGONS_GEOJSON, PRO_FILES_BASE_PATH,
+                           PRO_FILES_SOURCE, REMOTE_PRO_FILES_URL, RESULTS_PATH,
+                           SNOWPACK_LOCATIONS_CSV, USE_TEST_DATA,
+                           PRO_FILE_MANIFEST,)
 from .plotting import (create_folium_map, plot_summary_matplotlib, 
                        plot_summary_plotly)
 from .prepare_geodata import (link_polygons_to_pro_files,
@@ -81,6 +83,76 @@ from .wet_front_tracker import (find_time_to_loc, get_highest_wet_point,
                                 largest_fc_dh_gs_diff_bottom_half, wet_front_lwc)
 
 
+def generate_pro_file_manifest(base_path: Path, manifest_path: Path):
+    """Recursively scans a directory for .pro files and saves their paths to a manifest file.
+
+    The manifest is a JSON object that maps a simple filename (e.g., "station.pro") 
+    to its full, absolute path. This allows for quick lookups without needing to 
+    re-scan the entire filesystem on every run.
+
+    Args:
+        base_path (Path): The root directory to start the recursive scan from.
+        manifest_path (Path): The full path where the output JSON manifest 
+                              file will be saved.
+    """
+    logging.info(f"Scanning for .pro files under {base_path}...")
+    # Use rglob to find all files ending with .pro in all subdirectories
+    pro_files = list(base_path.rglob('*.pro'))
+    
+    # Create a dictionary of {filename: /full/path/to/file.pro}
+    manifest = {file.name: str(file.resolve()) for file in pro_files}
+    
+    # Write the dictionary to the specified JSON file
+    with open(manifest_path, 'w') as f:
+        json.dump(manifest, f, indent=4)
+    
+    logging.info(f"Pro file manifest with {len(manifest)} entries saved to {manifest_path}")
+    
+    
+def ensure_pro_file_is_local(file_name: str, local_input_path: Path, remote_base_url: str, central_date: datetime):
+    """
+    Checks if a .pro file exists locally and is fresh. If not, downloads it.
+    This is a placeholder for your actual download logic (e.g., from S3, HTTP).
+    """
+    local_file_path = local_input_path / file_name
+    
+    # 1. Check if file exists and is fresh (less than 12 hours old)
+    if local_file_path.exists():
+        mod_time_ts = os.path.getmtime(local_file_path)
+        mod_time_dt = datetime.fromtimestamp(mod_time_ts, tz=timezone.utc)
+        central_date_utc = central_date.replace(tzinfo=timezone.utc)
+        if (central_date_utc - mod_time_dt) < timedelta(hours=12):
+            logging.debug(f"'{file_name}' is fresh. Skipping download.")
+            return  # File is fresh, no need to download
+
+    # 2. If we reach here, the file is either missing or stale, so download it.
+    logging.info(f"Downloading '{file_name}'...")
+    remote_file_url = f"{remote_base_url.rstrip('/')}/{file_name}"
+    
+    # --- !!! ADD YOUR DOWNLOAD LOGIC HERE !!! ---
+    # Example for S3 using boto3:
+    # import boto3
+    # s3 = boto3.client('s3')
+    # bucket_name = "my-bucket"
+    # object_key = f"pro-files/{file_name}"
+    # s3.download_file(bucket_name, object_key, str(local_file_path))
+
+    # Example for HTTP using requests:
+    # import requests
+    # r = requests.get(remote_file_url, stream=True)
+    # if r.status_code == 200:
+    #     with open(local_file_path, 'wb') as f:
+    #         for chunk in r.iter_content(chunk_size=8192):
+    #             f.write(chunk)
+    # else:
+    #     logging.error(f"Failed to download {file_name}. Status: {r.status_code}")
+    
+    # For now, we'll just log a placeholder message.
+    logging.warning(f"Placeholder: Pretending to download from {remote_file_url} to {local_file_path}")
+    # You would create a dummy file for testing if needed
+    # local_file_path.touch()
+    
+    
 def _initialize_and_validate_profile(pro_file_path: Path, aspect: str) -> tuple[SnowpackProfile | None, str | None]:
     """
     Initializes a SnowpackProfile object and validates its data.
@@ -195,7 +267,12 @@ def _persist_loc_height(summary_df: pd.DataFrame, reference_date: datetime) -> p
     
     return summary_df
 
-def process_single_profile(pro_file_path: Path, aspect: str, start_date_arg: str | None = None, end_date_arg: str | None = None, central_date_arg: datetime | None = None) -> dict[str, Any] | None:
+def process_single_profile(pro_file_path: Path, 
+                           aspect: str, 
+                           start_date_arg: str | None = None, 
+                           end_date_arg: str | None = None, 
+                           central_date_arg: datetime | None = None,
+                           assets_path: Path | None = None) -> dict[str, Any] | None:
     """
     Handles the full analysis workflow for a single polygon and its linked .pro file.
     
@@ -213,6 +290,7 @@ def process_single_profile(pro_file_path: Path, aspect: str, start_date_arg: str
         end_date_arg: The end date for the analysis window.
         central_date_arg: The central reference date for the `time_to_loc`
                           calculation and for the vertical line on the plot.
+        assets_path: The directory where output plots should be saved.
 
     Returns:
         A dictionary containing results for the final summary map (station name,
@@ -278,8 +356,8 @@ def process_single_profile(pro_file_path: Path, aspect: str, start_date_arg: str
 
 
         if not summary_for_plot.empty:
-            plot_summary_matplotlib(summary_for_plot, file_stem, station_metadata, lwc_data_for_plot, central_date=central_date_arg)
-            plot_summary_plotly(summary_full, file_stem, station_metadata, central_date=central_date_arg)
+            plot_summary_matplotlib(summary_for_plot, file_stem, station_metadata, lwc_data_for_plot, central_date_arg, assets_path)
+            plot_summary_plotly(summary_full, file_stem, station_metadata, central_date_arg, assets_path)
             
         else:
             logging.warning(
@@ -370,8 +448,22 @@ def parse_args() -> argparse.Namespace:
              "Rounds to the closest synoptic time (00, 06, 12, 18).",
              default="2025-05-09 12:00"  # Default to a future date for demonstration
     )
-    parser.add_argument("-s", "--start", dest="start_date", help="Start date for analysis (overrides default window).")
-    parser.add_argument("-e", "--end", dest="end_date", help="End date for analysis (overrides default window).")
+    parser.add_argument("-s", "--start", dest="start_date", 
+                        help="Start date for analysis (overrides default window)."
+    )
+    parser.add_argument("-e", "--end", dest="end_date", 
+                        help="End date for analysis (overrides default window)."
+    )
+    parser.add_argument("-i", "--input-dir", dest="input_dir", 
+                        type=Path, default=None, help="Override default base directory for .pro files."
+    )
+    parser.add_argument("-o", "--output-dir", dest="output_dir", 
+                        type=Path, default=None, help="Override default directory for the final map."
+    )
+    parser.add_argument("-a", "--assets-dir", dest="assets_dir", 
+                        type=Path, default=None, help="Override default directory for plot assets."
+    )
+    
     return parser.parse_args()
 
 
@@ -391,80 +483,104 @@ def main():
     )    
     
     args = parse_args()
+    # --- Path Configuration ---
+    input_path = args.input_dir or PRO_FILES_BASE_PATH
+    output_path = args.output_dir or RESULTS_PATH
+    assets_path = args.assets_dir or ASSETS_PATH
+    output_path.mkdir(parents=True, exist_ok=True)
+    assets_path.mkdir(parents=True, exist_ok=True)
+    summary_map_path = output_path / "summary_map.html"
+    logging.info(f"Input .pro directory: {input_path}")
+    logging.info(f"Output map directory: {output_path}")
+    logging.info(f"Plot assets directory: {assets_path}")
 
-    # --- Date Handling ---
+    # --- Date Handling (Single Day) ---
     if args.central_date:
         try:
-            # First, try parsing with both date and time
+            # First, try parsing the full date and time
             initial_ref_time = datetime.strptime(args.central_date, '%Y-%m-%d %H:%M')
         except ValueError:
             try:
-                # If that fails, try parsing with date only (time defaults to noon)
-                date_only = datetime.strptime(args.central_date, '%Y-%m-%d')
-                initial_ref_time = date_only.replace(hour=12)
+                # If that fails, try parsing with date only
+                initial_ref_time = datetime.strptime(args.central_date, '%Y-%m-%d')
             except ValueError:
-                logging.error("Invalid date format. Use 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM'.")
+                logging.error(f"Invalid date format for '{args.central_date}'. Use 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM'.")
                 return
     else:
         # If no date is provided, use the current time
         initial_ref_time = datetime.now()
 
-    # Find the closest synoptic time to use as the central reference
     central_date = _get_closest_synoptic_time(initial_ref_time)
-    logging.info(f"Input time '{initial_ref_time.strftime('%Y-%m-%d %H:%M')}' rounded to closest synoptic time: {central_date.strftime('%Y-%m-%d %H:%M')}")
+    start_date = (central_date - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
+    end_date = (central_date + timedelta(hours=72)).strftime('%Y-%m-%d %H:%M:%S')
+    logging.info(f"Processing for central date: {central_date.strftime('%Y-%m-%d %H:%M')}")
 
-    # Define analysis window based on the rounded central date
-    start_date = args.start_date or (central_date - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
-    end_date = args.end_date or (central_date + timedelta(hours=72)).strftime('%Y-%m-%d %H:%M:%S')
-
+    # --- Geodata Preparation ---
+    input_geojson = INPUT_POLYGONS_GEOJSON_TEST if USE_TEST_DATA else INPUT_POLYGONS_GEOJSON
     if args.regenerate_data or not LINKED_POLYGONS_GEOJSON.exists():
-        logging.info("Regenerating all processed data...")
-        try:
-            prepare_aspect_polygons(INPUT_POLYGONS_GEOJSON, ASPECT_POLYGONS_GEOJSON, args.regenerate_data)
-            link_polygons_to_pro_files(ASPECT_POLYGONS_GEOJSON, SNOWPACK_LOCATIONS_CSV, LINKED_POLYGONS_GEOJSON)
-        except Exception as e:
-            logging.error(f"Failed during geodata preparation: {e}", exc_info=True)
-            return
+        logging.info("Regenerating all processed data and pro file manifest...")
+        
+        # First, generate the manifest so the geo-linking can use it if needed
+        generate_pro_file_manifest(input_path, PRO_FILE_MANIFEST)
+        
+        prepare_aspect_polygons(input_geojson, ASPECT_POLYGONS_GEOJSON, args.regenerate_data)
+        link_polygons_to_pro_files(ASPECT_POLYGONS_GEOJSON, SNOWPACK_LOCATIONS_CSV, LINKED_POLYGONS_GEOJSON)
 
     try:
         linked_gdf = gpd.read_file(LINKED_POLYGONS_GEOJSON)
-    except Exception as e:
-        logging.error(f"Could not read {LINKED_POLYGONS_GEOJSON}. Run with --regenerate-data. ({e})", exc_info=True)
+        with open(PRO_FILE_MANIFEST, 'r') as f:
+            pro_file_manifest = json.load(f)
+        logging.info(f"Successfully loaded pro file manifest with {len(pro_file_manifest)} entries.")
+    except FileNotFoundError:
+        logging.error(f"Manifest file not found at {PRO_FILE_MANIFEST}. Please run with --regenerate-data.")
         return
 
-    # --- Task Generation ---
-    tasks = []
-    prod_base = Path(PRO_FILES_BASE_PATH_PROD)
-    for poly in linked_gdf.itertuples(index=False):
-        original_path = poly.pro_file_path
-        aspect = poly.aspect
-        effective_path = Path(str(original_path))
-        if IS_DEV_ENVIRONMENT:
-            try:
-                relative_part = effective_path.relative_to(prod_base)
-                effective_path = PRO_FILES_BASE_PATH_DEV / relative_part
-            except ValueError:
-                logging.warning(f"Could not remap dev path for {original_path}, skipping.")
-                continue
-        
-        tasks.append((effective_path, aspect, start_date, end_date, central_date))
+    # --- NEW: Conditional Data Download Step ---
+    if PRO_FILES_SOURCE == 'remote':
+        logging.info("Checking for remote .pro files to download...")
+        # Create a unique set of filenames to check
+        required_files = {Path(p).name for p in linked_gdf['pro_file_path'].unique()}
+        for file_name in tqdm(required_files, desc="Updating data files"):
+            ensure_pro_file_is_local(file_name, input_path, REMOTE_PRO_FILES_URL, central_date)
+    else:
+        logging.info("Skipping remote file check. PRO_FILES_SOURCE is 'local'.")
 
+    # --- Task Generation (Single Day) ---
+    tasks = []
+    for poly in linked_gdf.itertuples(index=False):
+# Get the filename from the geodataframe
+        file_name = Path(str(poly.pro_file_path)).name
+        
+        # Look up the full path from our manifest dictionary
+        if full_pro_path_str := pro_file_manifest.get(file_name):
+            effective_path = Path(full_pro_path_str)
+            tasks.append((effective_path, poly.aspect, start_date, end_date, central_date, assets_path))
+        else:
+            logging.warning(f"File '{file_name}' from geojson not found in the manifest. Skipping.")
+    if not tasks:
+        logging.warning("No tasks were generated for processing. Exiting.")
+        return
+
+    # --- Parallel Processing ---
     logging.info(f"Starting parallel processing on {len(tasks)} polygons...")
-    worker_count = max(1, os.cpu_count() - 1) if os.cpu_count() is not None else 1 # # type: ignore
+    cpu_cores = os.cpu_count()
+    worker_count = int(max(1, cpu_cores / 4 )) if cpu_cores else 1 
     with multiprocessing.Pool(processes=worker_count) as pool:
         results = list(tqdm(pool.map(worker_wrapper, tasks, chunksize=1), total=len(tasks)))
 
+    # --- Aggregation and Final Map ---
     if valid_results := [res for res in results if res is not None]:
-        logging.info("All polygons processed. Creating summary map...")
         results_df = pd.DataFrame(valid_results)
-        # The order is preserved by pool.map, so we can concatenate horizontally
         final_gdf = gpd.GeoDataFrame(pd.concat([
-            linked_gdf.reset_index(drop=True), 
+            linked_gdf.reset_index(drop=True),
             results_df.reset_index(drop=True)
         ], axis=1))
-        create_folium_map(final_gdf, SUMMARY_MAP_HTML, central_date)
+        
+        logging.info("All polygons processed. Creating summary map...")
+        create_folium_map(final_gdf, summary_map_path, central_date, assets_path )
     else:
-        logging.info("No valid results were generated, skipping map creation.")
+        logging.info("No valid results were generated. Skipping map creation.")
+
 
 if __name__ == "__main__":
     main()

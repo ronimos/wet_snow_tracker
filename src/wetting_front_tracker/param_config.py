@@ -11,10 +11,19 @@ load_dotenv()
 # Detect if running on Windows (development) or another OS (production)
 IS_DEV_ENVIRONMENT = os.name == 'nt'
 
+# --- Data Source Configuration ---
+# Determines if .pro files are expected locally or should be fetched.
+# Options: 'local' or 'remote'
+PRO_FILES_SOURCE = os.getenv("PRO_FILES_SOURCE", "local").lower()
+
+# The base URL for fetching remote .pro files if PRO_FILES_SOURCE is 'remote'
+REMOTE_PRO_FILES_URL = os.getenv("REMOTE_PRO_FILES_URL", "https://nwp.mtnweather.info/ron/ssd/snowpack/output/")
+
 # --- TESTING SUITE FLAG ---
 # Set this to True to use a small subset of polygons for faster debugging.
 # Set it to False to run the full analysis.
-USE_TEST_DATA = True 
+# When changing the flag, ensure to run main with --regenerate-data to refresh processed files.
+USE_TEST_DATA = False 
 
 # --- PATH DEFINITIONS ---
 # Use a more robust method to define paths relative to this config file
@@ -31,10 +40,27 @@ ASSETS_PATH = RESULTS_PATH / ASSETS_SUBFOLDER_NAME
 REFERENCE_PATH = DATA_PATH / 'reference'
 PROCESSED_DATA_PATH = DATA_PATH / 'processed'
 
+PRO_FILE_MANIFEST = PROCESSED_DATA_PATH / "pro_file_manifest.json"
+
 # --- .pro File Base Paths ---
 # Store the production path as a raw string to prevent OS-specific interpretation
-PRO_FILES_BASE_PATH_PROD = "/ssd/snowpack/output/2024-newhs/"
-PRO_FILES_BASE_PATH_DEV = DATA_PATH / "input" 
+PRO_FILES_BASE_PATH = Path(os.getenv(
+    "PRO_FILES_INPUT_DIR", 
+    default=DATA_PATH / "input"
+))
+
+RESULTS_PATH = Path(os.getenv(
+    "WFT_RESULTS_OUTPUT_DIR", 
+    default=PROJECT_ROOT / 'results'
+))
+
+ASSETS_SUBFOLDER_NAME = "plot_assets"
+
+# Define the assets path using an environment variable, with a sensible default
+ASSETS_PATH = Path(os.getenv(
+    "WFT_ASSETS_OUTPUT_DIR",
+    default=RESULTS_PATH / ASSETS_SUBFOLDER_NAME
+)) 
 
 
 # Centralized File Paths
@@ -71,13 +97,13 @@ DEM_DATASETS = [
 
 
 # --- Functions to generate standardized output paths ---
-def get_png_path(file_stem: str) -> Path:
-    """Generates the output path for the Matplotlib PNG plot."""
-    return ASSETS_PATH / f"{file_stem}_wetting_front.png"
+def get_png_path(file_stem: str, assets_dir: Path) -> Path:
+    """Generates the output path for the Matplotlib PNG plot in the specified directory."""
+    return assets_dir / f"{file_stem}_wetting_front.png"
 
-def get_html_path(file_stem: str) -> Path:
-    """Generates the output path for the Plotly HTML plot."""
-    return ASSETS_PATH / f"{file_stem}_wetting_front.html"
+def get_html_path(file_stem: str, assets_dir: Path) -> Path:
+    """Generates the output path for the Plotly HTML plot in the specified directory."""
+    return assets_dir / f"{file_stem}_wetting_front.html"
 
 
 # --- SNOWPACK PARAMETERS ---

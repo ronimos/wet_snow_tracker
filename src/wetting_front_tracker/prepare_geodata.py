@@ -686,10 +686,9 @@ def _convert_deg_to_cardinal_from_map(df: pd.DataFrame) -> pd.DataFrame:
     numeric_aspects = pd.to_numeric(df.loc[~is_flat, 'aspect'], errors='coerce')
     
     bins = [0, 45, 135, 225, 315, 360]
-    labels = ["N_part2", "E", "S", "W", "N"]
+    labels = ["N", "E", "S", "W", "N"]
     
-    categorized_aspects = pd.cut(numeric_aspects, bins=bins, labels=labels, right=False, include_lowest=True)
-    categorized_aspects = categorized_aspects.replace("N_part2", "N")
+    categorized_aspects = pd.cut(numeric_aspects, bins=bins, labels=labels, right=False, include_lowest=True, ordered=False)
     
     df.loc[~is_flat, 'aspect_cardinal'] = categorized_aspects
     df['aspect'] = df['aspect_cardinal']
