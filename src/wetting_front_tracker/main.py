@@ -80,7 +80,7 @@ from .prepare_geodata import (link_polygons_to_pro_files,
 from .snowpack_reader import SnowpackProfile
 from .wet_front_tracker import (find_time_to_loc, get_highest_wet_point,
                                 get_total_snow_depth, lwc_above_weak,
-                                largest_fc_dh_gs_diff_bottom_half, wet_front_lwc)
+                                wet_front_lwc, find_wet_slab_loc_bottom_half)
 
 
 def generate_pro_file_manifest(base_path: Path, manifest_path: Path):
@@ -313,10 +313,10 @@ def process_single_profile(pro_file_path: Path,
         raw_summary = profile.get_full_timeseries_summary(
             parameters_to_calculate={
                 "hs": get_total_snow_depth, 
-                "weak_layer": largest_fc_dh_gs_diff_bottom_half,
+                "weak_layer": find_wet_slab_loc_bottom_half,
                 "wet_front_lwc": wet_front_lwc,
                 "highest_wet_point": get_highest_wet_point,
-                "lwc_above_weak": lambda df: lwc_above_weak(df, largest_fc_dh_gs_diff_bottom_half)
+                "lwc_above_weak": lambda df: lwc_above_weak(df, find_wet_slab_loc_bottom_half)
             },
             start_date=str(min_date_in_data),
             end_date=str(max_date_in_data),

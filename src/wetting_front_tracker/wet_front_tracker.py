@@ -69,7 +69,7 @@ def largest_fc_dh_gs_diff(df: pd.DataFrame):
     # SNOWPACK grain codes for FC and DH range from 400 to 599.
     mask_type = ((df['grain_type'] >= 400) & (df['grain_type'] < 600))
     # A positive difference indicates larger grains in the upper layer.
-    mask_diff = df['gs_difference'] > 0
+    mask_diff = df['gs_difference'] > 0.5
     candidates = df[mask_type & mask_diff]
 
     if candidates.empty:
@@ -78,6 +78,82 @@ def largest_fc_dh_gs_diff(df: pd.DataFrame):
     # Find the layer with the maximum grain size difference among candidates.
     best = candidates.loc[candidates['gs_difference'].idxmax()]
     return best['gs_difference'].astype(float), best['height'].astype(float)
+
+# In wet_front_tracker.py
+
+def find_wet_slab_loc(df: pd.DataFrame):
+    """
+    Finds the LOC for a wet slab avalanche based on a capillary barrier.
+
+    This function identifies the LOC by finding an interface where a layer of
+    smaller grains sits on top of a layer of larger, weak grains (FC or DH).
+    This creates a capillary barrier that can lead to water pooling.
+
+    Args:
+        df (pd.DataFrame): A DataFrame representing a single day's snow profile.
+                           It must contain 'grain_type', 'gs_difference', and
+                           'height' columns.
+
+    Returns:
+        tuple or None: A tuple containing (`gs_difference`, `height`) of the
+                       LOC (the lower layer), or (None, None) if no suitable
+                       layer is found.
+    """
+    if df.empty or "grain_type" not in df or "gs_difference" not in df or len(df) < 2:
+        return None, None
+
+    # 1. Find all interfaces with a negative grain size difference (small grains over large) 
+    # where the grain size difference >= 0.5 (indicating a significant capillary barrier).
+    # This identifies the upper layer of potential capillary barriers.
+    capillary_interfaces = df[df['gs_difference'] < 0.5].copy()
+    if capillary_interfaces.empty:
+        return None, None
+
+    # 2. For each interface, identify the layer below it (the LOC candidate)
+    # The index of the lower layer is one less than the index of the upper layer.
+    lower_layer_indices = capillary_interfaces.index - 1
+    
+    # Ensure indices are valid
+    valid_indices = lower_layer_indices[lower_layer_indices >= df.index.min()]
+    if valid_indices.empty:
+        return None, None
+        
+    loc_candidates = df.loc[valid_indices].copy()
+
+    # 3. The LOC must be faceted crystals (FC) or depth hoar (DH)
+    mask_type = (loc_candidates['grain_type'] >= 400) & (loc_candidates['grain_type'] < 600)
+    final_candidates = loc_candidates[mask_type].copy()
+
+    if final_candidates.empty:
+        return None, None
+
+    # 4. Find the interface with the most negative gs_difference.
+    # We need to look up the gs_difference from the layer *above* our final candidates.
+    corresponding_upper_layer_indices = final_candidates.index + 1
+    final_candidates['gs_difference_interface'] = df.loc[corresponding_upper_layer_indices, 'gs_difference'].to_numpy()
+
+    # Select the LOC with the most significant capillary barrier (most negative gs_diff)
+    best_loc = final_candidates.loc[final_candidates['gs_difference_interface'].idxmin()]
+    
+    return best_loc['gs_difference_interface'], best_loc['height']
+
+
+def find_wet_slab_loc_bottom_half(df: pd.DataFrame):
+    """
+    Wrapper to find the wet slab LOC only within the bottom half of the snowpack.
+    """
+    if df.empty or "height" not in df:
+        return None, None
+
+    total_depth = df['height'].max()
+    mid_point = total_depth / 2
+
+    # Filter the DataFrame to only include layers in the lower half.
+    bottom_half_df = df[df['height'] <= mid_point].copy()
+
+    # Reuse the new wet slab LOC detection logic on the filtered data.
+    return find_wet_slab_loc(bottom_half_df)
+
 
 def largest_fc_dh_gs_diff_bottom_half(df: pd.DataFrame):
     """
@@ -216,13 +292,12 @@ def lwc_above_weak(df: pd.DataFrame, weak_layer_func: Callable) -> tuple[float |
     return df.loc[interface_layer_idx]['lwc'], df.loc[interface_layer_idx]['height']
 
 
+# In wet_front_tracker.py
+
 def find_time_to_loc(summary_df: pd.DataFrame, reference_date: datetime) -> float | None:
     """
     Calculates the time (in hours) for the wetting front to reach the weak layer,
-    measured from a specific reference date.
-
-    Finds the penetration event closest to the reference date. The result can be 
-    positive (future) or negative (past).
+    measured from a specific reference date, considering only the current event.
 
     Args:
         summary_df: A pandas DataFrame with a DateTimeIndex and columns:
@@ -230,44 +305,45 @@ def find_time_to_loc(summary_df: pd.DataFrame, reference_date: datetime) -> floa
         reference_date: The central date for the analysis.
 
     Returns:
-        Time in hours from reference date until wetting front reaches weak layer.
-        Returns NaN if the front never reaches the layer or input is invalid.
+        Time in hours from reference date until wetting front reaches weak layer,
+        or np.nan if it doesn't happen during the current event.
     """
-    if summary_df is None or summary_df.empty or reference_date is None:
+    if summary_df is None or summary_df.empty or 'wet_front_lwc_height' not in summary_df or 'weak_layer_height' not in summary_df:
         return np.nan
 
-    # Ensure required columns exist
-    if 'wet_front_lwc_height' not in summary_df or 'weak_layer_height' not in summary_df:
-        return np.nan
+    # --- NEW LOGIC: Isolate the current wetting event ---
+    # 1. Find the start of all wetting events (where wet front appears).
+    is_wet = summary_df['wet_front_lwc_height'].notna()
+    event_starts = is_wet & ~is_wet.shift(1, fill_value=False)
+    all_start_times = summary_df.index[event_starts]
+    
+    # 2. Find the most recent event start time relative to the reference date.
+    relevant_start_times = all_start_times[all_start_times <= reference_date]
+    if relevant_start_times.empty:
+        return np.nan # No wetting event has started yet.
+    
+    current_event_start_time = relevant_start_times[-1]
+    
+    # 3. Filter the dataframe to only look at data from this event forward.
+    event_df = summary_df.loc[current_event_start_time:].copy()
 
-    # Ensure index is a DatetimeIndex
-    if not isinstance(summary_df.index, pd.DatetimeIndex):
-        summary_df = summary_df.copy()
-        summary_df.index = pd.to_datetime(summary_df.index)
-
-    # Find all timestamps where wetting front is at or below weak layer
-    penetration_df = summary_df[
-        summary_df['wet_front_lwc_height'].notna() &
-        summary_df['weak_layer_height'].notna() &
-        (summary_df['wet_front_lwc_height'] <= summary_df['weak_layer_height'])
+    # --- Original logic, now applied to the filtered event_df ---
+    penetration_df = event_df[
+        event_df['wet_front_lwc_height'].notna() &
+        event_df['weak_layer_height'].notna() &
+        (event_df['wet_front_lwc_height'] <= event_df['weak_layer_height'])
     ]
 
     if penetration_df.empty:
-        return np.nan
+        return np.nan # The front does not reach the LOC during this event.
 
-    # Calculate time difference from reference date in seconds
-    time_diffs = (penetration_df.index - reference_date).to_series().dt.total_seconds()
-
-    # Handle empty or NaN differences
-    valid_diffs = time_diffs.dropna()
-    if valid_diffs.empty:
-        return np.nan
-
-    # Find the event closest to the reference date
-    closest_idx = valid_diffs.abs().idxmin()
-
-    # Return time to LOC in hours
-    return float(valid_diffs.loc[closest_idx]) / 3600.0
+    # Find the first time the penetration happens in this event
+    first_penetration_time = penetration_df.index[0]
+    
+    # Calculate the difference from the reference date and return in hours
+    time_diff_seconds = (first_penetration_time - reference_date).total_seconds()
+    
+    return float(time_diff_seconds) / 3600.0
 
 def get_total_snow_depth(df: pd.DataFrame) -> float:
     """

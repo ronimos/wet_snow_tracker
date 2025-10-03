@@ -50,7 +50,6 @@ import plotly.graph_objects as go
 from PIL import Image
 from typing import Any, Dict, Optional
 from branca.element import Template, MacroElement, Element # type: ignore
-from datetime import datetime
 from .param_config import get_png_path, get_html_path, RESULTS_PATH, ASSETS_SUBFOLDER_NAME  
 
 def _create_thumbnail(png_path: Path, thumb_path: Path, max_size: tuple[int, int] = (800, 534)) -> None:
@@ -71,13 +70,17 @@ def _create_thumbnail(png_path: Path, thumb_path: Path, max_size: tuple[int, int
     except FileNotFoundError:
         logging.warning("Could not create thumbnail, source image not found at %s", png_path)
 
-def _generate_snowpack_viewer_url(metadata: Dict[str, Any]) -> Optional[str]:
+def _generate_snowpack_viewer_url(metadata: Dict[str, Any],
+                                  central_date: Optional[datetime]
+) -> Optional[str]:
     """
     Constructs the URL for the external snowpack profile visualization tool.
 
     Args:
         metadata (Dict[str, Any]): Dictionary of station metadata, must include
                                   'latitude', 'longitude', and 'aspect'.
+        central_date (Optional[datetime]): The reference date for the analysis,
+                                           used to determine the season.
 
     Returns:
         Optional[str]: The formatted URL string, or None if essential
@@ -86,8 +89,12 @@ def _generate_snowpack_viewer_url(metadata: Dict[str, Any]) -> Optional[str]:
     lat = metadata.get('latitude')
     lon = metadata.get('longitude')
     aspect = metadata.get('aspect')
-    season = datetime.now().year
-    season  = season if datetime.now().month >= 10 else season - 1
+    
+    # Use the analysis date if available, otherwise fall back to the current date.
+    date_to_use = central_date or datetime.now()
+    
+    # If the month is before October (1-9), the season is the previous year.
+    season = date_to_use.year - 1 if date_to_use.month < 10 else date_to_use.year
 
     if not all([lat, lon, aspect]):
         logging.warning("Missing lat, lon, or aspect in metadata; cannot generate viewer URL.")
@@ -99,7 +106,10 @@ def _generate_snowpack_viewer_url(metadata: Dict[str, Any]) -> Optional[str]:
     return f"https://nwp.mtnweather.info/snowpack/spvizll.php?lat={lat}&lon={lon}&aspect={aspect_word}&season={season}"
 
 
-def _generate_html_from_template(plotly_fig_html: str, metadata: Dict[str, Any], central_date: Optional[datetime]) -> str:
+def _generate_html_from_template(plotly_fig_html: str, 
+                                 metadata: Dict[str, Any], 
+                                 central_date: Optional[datetime]
+) -> str:
     """
     Embeds a Plotly figure and metadata into a full HTML page template.
 
@@ -121,7 +131,7 @@ def _generate_html_from_template(plotly_fig_html: str, metadata: Dict[str, Any],
     station_name = metadata.get('stationName', 'N/A')
     date_str_title = f" | Analysis for {central_date.strftime('%Y-%m-%d %H:%M UTC')}" if central_date else ""
     date_str_header = f"Analysis for: {central_date.strftime('%Y-%m-%d %H:%M UTC')}" if central_date else ""
-    snowpack_viewer_link = _generate_snowpack_viewer_url(metadata)
+    snowpack_viewer_link = _generate_snowpack_viewer_url(metadata, central_date)
 
     snowpack_viz_html = ""
     if snowpack_viewer_link:
