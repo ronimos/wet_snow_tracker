@@ -222,7 +222,7 @@ class SnowpackProfile:
         
         # ✅ Use xp directly to create either numpy or cupy arrays from the start
         data_vars = {
-            param: (("timestamp", "layer_index"), xp.full((len(profiles), max_layers), xp.nan, dtype=xp.float32)) 
+            param: (("timestamp", "layer_index"), xp.full((len(profiles), max_layers), xp.nan, dtype=xp.float64)) 
             for param in all_params
         }
 
