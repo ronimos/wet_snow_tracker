@@ -49,7 +49,8 @@ import xarray as xr
 import plotly.graph_objects as go
 from PIL import Image
 from typing import Any, Dict, Optional
-from branca.element import Template, MacroElement, Element # type: ignore
+from branca.element import Template, MacroElement, Element # type: ignore    
+
 from .param_config import get_png_path, get_html_path, RESULTS_PATH, ASSETS_SUBFOLDER_NAME  
 
 def _create_thumbnail(png_path: Path, thumb_path: Path, max_size: tuple[int, int] = (800, 534)) -> None:
@@ -544,11 +545,11 @@ def create_folium_map(final_gdf: gpd.GeoDataFrame,
     map_center = final_gdf.to_crs("EPSG:4269").unary_union.centroid
     m = folium.Map(location=[map_center.y, map_center.x] if map_center else [40, -105], zoom_start=8)
 
+    folium.TileLayer('OpenStreetMap', name='Street View').add_to(m)
     folium.TileLayer('OpenTopoMap', name='Topographic').add_to(m)
     folium.TileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
                      attr='Esri', name='Satellite').add_to(m)
-    folium.TileLayer('OpenStreetMap', name='Street View').add_to(m)
-
+    
     def style_function(x): 
         return {"fillColor": x['properties']['color'], "color": "black", "weight": 1, "fillOpacity": 0.6}
     
@@ -623,60 +624,86 @@ def create_folium_map(final_gdf: gpd.GeoDataFrame,
 
     folium.LayerControl().add_to(m)    
     
+    # Get the map's variable name to reference it in JavaScript
+    map_id = m.get_name()
+    
     # Inject persistence JS
 
-    js = """
-        <script>
-        document.addEventListener("DOMContentLoaded", function() {
-            var mapObj = Object.values(window).find(v => v instanceof L.Map);
-            if (!mapObj) return;
+    js = f"""
+    <script>
+    document.addEventListener("DOMContentLoaded", function() {{
+        // --- CONFIGURATION ---
+        // Set to true to see debug messages in the browser's console (F12)
+        const DEBUG_MODE = false;
 
-            // === Restore last view ===
-            var lastView = localStorage.getItem('preferredView');
-            if (lastView) {
-                try {
-                    var view = JSON.parse(lastView);
-                    mapObj.setView(view.center, view.zoom);
-                } catch(e) {}
-            }
+        var mapObj = window.{map_id};
+        if (!mapObj) return;
 
-            // === Restore last basemap (with a delay) ===
-            // We use a short timeout to ensure the layer control has been added to the map
-            setTimeout(function() {
-                var lastBase = localStorage.getItem('preferredBaseLayer');
-                if (lastBase) {
-                    var labels = document.querySelectorAll('.leaflet-control-layers-base label');
-                    labels.forEach(function(label) {
-                        if (label.textContent.trim() === lastBase) {
-                            var input = label.querySelector('input[type=radio]');
-                            if (input && !input.checked) {
-                                input.click(); // trigger Leaflet’s own logic
-                            }
-                        }
-                    });
-                }
-            }, 500); // 500ms delay
+        function log(message) {{
+            if (DEBUG_MODE) {{
+                console.log(message);
+            }}
+        }}
 
-            // === Save on base layer change ===
-            mapObj.on('baselayerchange', function(e) {
-                localStorage.setItem('preferredBaseLayer', e.name);
-            });
+        // === Restore last view (center and zoom) ===
+        var lastView = localStorage.getItem('preferredView');
+        if (lastView) {{
+            try {{
+                var view = JSON.parse(lastView);
+                mapObj.setView(view.center, view.zoom);
+            }} catch(e) {{}}
+        }}
 
-            // === Save on move/zoom ===
-            function saveView() {
-                var center = mapObj.getCenter();
-                var zoom = mapObj.getZoom();
-                localStorage.setItem('preferredView', JSON.stringify({
-                    center: [center.lat, center.lng],
-                    zoom: zoom
-                }));
-            }
-            mapObj.on('moveend', saveView);
-            mapObj.on('zoomend', saveView);
-        });
-        </script>
-        """
+        // === Restore last basemap (with a delay) ===
+        setTimeout(function() {{
+            var lastBase = localStorage.getItem('preferredBaseLayer');
+            log("Attempting to restore basemap: " + lastBase);
+
+            var found = false;
+            var layerControl = document.querySelector('.leaflet-control-layers-base');
+            if (layerControl) {{
+                var labels = layerControl.querySelectorAll('label');
+                labels.forEach(function(label) {{
+                    var layerName = label.textContent.trim();
+                    log("Available layer: " + layerName);
+                    if (layerName === lastBase) {{
+                        var input = label.querySelector('input[type=radio]');
+                        if (input && !input.checked) {{
+                            input.click();
+                            found = true;
+                            log("SUCCESS: Clicked to restore: " + layerName);
+                        }}
+                    }}
+                }});
+            }}
+            if (!found && lastBase) {{
+                console.warn("Saved basemap not found in map's layers.");
+            }}
+        }}, 750);
+
+        // === Save on base layer change ===
+        mapObj.on('baselayerchange', function(e) {{
+            localStorage.setItem('preferredBaseLayer', e.name);
+            log("Saved basemap choice: " + e.name);
+        }});
+
+        // === Save view on move/zoom ===
+        function saveView() {{
+            var center = mapObj.getCenter();
+            var zoom = mapObj.getZoom();
+            localStorage.setItem('preferredView', JSON.stringify({{
+                center: [center.lat, center.lng],
+                zoom: zoom
+            }}));
+        }}
+        mapObj.on('moveend', saveView);
+        mapObj.on('zoomend', saveView);
+    }});
+    </script>
+    """
+    
     m.get_root().html.add_child(Element(js))   # type: ignore
+    
     # --- Save map ---
     m.save(str(map_output_path))
     print(f"Summary map saved to: {map_output_path} at {datetime.now().strftime("%Y-%m-%d %H:%M")}")
