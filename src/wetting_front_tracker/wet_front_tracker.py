@@ -4,46 +4,75 @@ wet_snow_tracker.py
 
 This module provides a suite of custom analysis functions designed to extend the
 capabilities of the SnowpackProfile class. It focuses on identifying and
-tracking key features related to wet snow slab avalanches, a type of avalanche
-that occurs when liquid water weakens the bonds within the snowpack,
-particularly at the interface between a cohesive slab and an underlying weak
-layer.
+tracking key features related to wet snow slab avalanches.
 
 These functions are intended to be used as plug-ins with the
 `get_profile_summary()` method of the SnowpackProfile class, allowing for a
 powerful and flexible daily time-series analysis of snowpack stability factors.
-Each function is designed to analyze a single day's snow profile (represented
-as a pandas DataFrame) and return a specific metric of interest.
-
-Key Functions:
-- `largest_fc_dh_gs_diff`: Finds the most prominent weak layer of faceted
-  crystals (FC) or depth hoar (DH) based on grain size difference.
-- `largest_fc_dh_gs_diff_bottom_half`: Restricts the weak layer search to the
-  more critical lower half of the snowpack.
-- `wet_front_form`: Tracks the water penetration front based on the first
-  appearance of wet grain morphologies.
-- `wet_front_lwc`: Tracks the water penetration front based on a liquid water
-  content (LWC) threshold.
-- `lwc_above_weak`: A critical function that combines weak layer detection with
-  LWC analysis to check for water pooling above the weak layer—a key indicator
-  of instability.
 
 Authors: Itai and Ron
-Last Updated: August 25, 2025
+Last Updated: October 12, 2025
 """
 import numpy as np
 import pandas as pd
 import logging
 from datetime import datetime
-from typing import Callable
+from typing import Callable, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# SNOWPACK grain type codes
+FC_DH_MIN_CODE = 400  # Faceted crystals minimum code
+FC_DH_MAX_CODE = 600  # Faceted crystals/depth hoar maximum code
+WET_GRAIN_MIN_CODE = 770  # Wet grain forms minimum code
+WET_GRAIN_MAX_CODE = 780  # Wet grain forms maximum code
+
+# Thresholds
+MIN_GS_DIFFERENCE = 0.5  # Minimum grain size difference (mm)
+LWC_THRESHOLD_PERCENT = 4.0  # LWC threshold as percentage
+LWC_THRESHOLD = LWC_THRESHOLD_PERCENT / 100.0  # 4% = 0.04 volumetric
+LWC_THRESHOLD_WET_LAYER = 0.03  # 3% threshold for wet layer detection
+
+# ---------------------------------------------------------------------------
+# Helper Functions
+# ---------------------------------------------------------------------------
+
+def _validate_dataframe(df: pd.DataFrame, required_cols: list[str]) -> bool:
+    """
+    Validates that a DataFrame has required columns and is not empty.
+    
+    Args:
+        df: DataFrame to validate
+        required_cols: List of required column names
+        
+    Returns:
+        True if valid, False otherwise
+    """
+    if df.empty:
+        return False
+    
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        logger.warning(f"Missing required columns: {missing_cols}")
+        return False
+    
+    return True
+
+
+def _is_fc_or_dh(grain_type: float) -> bool:
+    """Check if grain type is faceted crystal (FC) or depth hoar (DH)."""
+    return FC_DH_MIN_CODE <= grain_type < FC_DH_MAX_CODE
+
 
 # ---------------------------------------------------------------------------
 # Weak Layer Detection
 # ---------------------------------------------------------------------------
 
-def largest_fc_dh_gs_diff(df: pd.DataFrame):
+def largest_fc_dh_gs_diff(df: pd.DataFrame) -> Tuple[Optional[float], Optional[float]]:
     """
     Finds the faceted (FC) or depth hoar (DH) layer with the largest positive
     grain size difference relative to the layer below it.
@@ -51,66 +80,71 @@ def largest_fc_dh_gs_diff(df: pd.DataFrame):
     This metric is a proxy for a potential weak layer. A large, positive
     `gs_difference` indicates that larger, weaker faceted grains are sitting on
     top of a layer of smaller grains, which can form a stark structural weakness.
-    This function searches the entire snowpack profile.
 
     Args:
-        df (pd.DataFrame): A DataFrame representing a single day's snow profile.
-                           It must contain 'grain_type', 'gs_difference', and
-                           'height' columns.
+        df: A DataFrame representing a single day's snow profile.
+            Must contain 'grain_type', 'gs_difference', and 'height' columns.
 
     Returns:
-        tuple or None: A tuple containing (`gs_difference`, `height`) of the most
-                       prominent FC/DH weak layer, or None if no suitable
-                       layer is found.
+        A tuple containing (gs_difference, height) of the most prominent FC/DH 
+        weak layer, or (None, None) if no suitable layer is found.
+        
+    Examples:
+        >>> weak_gs_diff, weak_height = largest_fc_dh_gs_diff(profile_df)
+        >>> if weak_height is not None:
+        ...     print(f"Weak layer at {weak_height}m with gs_diff={weak_gs_diff}")
     """
-    if df.empty or "grain_type" not in df or "gs_difference" not in df:
+    required_cols = ['grain_type', 'gs_difference', 'height']
+    if not _validate_dataframe(df, required_cols):
         return None, None
 
-    # SNOWPACK grain codes for FC and DH range from 400 to 599.
-    mask_type = ((df['grain_type'] >= 400) & (df['grain_type'] < 600))
-    # A positive difference indicates larger grains in the upper layer.
-    mask_diff = df['gs_difference'] > 0.5
+    # Filter for FC and DH grain types with positive grain size difference
+    mask_type = ((df['grain_type'] >= FC_DH_MIN_CODE) & 
+                 (df['grain_type'] < FC_DH_MAX_CODE))
+    mask_diff = df['gs_difference'] > MIN_GS_DIFFERENCE
     candidates = df[mask_type & mask_diff]
 
     if candidates.empty:
         return None, None
 
-    # Find the layer with the maximum grain size difference among candidates.
+    # Find the layer with the maximum grain size difference
     best = candidates.loc[candidates['gs_difference'].idxmax()]
-    return best['gs_difference'].astype(float), best['height'].astype(float)
+    return float(best['gs_difference']), float(best['height'])
 
-# In wet_front_tracker.py
 
-def find_wet_slab_loc(df: pd.DataFrame):
+def find_wet_slab_loc(df: pd.DataFrame) -> Tuple[Optional[float], Optional[float]]:
     """
-    Finds the LOC for a wet slab avalanche based on a capillary barrier.
+    Finds the LOC (layer of concern) for a wet slab avalanche based on a 
+    capillary barrier.
 
     This function identifies the LOC by finding an interface where a layer of
     smaller grains sits on top of a layer of larger, weak grains (FC or DH).
     This creates a capillary barrier that can lead to water pooling.
 
     Args:
-        df (pd.DataFrame): A DataFrame representing a single day's snow profile.
-                           It must contain 'grain_type', 'gs_difference', and
-                           'height' columns.
+        df: A DataFrame representing a single day's snow profile.
+            Must contain 'grain_type', 'gs_difference', and 'height' columns.
 
     Returns:
-        tuple or None: A tuple containing (`gs_difference`, `height`) of the
-                       LOC (the lower layer), or (None, None) if no suitable
-                       layer is found.
+        A tuple containing (gs_difference, height) of the LOC (the lower layer),
+        or (None, None) if no suitable layer is found.
+        
+    Notes:
+        The gs_difference represents the interface characteristic, where negative
+        values indicate small grains over large grains (capillary barrier).
     """
-    if df.empty or "grain_type" not in df or "gs_difference" not in df or len(df) < 2:
+    required_cols = ['grain_type', 'gs_difference', 'height']
+    if not _validate_dataframe(df, required_cols) or len(df) < 2:
         return None, None
 
-    # 1. Find all interfaces with a negative grain size difference (small grains over large) 
-    # where the grain size difference >= 0.5 (indicating a significant capillary barrier).
-    # This identifies the upper layer of potential capillary barriers.
-    capillary_interfaces = df[df['gs_difference'] < 0.5].copy()
+    # CRITICAL FIX: Capillary barrier = small grains over large grains
+    # This means NEGATIVE grain size difference (upper layer smaller than lower)
+    capillary_interfaces = df[df['gs_difference'] < -MIN_GS_DIFFERENCE].copy()
+    
     if capillary_interfaces.empty:
         return None, None
 
-    # 2. For each interface, identify the layer below it (the LOC candidate)
-    # The index of the lower layer is one less than the index of the upper layer.
+    # Identify the layer below each interface (the potential LOC)
     lower_layer_indices = capillary_interfaces.index - 1
     
     # Ensure indices are valid
@@ -120,144 +154,169 @@ def find_wet_slab_loc(df: pd.DataFrame):
         
     loc_candidates = df.loc[valid_indices].copy()
 
-    # 3. The LOC must be faceted crystals (FC) or depth hoar (DH)
-    mask_type = (loc_candidates['grain_type'] >= 400) & (loc_candidates['grain_type'] < 600)
+    # The LOC must be faceted crystals (FC) or depth hoar (DH)
+    mask_type = ((loc_candidates['grain_type'] >= FC_DH_MIN_CODE) & 
+                 (loc_candidates['grain_type'] < FC_DH_MAX_CODE))
     final_candidates = loc_candidates[mask_type].copy()
 
     if final_candidates.empty:
         return None, None
 
-    # 4. Find the interface with the most negative gs_difference.
-    # We need to look up the gs_difference from the layer *above* our final candidates.
-    corresponding_upper_layer_indices = final_candidates.index + 1
-    final_candidates['gs_difference_interface'] = df.loc[corresponding_upper_layer_indices, 'gs_difference'].to_numpy()
-
-    # Select the LOC with the most significant capillary barrier (most negative gs_diff)
-    best_loc = final_candidates.loc[final_candidates['gs_difference_interface'].idxmin()]
+    # Get the gs_difference from the layer above each candidate
+    corresponding_upper_indices = final_candidates.index + 1
     
-    return best_loc['gs_difference_interface'], best_loc['height']
+    # Ensure upper indices are valid
+    valid_upper = corresponding_upper_indices[
+        corresponding_upper_indices.isin(df.index)
+    ]
+    
+    if valid_upper.empty:
+        return None, None
+    
+    final_candidates['gs_difference_interface'] = df.loc[
+        valid_upper, 'gs_difference'
+    ].values
+
+    # Select the LOC with the most significant capillary barrier (most negative)
+    best_loc = final_candidates.loc[
+        final_candidates['gs_difference_interface'].idxmin()
+    ]
+    
+    return float(best_loc['gs_difference_interface']), float(best_loc['height'])
 
 
-def find_wet_slab_loc_bottom_half(df: pd.DataFrame):
+def find_wet_slab_loc_bottom_half(df: pd.DataFrame) -> Tuple[Optional[float], Optional[float]]:
     """
-    Wrapper to find the wet slab LOC only within the bottom half of the snowpack.
+    Finds the wet slab LOC only within the bottom half of the snowpack.
+    
+    Weak layers in the lower part of the snowpack are often more critical
+    as they can potentially fail under the load of a larger slab.
+    
+    Args:
+        df: A DataFrame representing a single day's snow profile.
+            Must contain a 'height' column.
+
+    Returns:
+        A tuple containing (gs_difference, height) of the LOC within the 
+        bottom half, or (None, None) if no suitable layer is found.
     """
-    if df.empty or "height" not in df:
+    if not _validate_dataframe(df, ['height']):
         return None, None
 
     total_depth = df['height'].max()
     mid_point = total_depth / 2
 
-    # Filter the DataFrame to only include layers in the lower half.
+    # Filter to only the lower half
     bottom_half_df = df[df['height'] <= mid_point].copy()
 
-    # Reuse the new wet slab LOC detection logic on the filtered data.
     return find_wet_slab_loc(bottom_half_df)
 
 
-def largest_fc_dh_gs_diff_bottom_half(df: pd.DataFrame):
+def largest_fc_dh_gs_diff_bottom_half(df: pd.DataFrame) -> Tuple[Optional[float], Optional[float]]:
     """
     Finds the FC/DH layer with the largest grain size difference, but only
     within the BOTTOM HALF of the snowpack.
 
-    This is a focused version of the `largest_fc_dh_gs_diff` function. Weak
-    layers in the lower part of the snowpack are often considered more critical
-    as they can potentially fail under the load of a larger slab, leading to
-    more significant avalanches. This function filters the search to only
-    consider these more dangerous layers.
-
     Args:
-        df (pd.DataFrame): A DataFrame representing a single day's snow profile.
-                           Must contain a 'height' column.
+        df: A DataFrame representing a single day's snow profile.
+            Must contain a 'height' column.
 
     Returns:
-        tuple or None: A tuple containing (`gs_difference`, `height`) of the
-                       target layer within the bottom half, or None if no
-                       suitable layer is found there.
+        A tuple containing (gs_difference, height) of the target layer within 
+        the bottom half, or (None, None) if no suitable layer is found.
     """
-    if df.empty or "height" not in df:
-        return None
+    if not _validate_dataframe(df, ['height']):
+        return None, None
 
     total_depth = df['height'].max()
     mid_point = total_depth / 2
 
-    # Filter the DataFrame to only include layers in the lower half.
-    bottom_half_df = df[df['height'] <= mid_point]
+    # Filter to only the lower half
+    bottom_half_df = df[df['height'] <= mid_point].copy()
 
-    # Reuse the original weak layer detection logic on the filtered data.
     return largest_fc_dh_gs_diff(bottom_half_df)
+
 
 # ---------------------------------------------------------------------------
 # Wet Front Detection
 # ---------------------------------------------------------------------------
 
-def wet_front_form(df: pd.DataFrame):
+def wet_front_form(df: pd.DataFrame) -> Tuple[Optional[float], Optional[float]]:
     """
     Finds the deepest layer where the grain morphology indicates wet forms.
 
     This function identifies the penetration depth of the wetting front by
     looking for specific grain types (SNOWPACK codes 770-779) that represent
-    wet or melting snow. The deepest such layer corresponds to the furthest
-    point the water has percolated into the snowpack from the surface.
+    wet or melting snow.
 
     Args:
-        df (pd.DataFrame): A DataFrame representing a single day's snow profile.
+        df: A DataFrame representing a single day's snow profile.
+            Must contain 'grain_type' and 'height' columns.
 
     Returns:
-        tuple or None: A tuple containing (`grain_type`, `height`) of the
-                       deepest wet grain form, or None if not found.
+        A tuple containing (grain_type, height) of the deepest wet grain form,
+        or (None, None) if not found.
     """
-    if df.empty or "grain_type" not in df:
+    required_cols = ['grain_type', 'height']
+    if not _validate_dataframe(df, required_cols):
         return None, None
 
-    # SNOWPACK grain codes for wet forms range from 770 to 779.
-    mask = (df['grain_type'] >= 770) & (df['grain_type'] < 780)
+    # Filter for wet grain forms
+    mask = ((df['grain_type'] >= WET_GRAIN_MIN_CODE) & 
+            (df['grain_type'] < WET_GRAIN_MAX_CODE))
     candidates = df[mask]
 
     if candidates.empty:
         return None, None
 
-    # The deepest layer is the one with the minimum height.
+    # The deepest layer is the one with the minimum height
     deepest = candidates.loc[candidates['height'].idxmin()]
-    return deepest['grain_type'].astype(float), deepest['height'].astype(float)
+    return float(deepest['grain_type']), float(deepest['height'])
 
-def wet_front_lwc(df: pd.DataFrame):
+
+def wet_front_lwc(df: pd.DataFrame) -> Tuple[Optional[float], Optional[float]]:
     """
     Finds the deepest layer where liquid water content (LWC) exceeds 4%.
 
     This provides a quantitative method for tracking the wetting front. A
-    volumetric LWC of 4% is a common threshold indicating that the snow is
-    becoming significantly wet, which can lead to a rapid loss of strength.
-    The function finds the deepest layer meeting this criterion.
-
-    Note: SNOWPACK stores LWC as a volumetric fraction (e.g., 0.04 for 4%).
+    volumetric LWC of 4% indicates that the snow is becoming significantly 
+    wet, which can lead to a rapid loss of strength.
 
     Args:
-        df (pd.DataFrame): A DataFrame representing a single day's snow profile.
+        df: A DataFrame representing a single day's snow profile.
+            Must contain 'lwc' and 'height' columns.
 
     Returns:
-        tuple or None: A tuple containing (`lwc`, `height`) of the deepest
-                       sufficiently wet layer, or None if not found.
+        A tuple containing (lwc, height) of the deepest sufficiently wet layer,
+        or (None, None) if not found.
+        
+    Notes:
+        SNOWPACK stores LWC as a volumetric fraction (e.g., 0.04 for 4%).
     """
-    if df.empty or "lwc" not in df:
+    required_cols = ['lwc', 'height']
+    if not _validate_dataframe(df, required_cols):
         return None, None
 
-    mask = df['lwc'] >= 0.04
+    mask = df['lwc'] >= LWC_THRESHOLD
     candidates = df[mask]
 
     if candidates.empty:
         return None, None
 
-    # The deepest layer is the one with the minimum height.
+    # The deepest layer is the one with the minimum height
     deepest_idx = candidates['height'].idxmin()
     deepest = candidates.loc[deepest_idx]
-    return deepest['lwc'].astype(float), deepest['height'].astype(float)
+    return float(deepest['lwc']), float(deepest['height'])
+
 
 # ---------------------------------------------------------------------------
 # LWC Above Weak Layer
 # ---------------------------------------------------------------------------
 
-def lwc_above_weak(df: pd.DataFrame, weak_layer_func: Callable) -> tuple[float | None, float | None]:
+def lwc_above_weak(
+    df: pd.DataFrame, 
+    weak_layer_func: Callable[[pd.DataFrame], Tuple[Optional[float], Optional[float]]]
+) -> Tuple[Optional[float], Optional[float]]:
     """
     Calculates the LWC at the interface directly above a specified weak layer.
 
@@ -265,16 +324,21 @@ def lwc_above_weak(df: pd.DataFrame, weak_layer_func: Callable) -> tuple[float |
     then finds the layer immediately on top of it and returns its LWC and height.
 
     Args:
-        df (pd.DataFrame): A single day's snow profile.
-        weak_layer_func (callable): A function that returns the properties
-                                    of the weak layer.
+        df: A single day's snow profile DataFrame.
+        weak_layer_func: A function that returns (value, height) of the weak layer.
 
     Returns:
-        tuple[float | None, float | None]: A tuple containing the LWC and height
-                                           of the layer above the weak layer,
-                                           or (None, None) if not found.
+        A tuple containing (lwc, height) of the layer above the weak layer,
+        or (None, None) if not found.
+        
+    Examples:
+        >>> lwc, height = lwc_above_weak(df, find_wet_slab_loc_bottom_half)
     """
-    gs_diff, weak_layer_height = weak_layer_func(df)
+    required_cols = ['lwc', 'height']
+    if not _validate_dataframe(df, required_cols):
+        return None, None
+
+    _, weak_layer_height = weak_layer_func(df)
 
     if weak_layer_height is None:
         return None, None
@@ -285,16 +349,22 @@ def lwc_above_weak(df: pd.DataFrame, weak_layer_func: Callable) -> tuple[float |
     if layers_above.empty:
         return None, None
 
-    # From those layers, find the one with the minimum height (the one right on top)
+    # Find the layer with the minimum height (the one right on top)
     interface_layer_idx = layers_above['height'].idxmin()
     
-    # Return the specific LWC and height values (scalars) from that single layer
-    return df.loc[interface_layer_idx]['lwc'], df.loc[interface_layer_idx]['height']
+    # Return the LWC and height from that layer
+    interface_layer = df.loc[interface_layer_idx]
+    return float(interface_layer['lwc']), float(interface_layer['height'])
 
 
-# In wet_front_tracker.py
+# ---------------------------------------------------------------------------
+# Time Series Analysis
+# ---------------------------------------------------------------------------
 
-def find_time_to_loc(summary_df: pd.DataFrame, reference_date: datetime) -> float | None:
+def find_time_to_loc(
+    summary_df: pd.DataFrame, 
+    reference_date: datetime
+) -> float:
     """
     Calculates the time (in hours) for the wetting front to reach the weak layer,
     measured from a specific reference date, considering only the current event.
@@ -308,26 +378,31 @@ def find_time_to_loc(summary_df: pd.DataFrame, reference_date: datetime) -> floa
         Time in hours from reference date until wetting front reaches weak layer,
         or np.nan if it doesn't happen during the current event.
     """
-    if summary_df is None or summary_df.empty or 'wet_front_lwc_height' not in summary_df or 'weak_layer_height' not in summary_df:
+    required_cols = ['wet_front_lwc_height', 'weak_layer_height']
+    if summary_df is None or summary_df.empty:
+        return np.nan
+    
+    if not all(col in summary_df.columns for col in required_cols):
+        logger.warning(f"Missing required columns: {required_cols}")
         return np.nan
 
-    # --- NEW LOGIC: Isolate the current wetting event ---
-    # 1. Find the start of all wetting events (where wet front appears).
+    # --- Isolate the current wetting event ---
+    # Find the start of all wetting events
     is_wet = summary_df['wet_front_lwc_height'].notna()
     event_starts = is_wet & ~is_wet.shift(1, fill_value=False)
     all_start_times = summary_df.index[event_starts]
     
-    # 2. Find the most recent event start time relative to the reference date.
+    # Find the most recent event start time relative to the reference date
     relevant_start_times = all_start_times[all_start_times <= reference_date]
     if relevant_start_times.empty:
-        return np.nan # No wetting event has started yet.
+        return np.nan  # No wetting event has started yet
     
     current_event_start_time = relevant_start_times[-1]
     
-    # 3. Filter the dataframe to only look at data from this event forward.
+    # Filter to only look at data from this event forward
     event_df = summary_df.loc[current_event_start_time:].copy()
 
-    # --- Original logic, now applied to the filtered event_df ---
+    # --- Find when the front reaches the LOC ---
     penetration_df = event_df[
         event_df['wet_front_lwc_height'].notna() &
         event_df['weak_layer_height'].notna() &
@@ -335,7 +410,7 @@ def find_time_to_loc(summary_df: pd.DataFrame, reference_date: datetime) -> floa
     ]
 
     if penetration_df.empty:
-        return np.nan # The front does not reach the LOC during this event.
+        return np.nan  # The front does not reach the LOC during this event
 
     # Find the first time the penetration happens in this event
     first_penetration_time = penetration_df.index[0]
@@ -345,6 +420,11 @@ def find_time_to_loc(summary_df: pd.DataFrame, reference_date: datetime) -> floa
     
     return float(time_diff_seconds) / 3600.0
 
+
+# ---------------------------------------------------------------------------
+# Utility Functions
+# ---------------------------------------------------------------------------
+
 def get_total_snow_depth(df: pd.DataFrame) -> float:
     """
     Calculates the total snow depth (HS) for a single daily profile.
@@ -352,15 +432,18 @@ def get_total_snow_depth(df: pd.DataFrame) -> float:
     This is a simple helper function designed to be passed to `get_profile_summary`.
 
     Args:
-        df (pd.DataFrame): A DataFrame for a single day's snow profile.
+        df: A DataFrame for a single day's snow profile.
 
     Returns:
-        float: The maximum height value in the profile, or 0 if empty.
+        The maximum height value in the profile, or 0.0 if empty.
     """
-    return 0 if df.empty or "height" not in df else df['height'].max()
+    if df.empty or 'height' not in df.columns:
+        return 0.0
+    
+    return float(df['height'].max())
 
 
-def get_highest_wet_point(df: pd.DataFrame) -> float | None:
+def get_highest_wet_point(df: pd.DataFrame) -> Optional[float]:
     """
     Finds the height of the uppermost 'wet' layer in a daily profile.
 
@@ -369,14 +452,23 @@ def get_highest_wet_point(df: pd.DataFrame) -> float | None:
     wet snow region in the snowpack.
 
     Args:
-        df (pd.DataFrame): A DataFrame for a single day's snow profile.
+        df: A DataFrame for a single day's snow profile.
 
     Returns:
-        Optional[float]: The height of the highest wet layer, or None if no
-                         wet layers are found.
+        The height of the highest wet layer, or None if no wet layers are found.
     """
-    if df.empty or "grain_type" not in df or "lwc" not in df:
+    required_cols = ['grain_type', 'lwc', 'height']
+    if not _validate_dataframe(df, required_cols):
         return None
-    mask = ((df['grain_type'] >= 770) & (df['grain_type'] < 780)) | (df['lwc'] > 0.03)
-    wet_layers = df[mask]
-    return None if wet_layers.empty else float(wet_layers['height'].max())
+    
+    # Define wet layer criteria
+    is_wet_grain = ((df['grain_type'] >= WET_GRAIN_MIN_CODE) & 
+                    (df['grain_type'] < WET_GRAIN_MAX_CODE))
+    is_wet_lwc = df['lwc'] > LWC_THRESHOLD_WET_LAYER
+    
+    wet_layers = df[is_wet_grain | is_wet_lwc]
+    
+    if wet_layers.empty:
+        return None
+    
+    return float(wet_layers['height'].max())
