@@ -105,7 +105,7 @@ def find_wet_slab_loc(df: pd.DataFrame):
     # 1. Find all interfaces with a negative grain size difference (small grains over large) 
     # where the grain size difference >= 0.5 (indicating a significant capillary barrier).
     # This identifies the upper layer of potential capillary barriers.
-    capillary_interfaces = df[df['gs_difference'] < 0.5].copy()
+    capillary_interfaces = df[df['gs_difference'] < - 0.5].copy()
     if capillary_interfaces.empty:
         return None, None
 
