@@ -1,187 +1,217 @@
-# Wetting Front Tracker for Snowpack Analysis
-## Overview
-This application automates the analysis of wet slab avalanche potential by processing SNOWPACK model output files (.pro), correlating them with specific terrain features, and visualizing the risk over time.
+# Documentation Index - Wetting Front Tracker
 
-It identifies potential weak layers within the snowpack, tracks the penetration of liquid water, and calculates the time it takes for the wetting front to reach these critical layers.
+Complete documentation for the Wetting Front Tracker project. Start here to find what you need!
 
-The final output is an interactive map that provides a geographic overview of wet slab risk for a given set of avalanche paths or polygons.
+## 📚 Documentation Suite
 
-Example of the final summary_map.html output
+### For All Users
 
-## Features
-- **Automated Geodata Preparation:** Downloads and mosaics DEM data from the OpenTopography API.
+1. **[PROJECT_README.md](PROJECT_README.md)** 📖
+   - **Start here!** Complete project overview
+   - Installation instructions
+   - Usage examples
+   - Scientific background
+   - 📄 ~8,000 words
 
-- **Terrain Analysis:** Splits polygons (e.g., avalanche paths) into sub-polygons by aspect (N, E, S, W).
+2. **[QUICK_START.md](QUICK_START.md)** 🚀
+   - **Get running in 5 minutes**
+   - Step-by-step setup
+   - First run instructions
+   - Common issues and fixes
+   - 📄 ~4,000 words
 
-- **Intelligent Data Linking:** Matches aspect polygons to the most relevant SNOWPACK `.pro` files.
+### For Data Users
 
-- **Parallel Processing:** Leverages all CPU cores to analyze hundreds of snowpack profiles efficiently.
+3. **[DATA_FORMATS.md](DATA_FORMATS.md)** 📊
+   - All input/output formats
+   - File schemas and specifications
+   - Data validation rules
+   - Example files
+   - 📄 ~5,000 words
 
-- **Advanced Snowpack Metrics:**
+4. **[COLORING_EXAMPLES.md](COLORING_EXAMPLES.md)** 🎨
+   - How polygon colors work
+   - Priority rules explained
+   - Example scenarios
+   - Color interpretation guide
+   - 📄 ~2,500 words
 
-  - Calculates snow depth
+### For Developers
 
-  - Identifies weak layers (faceted crystals/depth hoar)
+5. **[DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md)** 💻
+   - Architecture overview
+   - Code organization
+   - Adding new features
+   - Testing guidelines
+   - Performance optimization
+   - 📄 ~5,500 words
 
-  - Tracks wetting front depth using Liquid Water Content (LWC)
+6. **[CODE_REFERENCE.md](CODE_REFERENCE.md)** 📝
+   - Key code snippets
+   - Function signatures
+   - Quick lookup reference
+   - 📄 ~1,500 words
 
-  - Applies persistence logic to track weak layers through melt events
+### Recent Changes
 
-- Rich Visualization:
+7. **[CHANGES_SUMMARY.md](CHANGES_SUMMARY.md)** 🆕
+   - Latest feature: Average LWC coloring
+   - Detailed change documentation
+   - Migration guide
+   - 📄 ~2,000 words
 
-  - Static Matplotlib PNG plots
+## 🎯 Finding What You Need
 
-  - Interactive Plotly HTML plots
+### "I'm brand new to this project"
+→ Start with **[QUICK_START.md](QUICK_START.md)** to get running  
+→ Then read **[PROJECT_README.md](PROJECT_README.md)** for full context
 
-  - Final Folium map (`summary_map.html`) with color-coded polygons and interactive popups
+### "I need to understand the data"
+→ Read **[DATA_FORMATS.md](DATA_FORMATS.md)** for complete specifications  
+→ Check **[COLORING_EXAMPLES.md](COLORING_EXAMPLES.md)** to understand results
 
-## Project Structure
+### "I want to modify the code"
+→ Read **[DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md)** for architecture  
+→ Use **[CODE_REFERENCE.md](CODE_REFERENCE.md)** for quick lookups
+
+### "I want to know what changed"
+→ See **[CHANGES_SUMMARY.md](CHANGES_SUMMARY.md)** for recent updates
+
+### "I have a specific question"
+→ Use the search function (Ctrl+F / Cmd+F) in any document  
+→ Check the Table of Contents in each file
+
+## 📁 Files Included
+
+### Modified Python Files (with LWC coloring feature)
+- **main.py** - Orchestrator with LWC integration
+- **wet_front_tracker.py** - Added avg_lwc_above_weak()
+- **plotting.py** - Updated coloring logic
+
+### Documentation Files
+- **README.md** - (This file) Master index
+- **PROJECT_README.md** - Complete project documentation
+- **QUICK_START.md** - Getting started guide
+- **DATA_FORMATS.md** - Data specifications
+- **DEVELOPER_GUIDE.md** - Development documentation
+- **CODE_REFERENCE.md** - Code snippets
+- **COLORING_EXAMPLES.md** - Color logic examples
+- **CHANGES_SUMMARY.md** - Recent changes
+
+### Configuration
+- **requirements.txt** - Python dependencies
+
+## 🚀 Quick Links
+
+**Get Started:**
+- [Installation Steps](QUICK_START.md#installation-steps)
+- [First Run](QUICK_START.md#first-run)
+- [Common Issues](QUICK_START.md#common-first-time-issues)
+
+**Understand Output:**
+- [Color Meanings](COLORING_EXAMPLES.md#priority-rules)
+- [Map Features](PROJECT_README.md#summary-map-summary_maphtml)
+- [Analysis Metrics](PROJECT_README.md#analysis-metrics)
+
+**For Developers:**
+- [Architecture](DEVELOPER_GUIDE.md#architecture-overview)
+- [Add New Features](DEVELOPER_GUIDE.md#adding-new-features)
+- [Code Examples](CODE_REFERENCE.md)
+
+## 📊 Quick Reference
+
+### Color Codes
+| Color | Meaning | Priority |
+|-------|---------|----------|
+| 🔴 Red | LWC > 3% above LOC | **HIGHEST** |
+| 🟡 Yellow | LWC 1-3% OR 48-72h to LOC | High |
+| 🟧 Orange | 24-48h to LOC | Medium |
+| 🟥 Dark Red | 0-24h to LOC (imminent) | High |
+| 🔵 Blue | LOC reached (past) | Low |
+| ⚪ Gray | No data | Lowest |
+
+### Command Line Usage
+```bash
+# Default run
+python -m src.wetting_front_tracker.main
+
+# Specific date
+python -m src.wetting_front_tracker.main --date 2025-05-15
+
+# Custom date range
+python -m src.wetting_front_tracker.main \
+    --date 2025-05-15 \
+    --start-date 2025-05-01 \
+    --end-date 2025-05-31
+
+# More workers
+python -m src.wetting_front_tracker.main --workers 16
 ```
-wetting-front-tracker/
-├── data/
-│   ├── reference/         <-- Input files (Paths.geojson, snowpack metadata)
-│   ├── processed/         <-- Intermediate geodata
-│   └── input/             <-- Sample .pro files (for dev/testing)
-│
-├── results/
-│   ├── summary_map.html   <-- Final interactive map
-│   └── plot_assets/       <-- Generated plots (PNG + HTML)
-│
-├── src/
-│   └── wetting_front_tracker/
-│       ├── main.py        <-- Main CLI script
-│       ├── param_config.py  <-- User config file (API keys, paths, etc.)
-│       └── ... (modules)
-│
-├── .env                   <-- For storing API keys (not committed)
-├── pyproject.toml         <-- Dependencies
-└── README.md
-```
-## Setup and Installation
-### Prerequisites
-- Python 3.9+
 
-- `pip`
+## 🔄 What's New
 
-## Steps
-```
-# Clone the repository
-git clone <your-repository-url>
-cd wetting-front-tracker
+**Version 1.1 (November 2025):**
+- ✅ Added average LWC above LOC coloring
+- ✅ Priority-based color system (water content > time)
+- ✅ Updated map legend
+- ✅ Enhanced risk visualization
 
-# Create and activate a virtual environment
-python -m venv .venv
-source .venv/bin/activate   # on Linux/macOS
-.venv\Scripts\activate      # on Windows
+See [CHANGES_SUMMARY.md](CHANGES_SUMMARY.md) for complete details.
 
-# Install the project and its dependencies
-pip install .
-```
-## Configuration
-### Step 1: Input Data Files
-Place the following files inside the `data/reference/` directory.
+## 📖 Recommended Reading Order
 
-`Paths.geojson`
-A standard GeoJSON file containing `Polygon` or `MultiPolygon` features representing your areas of interest (e.g., avalanche paths).
+### For End Users
+1. [QUICK_START.md](QUICK_START.md) - Setup and first run
+2. [PROJECT_README.md](PROJECT_README.md) - Full overview
+3. [COLORING_EXAMPLES.md](COLORING_EXAMPLES.md) - Interpret results
+4. [DATA_FORMATS.md](DATA_FORMATS.md) - Understand data
 
-- CRS: WGS84 (EPSG:4326) is recommended.
+### For Developers
+1. [PROJECT_README.md](PROJECT_README.md) - Project context
+2. [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md) - Architecture
+3. [CODE_REFERENCE.md](CODE_REFERENCE.md) - Code patterns
+4. [CHANGES_SUMMARY.md](CHANGES_SUMMARY.md) - Recent work
 
-- Required Properties: Each feature's `properties` object must contain:
+### For Analysts
+1. [QUICK_START.md](QUICK_START.md) - Get running
+2. [COLORING_EXAMPLES.md](COLORING_EXAMPLES.md) - Understand colors
+3. [DATA_FORMATS.md](DATA_FORMATS.md) - Data specs
+4. [PROJECT_README.md § Analysis Metrics](PROJECT_README.md#analysis-metrics)
 
-  - `pathName`: A unique string identifier for the path (e.g., "Main Gully").
+## 🆘 Need Help?
 
-`snowpack_locations_with_metadata.csv`
-This CSV file links each SNOWPACK model output file to its geographic context.
+**Common Solutions:**
+- Installation issues → [QUICK_START.md § Common Issues](QUICK_START.md#common-first-time-issues)
+- Understanding output → [COLORING_EXAMPLES.md](COLORING_EXAMPLES.md)
+- Data format questions → [DATA_FORMATS.md](DATA_FORMATS.md)
+- Code problems → [DEVELOPER_GUIDE.md § Debugging](DEVELOPER_GUIDE.md#debugging-tips)
 
-- **Required Columns:**
+**Still Stuck?**
+1. Check logs: `cat wetting_front_tracker.log`
+2. Enable debug mode in code
+3. Open an issue with error details
 
-  - `latitude`: The latitude of the model point (decimal degrees, WGS84).
+## 📊 Documentation Stats
 
-  - `longitude`: The longitude of the model point (decimal degrees, WGS84).
+- **Total Documents:** 8
+- **Total Words:** ~28,500
+- **Total Lines:** ~2,580
+- **Topics Covered:** 63
 
-  - `aspect`: The aspect of the slope at the model point. This can be in degrees (0-360) or the string "Flat".
+## ⚖️ License
 
-  - `path`: The absolute file path to the corresponding `.pro` file as it exists on the production machine where the analysis will run.
+[Specify your license here]
 
-### Step 2: Environment and Path Configuration
-#### OpenTopography API Key
-This is required for downloading Digital Elevation Models (DEMs).
+## 📮 Contact
 
-- **Preferred Method (**`.env` **file):**
+- **Issues:** [Open a GitHub issue]
+- **Questions:** [Contact development team]
+- **Contributions:** See [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md)
 
-  1. Create a file named `.env` in the project's root directory.
+---
 
-  2. Add the following line to the file, replacing `your_key_here` with your actual key:
+**Version:** 1.1 (November 2025)  
+**Authors:** Ron Simenhois, Itai  
+**Status:** Production Ready
 
-    ```
-    OPENTOPO_API_KEY="your_key_here"
-    ```
-
-  - **Alternative Method:**
-
-    - Open `src/wetting_front_tracker/param_config.py` and hardcode your key by replacing `"YOUR_API_KEY_HERE"`.
-
-### SNOWPACK File Paths
-Open `src/wetting_front_tracker/param_config.py` and configure the base paths for your `.pro` files.
-
-- `PRO_FILES_BASE_PATH_PROD`: The base directory for `.pro` files on your production machine (e.g., a Linux server). This path should match the base used in your `snowpack_locations_with_metadata.csv`.
-
-- `PRO_FILES_BASE_PATH_DEV`: The directory where you store local `.pro` files for development and testing (defaults to `data/input/`). The script uses this to find local copies when run on a development machine (like Windows).
-
-## How It Works
-The application follows a multi-stage pipeline:
-
-1. Geospatial Pre-processing (`prepare_geodata.py`): The input polygons are first split by cardinal aspect (N, E, S, W) using a Digital Elevation Model (DEM). Each of these new, smaller polygons is then spatially matched to its nearest SNOWPACK model output location that shares the same aspect. This creates the primary analysis-ready file: `linked_aspect_polygons.geojson`.
-
-2. Snowpack Data Reading (`snowpack_reader.py`): The SnowpackProfile class efficiently parses the `.pro` files. It uses `xarray` to hold the data and can leverage `CuPy` for GPU-accelerated calculations if a compatible GPU is detected.
-
-3. Analysis (`wet_front_tracker.py`): A series of analysis functions are applied to each day's profile to identify weak layers and track the wetting front. The key output is the `time_to_loc` metric, which is calculated for a specific reference date.
-
-4. Visualization (`plotting.py`): The results are rendered into static PNGs, interactive HTML plots, and the final Folium summary map.
-
-## Running the Analysis
-The project is installed as a command-line script named `main`.
-```
-# Standard run using the current date and time
-main
-
-# Run for a specific date (time defaults to noon)
-main --date "2025-03-15"
-
-# Run for a specific date and time (will be rounded to the closest synoptic time)
-main --date "2025-03-15 18:00"
-
-# Force regeneration of DEMs, aspect polygons, and linked files
-main --regenerate-data
-```
-## Understanding the Output
-- `results/summary_map.html`: This is the main interactive output.
-
-  - **Color-Coded Polygons:** Represent the `time_to_loc` (time for the wetting front to reach the weak layer), indicating risk level.
-
-  - **Tooltip:** Hover over a polygon to see its name, aspect, analysis date, and a thumbnail of its plot.
-
-  - **Popup:** Click on a polygon to get a link to the detailed interactive chart.
-
-- `results/plot_assets/`: Contains the individual plots generated for each analysis.
-
-  - `*_wetting_front.png`: A static, high-resolution PNG plot created with Matplotlib.
-
-  - `*_wetting_front.html`: A fully interactive HTML plot created with Plotly.
-
-## Key Dependencies
-- **Geospatial:** `geopandas`, `rasterio`, `rioxarray`, `shapely`
-
-- **Data Handling:** `pandas`, `xarray`, `numpy`
-
-- **Visualization:** `folium`, `matplotlib`, `plotly`
-
-- **Performance:** `numba`, `cupy` (optional, for GPU)
-
-## Contributing
-Contributions are welcome! If you'd like to contribute, please fork the repository and open a pull request.
-
-## License
-This project is licensed under the MIT License.
-
-*README last updated: September 11, 2025*
+**Happy Analyzing! 🏔️❄️**

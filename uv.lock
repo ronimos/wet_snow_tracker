@@ -2845,6 +2845,7 @@ name = "wetting-snow-tracker"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "beautifulsoup4" },
     { name = "bottleneck" },
     { name = "branca" },
     { name = "dask" },
@@ -2915,6 +2916,7 @@ test = [
 
 [package.metadata]
 requires-dist = [
+    { name = "beautifulsoup4", specifier = ">=4.14.2" },
     { name = "black", marker = "extra == 'dev'", specifier = ">=23.7.0" },
     { name = "bottleneck", specifier = ">=1.5.0" },
     { name = "branca", specifier = ">=0.6.0" },

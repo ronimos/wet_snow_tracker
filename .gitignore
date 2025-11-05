@@ -9,3 +9,6 @@
 *.pyc
 __pycache__/
 src/wet_snow_tracker.egg-info/
+/.coverage
+/.DS_Store
+/.vscode/

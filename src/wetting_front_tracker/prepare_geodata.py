@@ -887,14 +887,34 @@ def prepare_aspect_polygons(
 
 def _convert_aspect_to_cardinal(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Converts aspect degrees to cardinal directions.
+    Converts aspect degrees to cardinal directions, or keeps cardinal aspects as-is.
+    
+    Handles two input formats:
+    1. Numeric degrees (0-360) → converts to N, E, S, W
+    2. Already cardinal (N, E, S, W, flat, Flat) → standardizes capitalization
 
     Args:
-        df: DataFrame with 'aspect' column in degrees
+        df: DataFrame with 'aspect' column in degrees or cardinal directions
 
     Returns:
         DataFrame with 'aspect' converted to N, E, S, W, or Flat
     """
+    # Make a copy to avoid modifying the original
+    df = df.copy()
+    
+    # Check if aspects are already cardinal (not numeric)
+    # Try to convert first value to numeric to test
+    test_val = str(df['aspect'].iloc[0]).strip().upper()
+    is_already_cardinal = test_val in ['N', 'E', 'S', 'W', 'FLAT']
+    
+    if is_already_cardinal:
+        # Aspects are already cardinal - just standardize capitalization
+        # Handle 'flat' vs 'Flat'
+        df['aspect'] = df['aspect'].astype(str).str.strip().str.upper()
+        df.loc[df['aspect'] == 'FLAT', 'aspect'] = 'Flat'
+        return df
+    
+    # Otherwise, convert numeric degrees to cardinal
     is_flat = df['aspect'] == 'Flat'
     df.loc[is_flat, 'aspect_cardinal'] = 'Flat'
 
@@ -916,6 +936,7 @@ def _convert_aspect_to_cardinal(df: pd.DataFrame) -> pd.DataFrame:
     df['aspect'] = df['aspect_cardinal']
     
     return df
+
 
 
 def link_polygons_to_pro_files(

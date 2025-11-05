@@ -37,7 +37,10 @@ from matplotlib.patches import PathPatch
 from matplotlib.path import Path as MplPath
 from PIL import Image
 
-from .param_config import ASSETS_SUBFOLDER_NAME, RESULTS_PATH, get_html_path, get_png_path
+from .param_config import RESULTS_PATH, ASSETS_PATH, get_html_path, get_png_path
+
+# Constants
+ASSETS_SUBFOLDER_NAME = "plot_assets"  # Relative path from results directory
 
 matplotlib.use('Agg')
 
