@@ -11,3 +11,6 @@ wetting_front_tracker/      <-- Run commands from here
 │       └── wet_front_tracker.py
 └── .venv/
 """
+"""Wetting front tracker package."""
+
+__version__ = "0.1.0"

@@ -495,8 +495,14 @@ class SnowpackProfile:
         timestamps = pd.to_datetime(self.data.timestamp.values)
         
         # Create boolean masks
-        start_mask = timestamps >= pd.to_datetime(start_date) if start_date else True
-        end_mask = timestamps <= pd.to_datetime(end_date) if end_date else True
+        if start_date:
+            start_mask = timestamps >= pd.to_datetime(start_date)
+        else:
+            start_mask = np.ones_like(timestamps, dtype=bool)
+        if end_date:
+            end_mask = timestamps <= pd.to_datetime(end_date)   
+        else:
+            end_mask = np.ones_like(timestamps, dtype=bool)
         combined_mask = start_mask & end_mask
         
         if not np.any(combined_mask):
