@@ -1,26 +1,64 @@
 """
 feature_extractor.py
-====================
+=======================
 
-Extracts features from snowpack interfaces for ML training.
+Extracts comprehensive SNOWPACK layer parameters for ML training.
 
-For each stall event, extracts characteristics of the layers above,
-at, and below the interface where the wetting front stalled.
+This version:
+- Extracts features from specific layers by ID (not height ranges)
+- Collects data 24 hours BEFORE stalling occurs
+- Extracts ALL available SNOWPACK parameters
+- Computes interface differences and ratios
 
-Author: [Your name]
+Author: Ron Simenhois
 Created: November 2025
 """
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Dict, List, Optional
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+# Try to import parameter configuration
+try:
+    from wetting_front_tracker.param_config import (
+        SNOWPACK_PARAMETERS,
+        get_parameters_for_differences,
+        get_parameters_for_ratios,
+        get_column_name
+    )
+except ImportError:
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+    from wetting_front_tracker.param_config import (
+        SNOWPACK_PARAMETERS,
+        get_parameters_for_differences,
+        get_parameters_for_ratios,
+        get_column_name
+    )
+
+# Import SnowpackProfile with proper type checking support
+if TYPE_CHECKING:
+    # For type checkers, always import the real type
+    from ..snowpack_reader import SnowpackProfile as SnowpackProfileType
+else:
+    # At runtime, try to import and fall back gracefully
+    try:
+        from ..snowpack_reader import SnowpackProfile as SnowpackProfileType
+    except ImportError:
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        try:
+            from ..snowpack_reader import SnowpackProfile as SnowpackProfileType
+        except ImportError:
+            logger.warning("Could not import SnowpackProfile - will fail at runtime if used")
+            SnowpackProfileType = None  # type: ignore
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -30,33 +68,34 @@ logger = logging.getLogger(__name__)
 class FeatureExtractionConfig:
     """Configuration for feature extraction."""
     
-    # Layer thickness for averaging (meters)
-    above_thickness: float = 0.20      # 20cm above interface
-    below_thickness: float = 0.20      # 20cm below interface
-    interface_thickness: float = 0.04  # ±2cm at interface
+    # Lookback time for feature extraction
+    lookback_hours: float = 24.0
     
-    # Feature categories to extract
-    extract_density: bool = True
-    extract_temperature: bool = True
-    extract_grain: bool = True
-    extract_lwc: bool = True
-    extract_hardness: bool = True
-    extract_structural: bool = True
+    # Which parameter groups to extract
+    extract_all_parameters: bool = True
+    
+    # Fallback options if exact time not available
+    max_time_tolerance_hours: float = 2.0
+    
+    # Whether to compute derived features
+    compute_differences: bool = True
+    compute_ratios: bool = True
+    compute_gradients: bool = True
 
 
 # ---------------------------------------------------------------------------
-# Feature Extraction
+# Layer Feature Extraction
 # ---------------------------------------------------------------------------
 
-class InterfaceFeatureExtractor:
+class LayerFeatureExtractor:
     """
-    Extracts comprehensive features from snowpack interfaces.
+    Extracts features from specific SNOWPACK layers by ID.
     
-    For a given height and time, extracts:
-    - Statistics from layers above the interface
-    - Statistics from layers at the interface (gradient)
-    - Statistics from layers below the interface
-    - Contextual snowpack information
+    This class handles:
+    - Finding layers at specific times
+    - Extracting all available SNOWPACK parameters
+    - Computing interface properties (differences, ratios, gradients)
+    - Handling missing data gracefully
     """
     
     def __init__(self, config: Optional[FeatureExtractionConfig] = None):
@@ -68,343 +107,305 @@ class InterfaceFeatureExtractor:
         """
         self.config = config or FeatureExtractionConfig()
     
-    def extract_all_features(
+    def extract_features_for_interface(
         self,
-        profile_df: pd.DataFrame,
-        interface_height: float,
-        timestamp: datetime
+        profile: "SnowpackProfileType",
+        feature_time: datetime,
+        stall_layer_id: int,  # Kept for compatibility, but unused
+        layer_above_id: int,
+        layer_below_id: int
     ) -> Dict[str, float]:
         """
-        Extract all features for a given interface.
+        Extract all features for a specific interface at a specific time.
         
         Args:
-            profile_df: DataFrame with single timestep profile data
-                       Columns: height, density, temperature, grain_size, 
-                               grain_type, lwc, hardness, etc.
-            interface_height: Height (m) of the interface
-            timestamp: Time of the profile
+            profile: SnowpackProfile object
+            feature_time: When to extract features (e.g., 24h before stall)
+            stall_layer_id: Unused, kept for compatibility with caller.
+            layer_above_id: Layer ID above the interface
+            layer_below_id: Layer ID below the interface
             
         Returns:
             Dictionary of feature_name: value pairs
         """
         features = {}
         
-        # Validate input
-        if profile_df.empty:
-            logger.warning("Empty profile DataFrame")
+        # Get profile at feature extraction time
+        profile_df, actual_time = self._get_profile_at_time(
+            profile, feature_time
+        )
+        
+        if profile_df is None or profile_df.empty:
+            logger.warning(f"No profile data available at {feature_time}")
+            return features
+
+        # Check if actual_time is None
+        if actual_time is None:
+            logger.warning(f"No valid timestamp returned for {feature_time}")
             return features
         
-        # Extract height information
-        features.update(self._extract_height_features(
-            profile_df, interface_height
-        ))
+        # Record actual lookback time
+        # Note: stall_time is not available here, so we record actual time.
+        # The caller (collect_ml_data) will compute the actual lookback.
+        features['feature_extraction_time'] = actual_time.isoformat()
         
-        # Extract above-interface features
-        above_features = self._extract_above_features(
-            profile_df, interface_height
-        )
-        features.update({f'above_{k}': v for k, v in above_features.items()})
+        # Extract layer above features
+        layer_above = self._get_layer_by_id(profile_df, layer_above_id)
+        if layer_above is not None:
+            above_features = self._extract_layer_parameters(
+                layer_above, prefix='above'
+            )
+            features.update(above_features)
+        else:
+            logger.warning(f"Layer above (ID={layer_above_id}) not found at {actual_time}")
         
-        # Extract interface features (gradients)
-        interface_features = self._extract_interface_features(
-            profile_df, interface_height
-        )
-        features.update({f'interface_{k}': v for k, v in interface_features.items()})
+        # Extract layer below features
+        layer_below = self._get_layer_by_id(profile_df, layer_below_id)
+        if layer_below is not None:
+            below_features = self._extract_layer_parameters(
+                layer_below, prefix='below'
+            )
+            features.update(below_features)
+        else:
+            logger.warning(f"Layer below (ID={layer_below_id}) not found at {actual_time}")
         
-        # Extract below-interface features
-        below_features = self._extract_below_features(
-            profile_df, interface_height
-        )
-        features.update({f'below_{k}': v for k, v in below_features.items()})
+        # Compute interface features if both layers available
+        if layer_above is not None and layer_below is not None:
+            interface_features = self._compute_interface_features(
+                layer_above, layer_below
+            )
+            features.update(interface_features)
         
-        # Extract contextual features
-        context_features = self._extract_context_features(
-            profile_df, interface_height, timestamp
-        )
-        features.update({f'context_{k}': v for k, v in context_features.items()})
-        
-        # Extract computed features
-        computed_features = self._compute_derived_features(
-            above_features, interface_features, below_features
-        )
-        features.update({f'computed_{k}': v for k, v in computed_features.items()})
+        # Add lookback hours (relative to feature_time, not stall_time)
+        # The caller computes the *actual* lookback from stall time
+        features['requested_lookback_hours'] = self.config.lookback_hours
         
         return features
     
-    def _get_layer_subset(
+    def _get_profile_at_time(
         self,
-        profile_df: pd.DataFrame,
-        height_min: float,
-        height_max: float
-    ) -> pd.DataFrame:
+        profile: "SnowpackProfileType",
+        target_time: datetime
+    ) -> Tuple[Optional[pd.DataFrame], Optional[datetime]]:
         """
-        Extract layers within a height range.
+        Get profile DataFrame at a specific time.
         
         Args:
-            profile_df: Full profile
-            height_min: Bottom of range
-            height_max: Top of range
+            profile: SnowpackProfile object
+            target_time: Desired time
             
         Returns:
-            Subset of profile within range
+            Tuple of (profile_df, actual_time)
+            Returns (None, None) if time not available
         """
-        if 'height' not in profile_df.columns:
-            logger.error("No 'height' column in profile")
-            return pd.DataFrame()
-        
-        mask = (profile_df['height'] >= height_min) & (profile_df['height'] <= height_max)
-        return profile_df[mask].copy()
-    
-    def _extract_height_features(
-        self,
-        profile_df: pd.DataFrame,
-        interface_height: float
-    ) -> Dict[str, float]:
-        """Extract height-related features."""
-        features = {}
-        
-        if 'height' not in profile_df.columns:
-            return features
-        
-        total_depth = profile_df['height'].max()
-        
-        features['absolute_height'] = interface_height
-        features['relative_height'] = interface_height / total_depth if total_depth > 0 else 0
-        features['distance_from_ground'] = interface_height
-        features['distance_from_surface'] = total_depth - interface_height
-        features['in_bottom_half'] = 1.0 if interface_height < (total_depth / 2) else 0.0
-        
-        # Count layers
-        features['layers_below'] = len(profile_df[profile_df['height'] < interface_height])
-        features['layers_above'] = len(profile_df[profile_df['height'] > interface_height])
-        features['total_layers'] = len(profile_df)
-        
-        return features
-    
-    def _extract_above_features(
-        self,
-        profile_df: pd.DataFrame,
-        interface_height: float
-    ) -> Dict[str, float]:
-        """Extract features from layers above the interface."""
-        features = {}
-        
-        # Get layers above
-        height_max = interface_height + self.config.above_thickness
-        above_df = self._get_layer_subset(
-            profile_df, interface_height, height_max
-        )
-        
-        if above_df.empty:
-            logger.debug(f"No layers above interface at {interface_height}m")
-            return self._get_default_features()
-        
-        # Density features
-        if self.config.extract_density and 'density' in above_df.columns:
-            features['density_mean'] = above_df['density'].mean()
-            features['density_std'] = above_df['density'].std()
-            features['density_min'] = above_df['density'].min()
-            features['density_max'] = above_df['density'].max()
-        
-        # Temperature features
-        if self.config.extract_temperature and 'temperature' in above_df.columns:
-            features['temperature_mean'] = above_df['temperature'].mean()
-            features['temperature_std'] = above_df['temperature'].std()
-        
-        # Grain features
-        if self.config.extract_grain:
-            if 'grain_size' in above_df.columns:
-                features['grain_size_mean'] = above_df['grain_size'].mean()
-                features['grain_size_std'] = above_df['grain_size'].std()
-            
-            if 'grain_type' in above_df.columns:
-                features['grain_type_mode'] = above_df['grain_type'].mode().iloc[0] if not above_df['grain_type'].mode().empty else np.nan
-                features['has_facets'] = float(any((above_df['grain_type'] >= 400) & (above_df['grain_type'] < 600)))
-        
-        # LWC features
-        if self.config.extract_lwc and 'lwc' in above_df.columns:
-            features['lwc_mean'] = above_df['lwc'].mean()
-            features['lwc_max'] = above_df['lwc'].max()
-            features['lwc_std'] = above_df['lwc'].std()
-        
-        # Hardness features
-        if self.config.extract_hardness and 'hardness' in above_df.columns:
-            features['hardness_mean'] = above_df['hardness'].mean()
-        
-        # Structural features
-        if self.config.extract_structural:
-            if 'bond_size' in above_df.columns:
-                features['bond_size_mean'] = above_df['bond_size'].mean()
-            if 'coord_number' in above_df.columns:
-                features['coord_number_mean'] = above_df['coord_number'].mean()
-        
-        return features
-    
-    def _extract_interface_features(
-        self,
-        profile_df: pd.DataFrame,
-        interface_height: float
-    ) -> Dict[str, float]:
-        """Extract gradient features at the interface."""
-        features = {}
-        
-        # Get layers at interface (±2cm)
-        height_min = interface_height - self.config.interface_thickness / 2
-        height_max = interface_height + self.config.interface_thickness / 2
-        interface_df = self._get_layer_subset(
-            profile_df, height_min, height_max
-        )
-        
-        if len(interface_df) < 2:
-            logger.debug(f"Insufficient layers at interface {interface_height}m")
-            return self._get_default_features()
-        
-        # Calculate gradients (difference between top and bottom)
-        top_layer = interface_df.iloc[-1]
-        bottom_layer = interface_df.iloc[0]
-        
-        if 'density' in interface_df.columns:
-            features['density_gradient'] = top_layer['density'] - bottom_layer['density']
-        
-        if 'temperature' in interface_df.columns:
-            features['temperature_gradient'] = top_layer['temperature'] - bottom_layer['temperature']
-        
-        if 'grain_size' in interface_df.columns:
-            features['grain_size_diff'] = top_layer['grain_size'] - bottom_layer['grain_size']
-        
-        if 'hardness' in interface_df.columns:
-            features['hardness_diff'] = top_layer['hardness'] - bottom_layer['hardness']
-        
-        # Grain type transition
-        if 'grain_type' in interface_df.columns:
-            features['grain_type_above'] = top_layer['grain_type']
-            features['grain_type_below'] = bottom_layer['grain_type']
-            features['grain_type_change'] = abs(top_layer['grain_type'] - bottom_layer['grain_type'])
-        
-        return features
-    
-    def _extract_below_features(
-        self,
-        profile_df: pd.DataFrame,
-        interface_height: float
-    ) -> Dict[str, float]:
-        """Extract features from layers below the interface."""
-        features = {}
-        
-        # Get layers below
-        height_min = interface_height - self.config.below_thickness
-        below_df = self._get_layer_subset(
-            profile_df, height_min, interface_height
-        )
-        
-        if below_df.empty:
-            logger.debug(f"No layers below interface at {interface_height}m")
-            return self._get_default_features()
-        
-        # Similar to above features
-        if self.config.extract_density and 'density' in below_df.columns:
-            features['density_mean'] = below_df['density'].mean()
-            features['density_std'] = below_df['density'].std()
-        
-        if self.config.extract_temperature and 'temperature' in below_df.columns:
-            features['temperature_mean'] = below_df['temperature'].mean()
-            features['temperature_std'] = below_df['temperature'].std()
-        
-        if self.config.extract_grain:
-            if 'grain_size' in below_df.columns:
-                features['grain_size_mean'] = below_df['grain_size'].mean()
-                features['grain_size_std'] = below_df['grain_size'].std()
-            
-            if 'grain_type' in below_df.columns:
-                features['grain_type_mode'] = below_df['grain_type'].mode().iloc[0] if not below_df['grain_type'].mode().empty else np.nan
-                features['has_facets'] = float(any((below_df['grain_type'] >= 400) & (below_df['grain_type'] < 600)))
-        
-        if self.config.extract_lwc and 'lwc' in below_df.columns:
-            features['lwc_mean'] = below_df['lwc'].mean()
-        
-        if self.config.extract_hardness and 'hardness' in below_df.columns:
-            features['hardness_mean'] = below_df['hardness'].mean()
-        
-        return features
-    
-    def _extract_context_features(
-        self,
-        profile_df: pd.DataFrame,
-        interface_height: float,
-        timestamp: datetime
-    ) -> Dict[str, float]:
-        """Extract contextual snowpack features."""
-        features = {}
-        
-        if 'height' not in profile_df.columns:
-            return features
-        
-        # Total snow depth
-        features['total_snow_depth'] = profile_df['height'].max()
-        
-        # Number of layers
-        features['n_layers_total'] = len(profile_df)
-        
-        # Temporal features
-        features['day_of_year'] = timestamp.timetuple().tm_yday
-        features['hour_of_day'] = timestamp.hour
-        
-        return features
-    
-    def _compute_derived_features(
-        self,
-        above_features: Dict[str, float],
-        interface_features: Dict[str, float],
-        below_features: Dict[str, float]
-    ) -> Dict[str, float]:
-        """Compute derived features from basic measurements."""
-        features = {}
-        
-        # Density contrast
-        if 'density_mean' in above_features and 'density_mean' in below_features:
-            above_density = above_features['density_mean']
-            below_density = below_features['density_mean']
-            if below_density > 0:
-                features['density_contrast'] = abs(above_density - below_density) / below_density
-            else:
-                features['density_contrast'] = 0.0
-        
-        # Temperature inversion
-        if 'temperature_mean' in above_features and 'temperature_mean' in below_features:
-            features['temperature_inversion'] = (
-                below_features['temperature_mean'] - above_features['temperature_mean']
+        try:
+            # Try to get profile at exact time (with nearest neighbor)
+            # Convert tolerance to numpy timedelta64 for xarray compatibility
+            tolerance_td = np.timedelta64(
+                int(self.config.max_time_tolerance_hours * 3600), 's'
             )
+            profile_at_time = profile.data.sel(
+                timestamp=target_time,
+                method='nearest',
+                tolerance=tolerance_td # type: ignore[arg-type]
+            )
+            
+            # Get actual timestamp
+            actual_time = pd.Timestamp(profile_at_time.timestamp.values)
+            
+            # Convert to DataFrame
+            profile_df = profile_at_time.to_dataframe().reset_index()
+            
+            return profile_df, actual_time
+            
+        except Exception as e:
+            logger.error(f"Error getting profile at {target_time}: {e}")
+            return None, None
+    
+    def _get_layer_by_id(
+        self,
+        profile_df: pd.DataFrame,
+        layer_id: int
+    ) -> Optional[pd.Series]:
+        """
+        Extract a specific layer by its element_ID.
         
-        # Grain size contrast
-        if 'grain_size_mean' in above_features and 'grain_size_mean' in below_features:
-            above_gs = above_features['grain_size_mean']
-            below_gs = below_features['grain_size_mean']
-            if below_gs > 0:
-                features['grain_size_ratio'] = above_gs / below_gs
-            else:
-                features['grain_size_ratio'] = 1.0
+        Args:
+            profile_df: DataFrame with layer data
+            layer_id: Element ID to find
+            
+        Returns:
+            Series representing the layer, or None if not found
+        """
+        if 'element_ID' not in profile_df.columns:
+            logger.warning("No element_ID column in profile")
+            return None
         
-        # Structural weakness index
-        if 'grain_size_diff' in interface_features and 'grain_size_mean' in above_features:
-            gs_diff = interface_features['grain_size_diff']
-            gs_above = above_features['grain_size_mean']
-            if gs_above > 0:
-                features['structural_weakness'] = gs_diff / gs_above
+        # Find layer with matching ID
+        layer_mask = profile_df['element_ID'] == layer_id
+        matching_layers = profile_df[layer_mask]
+        
+        if len(matching_layers) == 0:
+            logger.debug(f"Layer ID {layer_id} not found in profile")
+            return None
+        
+        if len(matching_layers) > 1:
+            logger.warning(f"Multiple layers with ID {layer_id}, using first")
+        
+        return matching_layers.iloc[0]
+    
+    def _extract_layer_parameters(
+        self,
+        layer: pd.Series,
+        prefix: str = 'layer'
+    ) -> Dict[str, float]:
+        """
+        Extract all available SNOWPACK parameters from a layer.
+        
+        Args:
+            layer: Series representing a single layer
+            prefix: Prefix for feature names ('above', 'below', etc.)
+            
+        Returns:
+            Dictionary of parameter features
+        """
+        features = {}
+        
+        # Extract each parameter
+        for code, param_def in SNOWPACK_PARAMETERS.items():
+            col_name = param_def.column_name
+            
+            if col_name in layer.index:
+                value = layer[col_name]
+                
+                # Ensure we have a scalar value (handle Series edge cases)
+                if isinstance(value, pd.Series):
+                    value = value.item()
+                
+                # Handle NaN and infinite values
+                if pd.isna(value) or np.isinf(value):
+                    value = np.nan
+                else:
+                    value = float(value)
+                
+                feature_name = f'{prefix}_{param_def.name}'
+                features[feature_name] = value
             else:
-                features['structural_weakness'] = 0.0
+                # Parameter not available in this profile
+                feature_name = f'{prefix}_{param_def.name}'
+                features[feature_name] = np.nan
         
         return features
     
-    def _get_default_features(self) -> Dict[str, float]:
-        """Return dictionary of NaN values for missing features."""
-        return {
-            'density_mean': np.nan,
-            'density_std': np.nan,
-            'temperature_mean': np.nan,
-            'grain_size_mean': np.nan,
-            'lwc_mean': np.nan,
-            'hardness_mean': np.nan
-        }
+    def _compute_interface_features(
+        self,
+        layer_above: pd.Series,
+        layer_below: pd.Series
+    ) -> Dict[str, float]:
+        """
+        Compute interface features from two adjacent layers.
+        
+        Computes:
+        - Differences (above - below)
+        - Ratios (above / below)
+        - Gradients (diff / distance)
+        
+        Args:
+            layer_above: Series for layer above interface
+            layer_below: Series for layer below interface
+            
+        Returns:
+            Dictionary of interface features
+        """
+        features = {}
+        
+        # Get height difference for gradient calculations
+        height_diff = None
+        if 'height' in layer_above.index and 'height' in layer_below.index:
+            h_above = layer_above['height']
+            if isinstance(h_above, pd.Series):
+                h_above = h_above.item()
+            h_above = float(h_above)
+            h_below = layer_below['height']
+            if isinstance(h_below, pd.Series):
+                h_below = h_below.item()
+            h_below = float(h_below)
+            height_diff = abs(h_above - h_below)
+            features['interface_layer_distance'] = height_diff
+        
+        # Compute differences
+        if self.config.compute_differences:
+            diff_params = get_parameters_for_differences()
+            for code in diff_params:
+                param_def = SNOWPACK_PARAMETERS[code]
+                col_name = param_def.column_name
+                
+                if col_name in layer_above.index and col_name in layer_below.index:
+                    val_above = layer_above[col_name]
+                    if isinstance(val_above, pd.Series):
+                        val_above = val_above.item()
+                    val_below = layer_below[col_name]
+                    if isinstance(val_below, pd.Series):
+                        val_below = val_below.item()
+                    if pd.notna(val_above) and pd.notna(val_below):
+                        diff = float(val_above) - float(val_below)
+                        features[f'interface_{param_def.name}_diff'] = diff
+                    else:
+                        features[f'interface_{param_def.name}_diff'] = np.nan
+        
+        # Compute ratios
+        if self.config.compute_ratios:
+            ratio_params = get_parameters_for_ratios()
+            for code in ratio_params:
+                param_def = SNOWPACK_PARAMETERS[code]
+                col_name = param_def.column_name
+                
+                if col_name in layer_above.index and col_name in layer_below.index:
+                    val_above = layer_above[col_name] 
+                    if isinstance(val_above, pd.Series):
+                        val_above = val_above.item()
+                    val_below = layer_below[col_name]
+                    if isinstance(val_below, pd.Series):
+                        val_below = val_below.item()
+                    
+                    if pd.notna(val_above) and pd.notna(val_below):
+                        val_above = float(val_above)
+                        val_below = float(val_below)
+                        
+                        # Avoid division by zero
+                        if val_below != 0:
+                            ratio = val_above / val_below
+                            features[f'interface_{param_def.name}_ratio'] = ratio
+                        else:
+                            features[f'interface_{param_def.name}_ratio'] = np.nan
+                    else:
+                        features[f'interface_{param_def.name}_ratio'] = np.nan
+        
+        # Compute gradients for key parameters
+        if self.config.compute_gradients and height_diff is not None and height_diff > 0:
+            gradient_params = ['0502', '0503', '0506', '0512']  # density, temp, lwc, grain_size
+            
+            for code in gradient_params:
+                if code in SNOWPACK_PARAMETERS:
+                    param_def = SNOWPACK_PARAMETERS[code]
+                    col_name = param_def.column_name
+                    
+                    if col_name in layer_above.index and col_name in layer_below.index:
+                        val_above = layer_above[col_name]
+                        if isinstance(val_above, pd.Series):
+                            val_above = val_above.item()
+                        val_below = layer_below[col_name]
+                        if isinstance(val_below, pd.Series):
+                            val_below = val_below.item()    
+                        
+                        if pd.notna(val_above) and pd.notna(val_below):
+                            diff = float(val_above) - float(val_below)
+                            gradient = diff / height_diff
+                            features[f'interface_{param_def.name}_gradient'] = gradient
+                        else:
+                            features[f'interface_{param_def.name}_gradient'] = np.nan
+        
+        return features
 
 
 # ---------------------------------------------------------------------------
@@ -412,41 +413,36 @@ class InterfaceFeatureExtractor:
 # ---------------------------------------------------------------------------
 
 def extract_features_for_stall_events(
-    stall_events: List[dict],
-    get_profile_func: callable,
-    extractor: InterfaceFeatureExtractor
+    stall_events: List[Dict[str, Any]],
+    extractor: LayerFeatureExtractor
 ) -> pd.DataFrame:
     """
     Extract features for a list of stall events.
     
     Args:
         stall_events: List of stall event dictionaries
-        get_profile_func: Function to get profile at specific time
-                         Signature: (pro_file: Path, timestamp: datetime) -> pd.DataFrame
-        extractor: InterfaceFeatureExtractor instance
+        extractor: LayerFeatureExtractor instance
         
     Returns:
         DataFrame with stall events and their features
     """
+    if SnowpackProfileType is None:
+        raise ImportError("SnowpackProfile not available")
+    
     all_features = []
     
     for event in stall_events:
         try:
-            # Get profile at stall time
-            profile_df = get_profile_func(
-                event['pro_file'],
-                event['start_time']
-            )
-            
-            if profile_df is None or profile_df.empty:
-                logger.warning(f"No profile data for event {event['event_id']}")
-                continue
+            # Load profile
+            profile = SnowpackProfileType(str(event['pro_file']))
             
             # Extract features
-            features = extractor.extract_all_features(
-                profile_df,
-                event['stall_height'],
-                event['start_time']
+            features = extractor.extract_features_for_interface(
+                profile,
+                event['start_time'],
+                event['stall_layer_id'],
+                event['layer_above_id'],
+                event['layer_below_id']
             )
             
             # Combine with event metadata
@@ -468,6 +464,97 @@ def extract_features_for_stall_events(
 
 
 # ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+def validate_features(features_df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Validate extracted features and return quality metrics.
+    
+    Args:
+        features_df: DataFrame with extracted features
+        
+    Returns:
+        Dictionary of validation metrics
+    """
+    metrics = {}
+    
+    # Count total features
+    feature_columns = [
+        col for col in features_df.columns
+        if col.startswith(('above_', 'below_', 'interface_'))
+    ]
+    metrics['total_features'] = len(feature_columns)
+    
+    # Missing data analysis
+    missing_counts = features_df[feature_columns].isnull().sum()
+    metrics['features_with_missing'] = (missing_counts > 0).sum()
+    metrics['mean_missing_pct'] = (missing_counts / len(features_df) * 100).mean()
+    
+    # Identify features with high missing rates
+    high_missing = missing_counts[missing_counts > len(features_df) * 0.1]
+    metrics['features_over_10pct_missing'] = len(high_missing)
+    
+    # Check lookback times
+    if 'lookback_hours' in features_df.columns:
+        metrics['mean_lookback_hours'] = features_df['lookback_hours'].mean()
+        metrics['min_lookback_hours'] = features_df['lookback_hours'].min()
+        metrics['max_lookback_hours'] = features_df['lookback_hours'].max()
+    
+    # Check for constant features (no variance)
+    constant_features = []
+    for col in feature_columns:
+        if features_df[col].notna().sum() > 1:  # Need at least 2 non-null values
+            if features_df[col].std(ddof=0) == 0:
+                constant_features.append(col)
+    metrics['constant_features'] = len(constant_features)
+    
+    return metrics
+
+
+def print_feature_summary(features_df: pd.DataFrame):
+    """Print summary of extracted features."""
+    print("=" * 80)
+    print("FEATURE EXTRACTION SUMMARY")
+    print("=" * 80)
+    
+    print(f"\nTotal examples: {len(features_df)}")
+    if 'stalled' in features_df.columns:
+        pos_count = (features_df['stalled'] == 1).sum()
+        neg_count = (features_df['stalled'] == 0).sum()
+        print(f"  Positive examples (stall=1): {pos_count}")
+        print(f"  Negative examples (stall=0): {neg_count}")
+    
+    # Count feature types
+    above_features = [col for col in features_df.columns if col.startswith('above_')]
+    below_features = [col for col in features_df.columns if col.startswith('below_')]
+    interface_features = [col for col in features_df.columns if col.startswith('interface_')]
+    
+    print(f"\nFeature counts:")
+    print(f"  Above layer:     {len(above_features)}")
+    print(f"  Below layer:     {len(below_features)}")
+    print(f"  Interface:       {len(interface_features)}")
+    print(f"  Total features:  {len(above_features) + len(below_features) + len(interface_features)}")
+    
+    # Validation metrics
+    metrics = validate_features(features_df)
+    
+    print(f"\nData quality:")
+    print(f"  Features with missing data:     {metrics['features_with_missing']}")
+    print(f"  Mean missing rate:              {metrics['mean_missing_pct']:.1f}%")
+    print(f"  Features >10% missing:          {metrics['features_over_10pct_missing']}")
+    print(f"  Constant features (no variance): {metrics['constant_features']}")
+    
+    if 'mean_lookback_hours' in metrics:
+        print(f"\nLookback times:")
+        print(f"  Mean:    {metrics['mean_lookback_hours']:.1f} hours")
+        print(f"  Min:     {metrics['min_lookback_hours']:.1f} hours")
+        print(f"  Max:     {metrics['max_lookback_hours']:.1f} hours")
+    
+    print("=" * 80)
+
+
+# ---------------------------------------------------------------------------
 # Example Usage
 # ---------------------------------------------------------------------------
 
@@ -476,28 +563,8 @@ if __name__ == "__main__":
     
     logging.basicConfig(level=logging.INFO)
     
-    # Create sample profile
-    profile_df = pd.DataFrame({
-        'height': [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0],
-        'density': [350, 320, 310, 300, 280, 250, 240, 230, 220, 210, 200],
-        'temperature': [270, 270.5, 271, 271.5, 272, 272.5, 273, 273.5, 274, 274.5, 275],
-        'grain_size': [0.5, 0.6, 0.7, 0.8, 1.2, 1.0, 0.9, 0.8, 0.7, 0.6, 0.5],
-        'grain_type': [200, 200, 200, 200, 450, 200, 200, 200, 200, 200, 200],
-        'lwc': [0.0, 0.01, 0.02, 0.03, 0.04, 0.03, 0.02, 0.01, 0.0, 0.0, 0.0],
-        'hardness': [3, 3, 3, 2, 1, 2, 3, 3, 4, 4, 4]
-    })
-    
-    # Create extractor
-    extractor = InterfaceFeatureExtractor()
-    
-    # Extract features at 0.8m (where grain type changes)
-    features = extractor.extract_all_features(
-        profile_df,
-        interface_height=0.8,
-        timestamp=datetime(2025, 5, 15, 12, 0)
-    )
-    
-    print("\nExtracted features:")
-    for key, value in sorted(features.items()):
-        if pd.notna(value):
-            print(f"{key:30s}: {value:.3f}")
+    print("LayerFeatureExtractor - Layer ID-based feature extraction")
+    print("=" * 80)
+    print("Extracts all SNOWPACK parameters from specific layers")
+    print("24 hours before wetting front stalling occurs.")
+    print("=" * 80)

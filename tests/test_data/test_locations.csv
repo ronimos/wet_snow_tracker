@@ -1,9 +1,0 @@
-latitude,longitude,aspect,altitude,stationName,path
-39.52,-105.47,N,3500,TestStation_N,test_station.pro
-39.52,-105.47,E,3500,TestStation_E,test_station.pro
-39.52,-105.47,S,3500,TestStation_S,test_station.pro
-39.52,-105.47,W,3500,TestStation_W,test_station.pro
-39.65,-105.55,N,3600,TestStation2_N,test_station2.pro
-39.65,-105.55,E,3600,TestStation2_E,test_station2.pro
-39.65,-105.55,S,3600,TestStation2_S,test_station2.pro
-39.65,-105.55,W,3600,TestStation2_W,test_station2.pro

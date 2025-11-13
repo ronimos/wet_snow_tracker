@@ -1,14 +1,15 @@
 """
 stall_detector.py
-=================
+====================
 
-Detects wetting front stall events in SNOWPACK profiles.
+Detects wetting front stall events and tracks them by layer ID.
 
-A "stall" is defined as when the wetting front remains at approximately
-the same height for an extended period (e.g., 12+ hours), indicating
-it has encountered a layer that impedes water infiltration.
+This version:
+- Tracks stalling by SNOWPACK element_ID instead of height
+- Records which layer IDs are above and below the stalling interface
+- Enables lookback to collect features before stalling occurs
 
-Author: [Your name]
+Author: Ron Simenhois
 Created: November 2025
 """
 
@@ -17,27 +18,23 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
 
 import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# Try to import from main project - handle both installed and local development
+# Try to import from main project
 try:
-    from ..snowpack_reader import SnowpackProfile
-    from ..wet_front_tracker import wet_front_lwc
+    from wetting_front_tracker.snowpack_reader import SnowpackProfile
+    from wetting_front_tracker.wet_front_tracker import wet_front_lwc
 except ImportError:
-    # For standalone testing, add parent directories to path
-    sys.path.insert(0, str(Path(__file__).parent.parent))
-    try:
-        from snowpack_reader import SnowpackProfile
-        from wet_front_tracker import wet_front_lwc
-    except ImportError:
-        logger.warning("Could not import SnowpackProfile - using test mode only")
-        SnowpackProfile = None
-        wet_front_lwc = None
+    # This block will be hit if the path wasn't added above
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+    from wetting_front_tracker.snowpack_reader import SnowpackProfile
+    from wetting_front_tracker.wet_front_tracker import wet_front_lwc
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -49,19 +46,20 @@ class StallDetectionConfig:
     
     # Stall definition
     min_duration_hours: float = 12.0      # Minimum stall duration
-    height_tolerance_m: float = 0.05      # ±5cm height tolerance (in meters)
+    height_tolerance_m: float = 0.05      # ±5cm height tolerance
     min_lwc_threshold: float = 0.04       # 4% LWC for wetting front
     
     # Quality control
     min_data_points: int = 3              # Minimum points to confirm stall
     max_gap_hours: float = 6.0            # Maximum time gap in data
     
-    # Analysis window
-    lookback_hours: float = 48.0          # How far back to look for stalls
+    # Physical constraints
+    min_wetting_front_height: float = 0.05    # 5 cm minimum height
+    min_snow_height: float = 0.25             # 25 cm minimum total snowpack
+    max_duration_hours: float = 240.0         # 10 days max
     
-    # IMPORTANT: SNOWPACK height data is in METERS, not centimeters
-    # This was verified - the 'height' column in SNOWPACK output is already in meters
-    # If your data is in cm, you need to convert it first!
+    # Feature extraction
+    feature_lookback_hours: float = 24.0      # How far back to extract features
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +69,7 @@ class StallDetectionConfig:
 @dataclass
 class StallEvent:
     """
-    Represents a single wetting front stall event.
+    Represents a single wetting front stall event with layer ID tracking.
     
     Attributes:
         event_id: Unique identifier for this event
@@ -80,6 +78,9 @@ class StallEvent:
         start_time: When stall began
         end_time: When stall ended (or data ended)
         stall_height: Height (m) where wetting front stalled
+        stall_layer_id: Element ID of layer where stall occurred
+        layer_above_id: Element ID of layer above the interface
+        layer_below_id: Element ID of layer below the interface
         duration_hours: How long the stall lasted
         confidence: Confidence score (0-1) for this event
         n_data_points: Number of timesteps confirming stall
@@ -92,6 +93,9 @@ class StallEvent:
     start_time: datetime
     end_time: datetime
     stall_height: float
+    stall_layer_id: int
+    layer_above_id: int
+    layer_below_id: int
     duration_hours: float
     confidence: float
     n_data_points: int
@@ -107,6 +111,9 @@ class StallEvent:
             'start_time': self.start_time,
             'end_time': self.end_time,
             'stall_height': self.stall_height,
+            'stall_layer_id': self.stall_layer_id,
+            'layer_above_id': self.layer_above_id,
+            'layer_below_id': self.layer_below_id,
             'duration_hours': self.duration_hours,
             'confidence': self.confidence,
             'n_data_points': self.n_data_points,
@@ -116,18 +123,149 @@ class StallEvent:
 
 
 # ---------------------------------------------------------------------------
-# Stall Detection
+# Layer ID Utilities
+# ---------------------------------------------------------------------------
+
+def get_layer_at_height(
+    profile_df: pd.DataFrame,
+    target_height: float,
+    tolerance: float = 0.05
+) -> Optional[int]:
+    """
+    Find the layer ID (element_ID) at a specific height.
+    
+    Args:
+        profile_df: DataFrame with 'height' and 'element_ID' columns
+        target_height: Height (m) to search for
+        tolerance: Search tolerance (m)
+        
+    Returns:
+        Element ID at that height, or None if not found
+    """
+    if 'height' not in profile_df.columns or 'element_ID' not in profile_df.columns:
+        logger.warning("Missing required columns: height or element_ID")
+        return None
+    
+    # Find layers within tolerance of target height
+    mask = np.abs(profile_df['height'] - target_height) <= tolerance
+    matches = profile_df[mask]
+    
+    if len(matches) == 0:
+        logger.debug(f"No layer found at height {target_height:.3f}m ±{tolerance}m")
+        return None
+    
+    # If multiple matches, take the closest one
+    closest_idx = (matches['height'] - target_height).abs().idxmin()
+    layer_id_val = matches.loc[closest_idx, 'element_ID']
+    if isinstance(layer_id_val, pd.Series):
+        layer_id_val = layer_id_val.item()
+    layer_id = int(layer_id_val)
+    
+    return layer_id
+
+
+def get_adjacent_layers(
+    profile_df: pd.DataFrame,
+    layer_id: int
+) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Find the layer IDs immediately above and below a given layer.
+    
+    Args:
+        profile_df: DataFrame with 'height' and 'element_ID' columns
+        layer_id: Element ID of the reference layer
+        
+    Returns:
+        Tuple of (layer_above_id, layer_below_id)
+        Either can be None if layer is at boundary
+    """
+    if 'height' not in profile_df.columns or 'element_ID' not in profile_df.columns:
+        return None, None
+    
+    # Find the reference layer
+    ref_layer = profile_df[profile_df['element_ID'] == layer_id]
+    
+    if len(ref_layer) == 0:
+        logger.warning(f"Layer ID {layer_id} not found in profile")
+        return None, None
+    
+    ref_height = float(ref_layer['height'].iloc[0])
+    
+    # Find layer above (next higher height)
+    above_layers = profile_df[profile_df['height'] > ref_height]
+    layer_above_id = None
+    if len(above_layers) > 0:
+        # Get layer with minimum height among those above
+        closest_above = above_layers.loc[above_layers['height'].idxmin()]
+        layer_above_id = closest_above['element_ID']
+        if isinstance(layer_above_id, pd.Series):
+            layer_above_id = layer_above_id.item()
+        layer_above_id = int(layer_above_id)
+    
+    # Find layer below (next lower height)
+    below_layers = profile_df[profile_df['height'] < ref_height]
+    layer_below_id = None
+    if len(below_layers) > 0:
+        # Get layer with maximum height among those below
+        closest_below = below_layers.loc[below_layers['height'].idxmax()]
+        layer_below_id = closest_below['element_ID']
+        if isinstance(layer_below_id, pd.Series):
+            layer_below_id = layer_below_id.item()
+        layer_below_id = int(layer_below_id)
+    
+    return layer_above_id, layer_below_id
+
+
+def verify_layer_id_persistence(
+    profile: SnowpackProfile,
+    layer_id: int,
+    start_time: datetime,
+    end_time: datetime
+) -> bool:
+    """
+    Verify that a layer ID persists across a time range.
+    
+    Args:
+        profile: SnowpackProfile object
+        layer_id: Element ID to check
+        start_time: Start of time range
+        end_time: End of time range
+        
+    Returns:
+        True if layer ID exists throughout the time range
+    """
+    try:
+        # Select time range
+        time_slice = profile.data.sel(timestamp=slice(start_time, end_time))
+        
+        # Check if layer_id appears in each timestamp
+        for timestamp in time_slice.timestamp.values:
+            profile_at_time = time_slice.sel(timestamp=timestamp)
+            if 'element_ID' in profile_at_time:
+                layer_ids = profile_at_time['element_ID'].values
+                if layer_id not in layer_ids:
+                    logger.debug(f"Layer {layer_id} missing at {timestamp}")
+                    return False
+        
+        return True
+        
+    except Exception as e:
+        logger.warning(f"Error verifying layer ID persistence: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Stall Detection with Layer ID Tracking
 # ---------------------------------------------------------------------------
 
 class StallDetector:
     """
-    Detects wetting front stall events in SNOWPACK time series.
+    Detects wetting front stall events and tracks them by layer ID.
     
-    Algorithm:
-    1. Track wetting front position over time
-    2. Identify periods where front height is stable (±tolerance)
-    3. Filter for events lasting minimum duration
-    4. Calculate confidence scores
+    Key features:
+    - Identifies which layer ID the wetting front stalled at
+    - Records layer IDs above and below the interface
+    - Enables feature extraction from specific layers
     """
     
     def __init__(self, config: Optional[StallDetectionConfig] = None):
@@ -142,17 +280,17 @@ class StallDetector:
     
     def find_stalls(
         self,
+        profile: SnowpackProfile,
         wetting_front_timeseries: pd.Series,
-        station_name: str,
-        pro_file: Path
+        station_name: str
     ) -> List[StallEvent]:
         """
-        Find all stall events in a wetting front time series.
+        Find all stall events with layer ID tracking.
         
         Args:
-            wetting_front_timeseries: Series with datetime index and heights (in METERS)
+            profile: SnowpackProfile object (needed for layer ID lookup)
+            wetting_front_timeseries: Series with datetime index and heights (meters)
             station_name: Station identifier
-            pro_file: Source .pro file path
             
         Returns:
             List of detected StallEvent objects
@@ -168,534 +306,338 @@ class StallDetector:
             logger.debug(f"Insufficient data points for {station_name}")
             return []
         
-        # Validate units - heights should be in reasonable range for meters
+        # Check if snowpack is deep enough
         max_height = float(valid_data.max())
-        min_height = float(valid_data.min())
-        
-        if max_height > 20:
-            logger.error(f"Height values too large (max={max_height:.1f}m) - likely still in cm!")
-            logger.error("Use extract_wetting_front_timeseries() to auto-convert units")
+        if max_height < self.config.min_snow_height:
+            logger.info(f"Snowpack too shallow for {station_name}")
             return []
         
-        if max_height < 0.1 and min_height >= 0:
-            logger.warning(f"Height values very small (max={max_height:.3f}m) - check units")
-        
-        logger.debug(f"Height range: {min_height:.2f}m to {max_height:.2f}m")
-        
-        # Find stable periods
+        # Find stable periods (height-based detection)
         stable_periods = self._find_stable_periods(valid_data)
         
-        # Convert to stall events
-        stall_events = []
-        for period_start, period_end, mean_height in stable_periods:
-            event = self._create_stall_event(
-                period_start, period_end, mean_height,
-                valid_data, station_name, pro_file
-            )
-            
-            if self._validate_stall(event):
-                stall_events.append(event)
+        # Filter by duration and quality
+        stall_periods = self._filter_stalls(stable_periods, valid_data)
         
-        logger.info(f"Found {len(stall_events)} stall events in {station_name}")
-        return stall_events
+        # Convert to StallEvent objects with layer IDs
+        events = []
+        for period in stall_periods:
+            event = self._create_stall_event(
+                period,
+                profile,
+                station_name,
+                profile.filename
+            )
+            if event is not None:
+                events.append(event)
+        
+        logger.info(f"Found {len(events)} stall events for {station_name}")
+        return events
     
-    def _find_stable_periods(
-        self,
-        timeseries: pd.Series
-    ) -> List[Tuple[datetime, datetime, float]]:
+    def _find_stable_periods(self, timeseries: pd.Series) -> List[Dict[str, Any]]:
         """
-        Identify periods where height is stable within tolerance.
+        Find periods where wetting front height is stable.
         
         Args:
-            timeseries: Time series of wetting front heights
+            timeseries: Valid (non-NaN) wetting front time series
             
         Returns:
-            List of (start_time, end_time, mean_height) tuples
+            List of dictionaries describing stable periods
         """
         stable_periods = []
-        current_period_start = None
-        current_period_indices = []
         
-        timestamps = timeseries.index.to_list()
-        heights = timeseries.values
+        if len(timeseries) < 2:
+            return stable_periods
         
-        # Detect units and convert if necessary
-        # If heights are in cm (typical range 0-500), convert to meters
-        # If already in meters (typical range 0-5), keep as is
-        max_height = np.max(heights[~np.isnan(heights)])
-        if max_height > 50:  # Likely in cm
-            logger.info(f"Detected heights in cm (max: {max_height:.1f}), converting to meters")
-            heights = np.divide(heights, 100.0)
-            height_units = "cm (converted to m)"
-        else:
-            logger.debug(f"Heights appear to be in meters (max: {max_height:.2f})")
-            height_units = "m"
+        # Start first potential period
+        period_start = timeseries.index[0]
+        period_heights = [timeseries.iloc[0]]
         
-        # Now heights are in meters, tolerance is in meters
-        tolerance_m = self.config.height_tolerance_m
-        
-        for i in range(len(heights)):
-            if current_period_start is None:
-                # Start new period
-                current_period_start = timestamps[i]
-                current_period_indices = [i]
-            else:
-                # Check if this point is within tolerance of period mean
-                period_heights = heights[current_period_indices]
-                period_mean = float(np.mean(period_heights))
-                
-                if abs(float(heights[i]) - period_mean) <= tolerance_m:
-                    # Point is within tolerance - extend period
-                    current_period_indices.append(i)
-                else:
-                    # Point breaks the stability - evaluate current period
-                    if len(current_period_indices) >= self.config.min_data_points:
-                        period_end = timestamps[current_period_indices[-1]]
-                        period_mean = float(np.mean(heights[current_period_indices]))
-                        
-                        duration = float((period_end - current_period_start).total_seconds() / 3600.0)
-                        if duration >= self.config.min_duration_hours:
-                            stable_periods.append((
-                                current_period_start,
-                                period_end,
-                                period_mean
-                            ))
-                    
-                    # Start new period
-                    current_period_start = timestamps[i]
-                    current_period_indices = [i]
-        
-        # Handle final period
-        if current_period_indices and len(current_period_indices) >= self.config.min_data_points:
-            period_end = timestamps[current_period_indices[-1]]
-            period_mean = float(np.mean(heights[current_period_indices]))
+        for i in range(1, len(timeseries)):
+            current_time = timeseries.index[i]
+            current_height = timeseries.iloc[i]
+            prev_time = timeseries.index[i-1]
             
-            duration = float((period_end - current_period_start).total_seconds() / 3600.0)
-            if duration >= self.config.min_duration_hours:
-                stable_periods.append((
-                    current_period_start,
-                    period_end,
-                    period_mean
-                ))
+            # Check time gap
+            time_diff = pd.Timestamp(current_time) - pd.Timestamp(prev_time) # type: ignore[arg-type]
+            time_gap = time_diff.total_seconds() / 3600
+            if time_gap > self.config.max_gap_hours:
+                
+                # Gap too large - end current period and start new one
+                if len(period_heights) >= self.config.min_data_points:
+                    stable_periods.append({
+                        'start': period_start,
+                        'end': timeseries.index[i-1],
+                        'heights': period_heights.copy()
+                    })
+                period_start = current_time
+                period_heights = [current_height]
+                continue
+            
+            # Check if height is within tolerance of period mean
+            period_mean = np.mean(period_heights)
+            if abs(current_height - period_mean) <= self.config.height_tolerance_m:
+                # Still stable
+                period_heights.append(current_height)
+            else:
+                # Height deviated - check if we should save this period
+                if len(period_heights) >= self.config.min_data_points:
+                    stable_periods.append({
+                        'start': period_start,
+                        'end': timeseries.index[i-1],
+                        'heights': period_heights.copy()
+                    })
+                # Start new period
+                period_start = current_time
+                period_heights = [current_height]
         
-        logger.debug(f"Found {len(stable_periods)} stable periods (units: {height_units}, tolerance: ±{tolerance_m}m)")
+        # Save final period if valid
+        if len(period_heights) >= self.config.min_data_points:
+            stable_periods.append({
+                'start': period_start,
+                'end': timeseries.index[-1],
+                'heights': period_heights.copy()
+            })
+        
         return stable_periods
     
-    def _create_stall_event(
+    def _filter_stalls(
         self,
-        start_time: datetime,
-        end_time: datetime,
-        mean_height: float,
-        full_timeseries: pd.Series,
-        station_name: str,
-        pro_file: Path
-    ) -> StallEvent:
+        stable_periods: List[Dict[str, Any]],
+        timeseries: pd.Series
+    ) -> List[Dict[str, Any]]:
         """
-        Create a StallEvent object from a stable period.
+        Filter stable periods to identify actual stalls.
         
         Args:
-            start_time: Period start
-            end_time: Period end
-            mean_height: Average height during period
-            full_timeseries: Complete time series (for context)
-            station_name: Station identifier
-            pro_file: Source file
+            stable_periods: List of stable period dictionaries
+            timeseries: Full time series
             
         Returns:
-            StallEvent object
+            List of stall period dictionaries
         """
-        # Extract data for this period
-        period_data = full_timeseries.loc[start_time:end_time]
+        stalls = []
         
-        # Calculate metrics - explicit float conversions for type checker
-        duration_hours = float((end_time - start_time).total_seconds() / 3600.0)
-        height_std = float(period_data.std()) if len(period_data) > 0 else 0.0
-        n_points = int(len(period_data))
+        for period in stable_periods:
+            # Calculate duration
+            duration = (period['end'] - period['start']).total_seconds() / 3600
+            
+            # Check duration constraints
+            if duration < self.config.min_duration_hours:
+                continue
+            if duration > self.config.max_duration_hours:
+                continue
+            
+            # Calculate statistics
+            heights = period['heights']
+            mean_height = float(np.mean(heights))
+            std_height = float(np.std(heights))
+            
+            # Check height constraints
+            if mean_height < self.config.min_wetting_front_height:
+                continue
+            
+            # Calculate confidence score
+            confidence = self._calculate_confidence(
+                duration, len(heights), std_height
+            )
+            
+            # Check if stall is ongoing (ends at last data point)
+            is_ongoing = (period['end'] == timeseries.index[-1])
+            
+            # Add to stalls
+            stalls.append({
+                'start': period['start'],
+                'end': period['end'],
+                'height': mean_height,
+                'height_std': std_height,
+                'duration': duration,
+                'n_points': len(heights),
+                'confidence': confidence,
+                'is_ongoing': is_ongoing
+            })
         
-        # Check if stall is ongoing (at end of available data)
-        is_ongoing = (end_time == full_timeseries.index[-1])
-        
-        # Calculate confidence score
-        confidence = self._calculate_confidence(
-            duration_hours, height_std, n_points
-        )
-        
-        # Generate unique ID
-        self._event_counter += 1
-        event_id = f"SE_{self._event_counter:06d}"
-        
-        return StallEvent(
-            event_id=event_id,
-            station_name=station_name,
-            pro_file=pro_file,
-            start_time=start_time,
-            end_time=end_time,
-            stall_height=float(mean_height),
-            duration_hours=duration_hours,
-            confidence=confidence,
-            n_data_points=n_points,
-            height_std=height_std,
-            is_ongoing=is_ongoing
-        )
+        return stalls
     
     def _calculate_confidence(
         self,
         duration_hours: float,
-        height_std: float,
-        n_points: int
+        n_points: int,
+        height_std: float
     ) -> float:
-        """
-        Calculate confidence score for a stall event.
+        """Calculate confidence score for a stall event."""
+        # Duration component (0-0.4)
+        duration_score = min(0.4, duration_hours / 48.0)
         
-        Higher confidence for:
-        - Longer duration
-        - Lower height variability
-        - More data points
+        # Data density component (0-0.3)
+        density_score = min(0.3, n_points / 20.0)
         
-        Args:
-            duration_hours: Stall duration
-            height_std: Standard deviation of heights
-            n_points: Number of data points
-            
-        Returns:
-            Confidence score (0-1)
-        """
-        # Duration score: sigmoid centered at 18 hours
-        # Convert to float to satisfy type checker
-        duration_score = float(1.0 / (1.0 + np.exp(-(float(duration_hours) - 18.0) / 6.0)))
+        # Stability component (0-0.3)
+        stability_score = max(0, 0.3 - (height_std / self.config.height_tolerance_m) * 0.1)
         
-        # Stability score: inverse of normalized std
-        max_std = float(self.config.height_tolerance_m)
-        stability_score = 1.0 - min(float(height_std) / max_std, 1.0)
-        
-        # Data quality score: sigmoid centered at 10 points
-        quality_score = float(1.0 / (1.0 + np.exp(-(float(n_points) - 10.0) / 3.0)))
-        
-        # Weighted average
-        confidence = (
-            0.4 * duration_score +
-            0.4 * stability_score +
-            0.2 * quality_score
-        )
-        
-        return float(confidence)
+        return min(1.0, duration_score + density_score + stability_score)
     
-    def _validate_stall(self, event: StallEvent) -> bool:
+    def _create_stall_event(
+        self,
+        stall_period: dict,
+        profile: SnowpackProfile,
+        station_name: str,
+        pro_file: Path
+    ) -> Optional[StallEvent]:
         """
-        Validate that a stall event meets quality criteria.
+        Create StallEvent with layer ID information.
         
         Args:
-            event: StallEvent to validate
+            stall_period: Dictionary describing the stall
+            profile: SnowpackProfile for layer lookup
+            station_name: Station name
+            pro_file: Source file path
             
         Returns:
-            True if event is valid
+            StallEvent object or None if layer ID lookup fails
         """
-        # Basic checks
-        if event.duration_hours < self.config.min_duration_hours:
-            return False
-        
-        if event.n_data_points < self.config.min_data_points:
-            return False
-        
-        if event.confidence < 0.3:  # Minimum confidence threshold
-            return False
-        
-        if event.stall_height < 0:  # Physical constraint
-            return False
-        
-        return True
+        try:
+            # Get profile at start of stall
+            profile_at_stall = profile.data.sel(
+                timestamp=stall_period['start'],
+                method='nearest'
+            )
+            profile_df = profile_at_stall.to_dataframe().reset_index()
+            
+            # Find layer ID at stall height
+            stall_height = stall_period['height']
+            stall_layer_id = get_layer_at_height(
+                profile_df,
+                stall_height,
+                self.config.height_tolerance_m
+            )
+            
+            if stall_layer_id is None:
+                # logger.warning(f"Could not find layer ID at height {stall_height:.3f}m")
+                return None
+            
+            # Find adjacent layers
+            layer_above_id, layer_below_id = get_adjacent_layers(
+                profile_df,
+                stall_layer_id
+            )
+            
+            if layer_above_id is None or layer_below_id is None:
+                #logger.warning(f"Could not find adjacent layers for layer {stall_layer_id}")
+                return None
+            
+            # Create event
+            self._event_counter += 1
+            event_id = f"{station_name}_stall_{self._event_counter:04d}"
+            
+            event = StallEvent(
+                event_id=event_id,
+                station_name=station_name,
+                pro_file=pro_file,
+                start_time=stall_period['start'],
+                end_time=stall_period['end'],
+                stall_height=stall_height,
+                stall_layer_id=stall_layer_id,
+                layer_above_id=layer_above_id,
+                layer_below_id=layer_below_id,
+                duration_hours=stall_period['duration'],
+                confidence=stall_period['confidence'],
+                n_data_points=stall_period['n_points'],
+                height_std=stall_period['height_std'],
+                is_ongoing=stall_period['is_ongoing']
+            )
+            
+            logger.debug(f"Created event {event_id}: "
+                        f"layer {stall_layer_id} at {stall_height:.3f}m, "
+                        f"above={layer_above_id}, below={layer_below_id}")
+            
+            return event
+            
+        except Exception as e:
+            logger.error(f"Error creating stall event: {e}")
+            return None
 
 
 # ---------------------------------------------------------------------------
-# Wetting Front Tracking
+# Convenience Functions
 # ---------------------------------------------------------------------------
 
-def extract_wetting_front_timeseries(
-    summary_df: pd.DataFrame,
-    lwc_threshold: float = 0.04
-) -> pd.Series:
+def extract_wetting_front_timeseries(summary: pd.DataFrame) -> pd.Series:
     """
-    Extract wetting front position time series from summary DataFrame.
+    Extract wetting front height time series from summary DataFrame.
     
     Args:
-        summary_df: Summary DataFrame with wet_front_lwc_height column
-        lwc_threshold: LWC threshold for defining wetting front
+        summary: Summary DataFrame with wet_front_lwc_height column
         
     Returns:
-        Series with datetime index and wetting front heights (in METERS)
+        Series with datetime index and heights in meters
     """
-    if 'wet_front_lwc_height' not in summary_df.columns:
+    if 'wet_front_lwc_height' not in summary.columns:
         logger.warning("No wet_front_lwc_height column in summary")
         return pd.Series(dtype=float)
     
     # Extract height column
-    wetting_front = summary_df['wet_front_lwc_height'].copy()
+    wetting_front = summary['wet_front_lwc_height'].copy()
     
-    # Ensure datetime index
-    if not isinstance(wetting_front.index, pd.DatetimeIndex):
-        logger.warning("Index is not DatetimeIndex, attempting conversion")
-        try:
-            wetting_front.index = pd.to_datetime(wetting_front.index)
-        except Exception as e:
-            logger.error(f"Failed to convert index to datetime: {e}")
-            return pd.Series(dtype=float)
-    
-    # Check units and convert if necessary
-    # SNOWPACK height should be in meters, but some outputs may be in cm
-    valid_heights = wetting_front.dropna()
-    if not valid_heights.empty:
-        max_height = float(valid_heights.max())
-        # If max height > 20, likely in centimeters (assuming snowpack < 20m)
-        if max_height > 20:
-            logger.warning(f"Height values appear to be in cm (max={max_height:.1f}), converting to meters")
-            wetting_front = wetting_front / 100.0
+    # Units already in meters from SNOWPACK
     
     return wetting_front
 
 
-# ---------------------------------------------------------------------------
-# Batch Processing
-# ---------------------------------------------------------------------------
-
-def detect_stalls_batch(
-    pro_files: List[Path],
-    detector: StallDetector,
-    process_summary_func: callable
-) -> pd.DataFrame:
+def detect_stalls(
+    pro_file: Path,
+    config: Optional[StallDetectionConfig] = None
+) -> List[StallEvent]:
     """
-    Detect stalls across multiple .pro files.
+    Convenience function to detect stalls in a .pro file.
     
     Args:
-        pro_files: List of .pro file paths
-        detector: StallDetector instance
-        process_summary_func: Function to get summary from .pro file
-                              Signature: (pro_file: Path) -> pd.DataFrame
+        pro_file: Path to .pro file
+        config: Detection configuration
         
     Returns:
-        DataFrame with all detected stall events
+        List of StallEvent objects
     """
-    all_events = []
+    if SnowpackProfile is None or wet_front_lwc is None:
+        raise ImportError("SnowpackProfile or wet_front_lwc not available")
     
-    for pro_file in pro_files:
-        try:
-            logger.info(f"Processing {pro_file.name}")
-            
-            # Get summary data
-            summary_df = process_summary_func(pro_file)
-            
-            if summary_df is None or summary_df.empty:
-                logger.warning(f"No summary data for {pro_file.name}")
-                continue
-            
-            # Extract wetting front
-            wetting_front = extract_wetting_front_timeseries(summary_df)
-            
-            if wetting_front.empty:
-                logger.debug(f"No wetting front data in {pro_file.name}")
-                continue
-            
-            # Detect stalls
-            station_name = pro_file.stem
-            events = detector.find_stalls(wetting_front, station_name, pro_file)
-            
-            all_events.extend([e.to_dict() for e in events])
-            
-        except Exception as e:
-            logger.error(f"Error processing {pro_file.name}: {e}", exc_info=True)
-            continue
+    # Load profile
+    profile = SnowpackProfile(str(pro_file))
     
-    if not all_events:
-        logger.warning("No stall events found in any files")
-        return pd.DataFrame()
+    # Calculate wetting front
+    parameters_to_calculate = {
+        "wet_front_lwc": wet_front_lwc
+    }
+    summary = profile.get_full_timeseries_summary(
+        parameters_to_calculate=parameters_to_calculate
+    )
     
-    # Convert to DataFrame
-    events_df = pd.DataFrame(all_events)
-    logger.info(f"Total stall events found: {len(events_df)}")
+    # Unpack tuple column
+    if 'wet_front_lwc' in summary.columns:
+        summary[['wet_front_lwc_value', 'wet_front_lwc_height']] = pd.DataFrame(
+            summary['wet_front_lwc'].tolist(),
+            index=summary.index
+        )
     
-    return events_df
+    # Extract wetting front
+    wetting_front = extract_wetting_front_timeseries(summary)
+    
+    # Detect stalls
+    detector = StallDetector(config)
+    station_name = pro_file.stem
+    events = detector.find_stalls(profile, wetting_front, station_name)
+    
+    return events
 
 
-# ---------------------------------------------------------------------------
-# Example Usage
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    """
-    Example usage: Detect stalls in a real .pro file.
-    
-    Usage:
-        python stall_detector.py path/to/file.pro
-        python stall_detector.py path/to/file.pro --min-duration 8 --tolerance 0.10
-    """
-    import argparse
-    
-    # Setup logging
+if __name__ == '__main__':
+    # Example usage
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s [%(levelname)s] %(message)s'
     )
     
-    # Parse arguments
-    parser = argparse.ArgumentParser(description='Detect wetting front stalls in SNOWPACK profiles')
-    parser.add_argument('pro_file', type=Path, help='Path to .pro file')
-    parser.add_argument('--min-duration', type=float, default=12.0, 
-                       help='Minimum stall duration (hours, default: 12.0)')
-    parser.add_argument('--tolerance', type=float, default=0.05,
-                       help='Height tolerance (meters, default: 0.05)')
-    parser.add_argument('--start-date', type=str, help='Start date (YYYY-MM-DD)')
-    parser.add_argument('--end-date', type=str, help='End date (YYYY-MM-DD)')
-    args = parser.parse_args()
-    
-    # Check if file exists
-    if not args.pro_file.exists():
-        logger.error(f"File not found: {args.pro_file}")
-        sys.exit(1)
-    
-    # Check if we can import required modules
-    if SnowpackProfile is None or wet_front_lwc is None:
-        logger.error("Cannot import SnowpackProfile or wet_front_lwc")
-        logger.error("Make sure you're running from the project directory")
-        logger.error("Or install the package: pip install -e .")
-        sys.exit(1)
-    
-    try:
-        # Load profile
-        logger.info(f"Loading profile: {args.pro_file}")
-        profile = SnowpackProfile(str(args.pro_file))
-        logger.info(f"  Station: {profile.metadata.get('stationName', 'Unknown')}")
-        logger.info(f"  Location: {profile.metadata.get('latitude')}, {profile.metadata.get('longitude')}")
-        
-        # Calculate summary with wetting front
-        logger.info("Calculating wetting front time series...")
-        parameters_to_calculate = {
-            "wet_front_lwc": wet_front_lwc
-        }
-        
-        # Only pass date parameters if they're specified
-        summary_kwargs = {
-            'parameters_to_calculate': parameters_to_calculate
-        }
-        
-        if args.start_date:
-            summary_kwargs['start_date'] = args.start_date
-        if args.end_date:
-            summary_kwargs['end_date'] = args.end_date
-        
-        summary = profile.get_full_timeseries_summary(parameters_to_calculate=summary_kwargs) # type: ignore[call-arg]
-        
-        if summary.empty:
-            logger.error("Summary calculation returned empty DataFrame")
-            sys.exit(1)
-        
-        logger.info(f"  Time range: {summary.index[0]} to {summary.index[-1]}")
-        logger.info(f"  Data points: {len(summary)}")
-        
-        # Unpack wet_front_lwc tuple column
-        if 'wet_front_lwc' in summary.columns:
-            summary[['wet_front_lwc_value', 'wet_front_lwc_height']] = pd.DataFrame(
-                summary['wet_front_lwc'].tolist(),
-                index=summary.index
-            )
-        
-        # Extract wetting front time series
-        wetting_front = extract_wetting_front_timeseries(summary)
-        
-        if wetting_front.empty:
-            logger.warning("No wetting front detected in profile")
-            logger.warning("This may indicate:")
-            logger.warning("  - No liquid water in snowpack during analysis period")
-            logger.warning("  - Dry snow conditions")
-            logger.warning("  - Early/late season data")
-            sys.exit(0)
-        
-        # Count non-null values
-        n_wet_points = wetting_front.notna().sum()
-        logger.info(f"  Wetting front detected: {n_wet_points}/{len(wetting_front)} timesteps")
-        
-        if n_wet_points == 0:
-            logger.warning("Wetting front height is null at all timesteps")
-            sys.exit(0)
-        
-        # Display wetting front statistics
-        wet_data = wetting_front.dropna()
-        logger.info(f"  Height range: {wet_data.min():.2f}m to {wet_data.max():.2f}m")
-        logger.info(f"  Mean height: {wet_data.mean():.2f}m")
-        
-        # Create detector
-        config = StallDetectionConfig(
-            min_duration_hours=args.min_duration,
-            height_tolerance_m=args.tolerance
-        )
-        detector = StallDetector(config)
-        
-        # Detect stalls
-        logger.info(f"\nDetecting stalls (min duration: {args.min_duration}h, tolerance: ±{args.tolerance}m)...")
-        station_name = args.pro_file.stem
-        events = detector.find_stalls(wetting_front, station_name, args.pro_file)
-        
-        # Display results
-        print("\n" + "="*80)
-        print(f"STALL DETECTION RESULTS: {args.pro_file.name}")
-        print("="*80)
-        
-        if not events:
-            print("\n❌ No stall events detected")
-            print("\nPossible reasons:")
-            print("  - Wetting front moved continuously (no impedance)")
-            print("  - Stalls were shorter than minimum duration")
-            print("  - Height variations exceeded tolerance")
-            print("\nTry adjusting parameters:")
-            print(f"  python {Path(__file__).name} {args.pro_file} --min-duration 6 --tolerance 0.10")
-        else:
-            print(f"\n✓ Found {len(events)} stall event(s):\n")
-            
-            for i, event in enumerate(events, 1):
-                print(f"{'─'*80}")
-                print(f"Event {i}: {event.event_id}")
-                print(f"{'─'*80}")
-                print(f"  Station:      {event.station_name}")
-                print(f"  Height:       {event.stall_height:.2f} m")
-                print(f"  Duration:     {event.duration_hours:.1f} hours")
-                print(f"  Start:        {event.start_time}")
-                print(f"  End:          {event.end_time}")
-                print(f"  Confidence:   {event.confidence:.2f}")
-                print(f"  Height std:   {event.height_std:.3f} m")
-                print(f"  Data points:  {event.n_data_points}")
-                print(f"  Ongoing:      {'Yes' if event.is_ongoing else 'No'}")
-                print()
-            
-            # Summary statistics
-            durations = [e.duration_hours for e in events]
-            heights = [e.stall_height for e in events]
-            confidences = [e.confidence for e in events]
-            
-            print(f"{'═'*80}")
-            print("SUMMARY STATISTICS")
-            print(f"{'═'*80}")
-            print(f"  Total stalls:        {len(events)}")
-            print(f"  Duration (hours):")
-            print(f"    Mean:              {np.mean(durations):.1f}")
-            print(f"    Median:            {np.median(durations):.1f}")
-            print(f"    Range:             {min(durations):.1f} - {max(durations):.1f}")
-            print(f"  Height (m):")
-            print(f"    Mean:              {np.mean(heights):.2f}")
-            print(f"    Range:             {min(heights):.2f} - {max(heights):.2f}")
-            print(f"  Confidence:")
-            print(f"    Mean:              {np.mean(confidences):.2f}")
-            print(f"    Range:             {min(confidences):.2f} - {max(confidences):.2f}")
-            print(f"{'═'*80}\n")
-            
-            # Export option
-            print("💾 To export results:")
-            print(f"   python -c \"from stall_detector import *; import pandas as pd; \"\\")
-            print(f"             \"events = detect_stalls('{args.pro_file}'); \"\\")
-            print(f"             \"pd.DataFrame([e.to_dict() for e in events]).to_csv('stalls.csv', index=False)\"")
-        
-        print()
-        
-    except FileNotFoundError as e:
-        logger.error(f"File error: {e}")
-        sys.exit(1)
-    except Exception as e:
-        logger.error(f"Error processing file: {e}", exc_info=True)
-        sys.exit(1)
+    print("StallDetector - Layer ID-based tracking")
+    print("=" * 80)
+    print("This module detects wetting front stalls and tracks them by layer ID.")
+    print("Use detect_stalls(pro_file) for quick detection.")
+    print("=" * 80)

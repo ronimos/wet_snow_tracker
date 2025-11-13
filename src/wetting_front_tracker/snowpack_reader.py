@@ -308,7 +308,7 @@ class SnowpackProfile:
         data_vars = {
             param: (
                 ("timestamp", "layer_index"),
-                xp.full((len(profiles), max_layers), xp.nan, dtype=xp.float32)
+                xp.full((len(profiles), max_layers), xp.nan, dtype=xp.float64)
             )
             for param in all_params
         }
@@ -322,7 +322,7 @@ class SnowpackProfile:
                     if values is not None and len(values) > 0:
                         arr[i, :num_layers] = xp.array(
                             values[:num_layers],
-                            dtype=xp.float32
+                            dtype=xp.float64
                         )
 
         # Create coordinates (use numpy for compatibility)
