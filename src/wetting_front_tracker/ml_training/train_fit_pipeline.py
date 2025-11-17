@@ -1,5 +1,5 @@
 """
-example_workflow.py
+train_fit_pipeline.py
 ====================
 
 Complete end-to-end example of the ML training workflow.
@@ -12,6 +12,7 @@ Created: November 2025
 import pandas as pd
 import numpy as np
 from pathlib import Path
+import logging
 
 # Import our ML module
 from wetting_front_tracker.ml_training.model_trainer import (
@@ -26,6 +27,8 @@ from wetting_front_tracker.ml_training.model_trainer import (
 
 def main():
     """Complete ML workflow example."""
+    # Configure logging to show INFO messages
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     
     print("=" * 80)
     print("WETTING FRONT STALL PREDICTION - COMPLETE WORKFLOW")
@@ -51,15 +54,33 @@ def main():
     metadata_cols = [
         'event_id', 'pro_file', 'start_time', 'end_time',
         'stall_layer_id', 'layer_above_id', 'layer_below_id',
-        'feature_extraction_time', 'lookback_hours'
+        'feature_extraction_time', 'lookback_hours', 'station_name',
+        'duration_hours', 'confidence', 'n_data_points', 'is_ongoing',
+        'lookback_method', 'above_lwc_at_extraction', 'below_lwc_at_extraction',
     ]
+    
+    irelevant_cols = [
+        'above_absorbed_shortwave', 'above_age', 'above_coordination_number', 
+        'above_critical_cut_length', 'above_element_ID', 'above_inverse_texture_index', 
+        'above_soil_volume_fraction', 'above_ssi', 'above_stability_sdef', 
+        'above_stability_sk38', 'above_stability_sn38', 'above_thermal_conductivity', 
+        'below_absorbed_shortwave', 'below_age', 'below_coordination_number', 
+        'below_critical_cut_length', 'below_element_ID', 'below_inverse_texture_index', 
+        'below_soil_volume_fraction', 'below_ssi', 'below_stability_sdef', 
+        'below_stability_sk38', 'below_stability_sn38', 'below_thermal_conductivity', 
+        'distance_from_stall_m', 'example_type', 'interface_coordination_number_diff', 
+        'interface_ssi_diff', 'interface_ssi_ratio', 'interface_stability_sdef_diff', 
+        'interface_stability_sdef_ratio', 'interface_stability_sk38_diff', 
+        'interface_stability_sk38_ratio', 'interface_stability_sn38_diff', 
+        'interface_stability_sn38_ratio', 'requested_lookback_hours'
+        ]
     
     # Target column
     target_col = 'target'  # Or 'stalled', depending on your data
     
     # Extract features
     feature_cols = [c for c in df.columns 
-                   if c not in metadata_cols and c != target_col]
+                   if c not in metadata_cols and c not in irelevant_cols and c != target_col]
     
     X = df[feature_cols].copy()
     y = df[target_col].copy()
@@ -71,24 +92,26 @@ def main():
     # =========================================================================
     # STEP 3: Statistical Feature Filtering (Optional but Recommended)
     # =========================================================================
-    print("\n[STEP 3] Statistical feature filtering...")
-    
-    selector = FeatureSelector(
-        variance_threshold=0.01,
-        correlation_threshold=0.95
-    )
-    
-    # Remove low variance features
-    X_filtered = selector.remove_low_variance(X, y)
-    print(f"  After variance filter: {X_filtered.shape[1]} features "
-          f"({X.shape[1] - X_filtered.shape[1]} removed)")
-    
-    # Remove highly correlated features
-    X_filtered = selector.remove_correlated(X_filtered, y)
-    print(f"  After correlation filter: {X_filtered.shape[1]} features "
-          f"({X.shape[1] - X_filtered.shape[1]} total removed)")
-    
-    X = X_filtered
+    # print("\n[STEP 3] Statistical feature filtering...")
+    #
+    # selector = FeatureSelector(
+    #     variance_threshold=0.01,
+    #     correlation_threshold=0.95
+    # )
+    #
+    # # Remove low variance features
+    # X_filtered = selector.remove_low_variance(X, y)
+    # print(f"  After variance filter: {X_filtered.shape[1]} features "
+    #       f"({X.shape[1] - X_filtered.shape[1]} removed)")
+    #
+    # # Remove highly correlated features
+    # X_filtered = selector.remove_correlated(X_filtered, y)
+    # print(f"  After correlation filter: {X_filtered.shape[1]} features "
+    #       f"({X.shape[1] - X_filtered.shape[1]} total removed)")
+    #
+    # X = X_filtered
+    print("\n[STEP 3] Skipping manual feature filtering.")
+    print("   ModelTrainer will handle all preprocessing (imputation, filtering, scaling).")
     
     # =========================================================================
     # STEP 4: Configure Training
@@ -122,8 +145,8 @@ def main():
         
         # Preprocessing
         scale_features=True,
-        remove_low_variance=False,  # Already done manually
-        remove_correlated=False     # Already done manually
+        remove_low_variance=True,  # Already done manually
+        remove_correlated=True     # Already done manually
     )
     
     print(f"  Models: {config.models_to_train}")
@@ -233,8 +256,14 @@ def main():
     # =========================================================================
     print("\n[STEP 9] Saving results...")
     
-    output_dir = Path('results') / 'example_workflow'
+    output_dir = Path('results') / 'model'
     output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save the trained model
+    print("  Saving trained model...")
+    model_dir = output_dir / 'trained_model'
+    trainer.save_model(model_dir)
+    print(f"  Saved: {model_dir}")
     
     # Plot model comparison
     plot_model_comparison(

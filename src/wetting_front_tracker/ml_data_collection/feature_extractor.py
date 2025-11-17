@@ -6,12 +6,13 @@ Extracts comprehensive SNOWPACK layer parameters for ML training.
 
 This version:
 - Extracts features from specific layers by ID (not height ranges)
-- Collects data 24 hours BEFORE stalling occurs
-- Extracts ALL available SNOWPACK parameters
+- NEW: Uses dynamic lookback based on LWC threshold (when both layers were dry)
+- Collects all available SNOWPACK parameters
 - Computes interface differences and ratios
 
 Author: Ron Simenhois
 Created: November 2025
+Updated: November 2025 (Dynamic LWC-based lookback)
 """
 
 import logging
@@ -45,10 +46,8 @@ except ImportError:
 
 # Import SnowpackProfile with proper type checking support
 if TYPE_CHECKING:
-    # For type checkers, always import the real type
     from ..snowpack_reader import SnowpackProfile as SnowpackProfileType
 else:
-    # At runtime, try to import and fall back gracefully
     try:
         from ..snowpack_reader import SnowpackProfile as SnowpackProfileType
     except ImportError:
@@ -60,6 +59,7 @@ else:
             logger.warning("Could not import SnowpackProfile - will fail at runtime if used")
             SnowpackProfileType = None  # type: ignore
 
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -68,8 +68,17 @@ else:
 class FeatureExtractionConfig:
     """Configuration for feature extraction."""
     
-    # Lookback time for feature extraction
-    lookback_hours: float = 24.0
+    # NEW: Dynamic lookback based on LWC threshold
+    use_dynamic_lookback: bool = True
+    lwc_threshold_pct: float = 1.0      # LWC threshold in percent (1% = 0.01)
+    max_lookback_hours: float = 72.0    # Don't look back more than 72h
+    min_lookback_hours: float = 1.0     # At least 1 hour of history
+    
+    # Fallback to fixed lookback if dynamic fails
+    fallback_lookback_hours: float = 24.0
+    
+    # DEPRECATED: Use fallback_lookback_hours instead
+    lookback_hours: float = 24.0  # Kept for backwards compatibility
     
     # Which parameter groups to extract
     extract_all_parameters: bool = True
@@ -93,6 +102,7 @@ class LayerFeatureExtractor:
     
     This class handles:
     - Finding layers at specific times
+    - NEW: Dynamic lookback based on LWC threshold
     - Extracting all available SNOWPACK parameters
     - Computing interface properties (differences, ratios, gradients)
     - Handling missing data gracefully
@@ -107,28 +117,181 @@ class LayerFeatureExtractor:
         """
         self.config = config or FeatureExtractionConfig()
     
+    def find_last_dry_timestamp(
+        self,
+        profile: "SnowpackProfileType",
+        stall_time: datetime,
+        layer_above_id: int,
+        layer_below_id: int
+    ) -> Optional[pd.Timestamp]:
+        """
+        Find the last timestamp where both layers had LWC < threshold.
+        
+        This identifies when both layers were still "dry" before wetting began.
+        
+        Args:
+            profile: SnowpackProfile object
+            stall_time: When the stall event started
+            layer_above_id: Layer ID above the interface
+            layer_below_id: Layer ID below the interface
+            
+        Returns:
+            Timestamp when both layers were last dry, or None if not found
+        """
+        lwc_threshold = self.config.lwc_threshold_pct / 100.0  # Convert % to fraction
+        
+        # Get all timestamps before stall time
+        all_times = pd.to_datetime(profile.data.timestamp.values)
+        
+        # Filter to times before stall, within max lookback window
+        min_time = stall_time - timedelta(hours=self.config.max_lookback_hours)
+        valid_times = all_times[(all_times < stall_time) & (all_times >= min_time)]
+        
+        if len(valid_times) == 0:
+            logger.warning(f"No valid timestamps found before {stall_time}")
+            return None
+        
+        # Sort in reverse chronological order (most recent first)
+        valid_times = sorted(valid_times, reverse=True)
+        
+        # Search backwards in time for when both layers were dry
+        for timestamp in valid_times:
+            try:
+                # Get profile at this timestamp
+                profile_at_time = profile.data.sel(timestamp=timestamp, method='nearest')
+                profile_df = profile_at_time.to_dataframe().reset_index()
+                
+                # Find the layers by ID
+                layer_above = profile_df[profile_df['element_ID'] == layer_above_id]
+                layer_below = profile_df[profile_df['element_ID'] == layer_below_id]
+                
+                if layer_above.empty or layer_below.empty:
+                    # Layers not found at this time, skip
+                    continue
+                
+                # Check LWC for both layers
+                lwc_col = self._get_lwc_column(profile_df)
+                if lwc_col is None:
+                    logger.warning("Could not find LWC column in profile")
+                    return None
+                
+                lwc_above = layer_above[lwc_col].iloc[0]
+                lwc_below = layer_below[lwc_col].iloc[0]
+                
+                # Check if both are below threshold
+                if pd.notna(lwc_above) and pd.notna(lwc_below):
+                    if lwc_above < lwc_threshold and lwc_below < lwc_threshold:
+                        # Found it! Both layers are dry
+                        logger.debug(
+                            f"Found dry state at {timestamp}: "
+                            f"above_lwc={lwc_above:.4f}, below_lwc={lwc_below:.4f}"
+                        )
+                        
+                        # Verify minimum lookback
+                        lookback_hours = (stall_time - timestamp).total_seconds() / 3600
+                        if lookback_hours < self.config.min_lookback_hours:
+                            # Too recent, keep searching
+                            continue
+                        
+                        return pd.Timestamp(timestamp)
+                        
+            except Exception as e:
+                logger.debug(f"Error checking timestamp {timestamp}: {e}")
+                continue
+        
+        # No dry state found within the window
+        logger.warning(
+            f"No timestamp found where both layers had LWC < {self.config.lwc_threshold_pct}% "
+            f"within {self.config.max_lookback_hours}h before {stall_time}"
+        )
+        return None
+    
+    def _get_lwc_column(self, df: pd.DataFrame) -> Optional[str]:
+        """
+        Find the LWC column name in the DataFrame.
+        
+        Different SNOWPACK outputs may use different names.
+        """
+        possible_names = [
+            'lwc',
+            'liquid_water_content',
+            'theta_water',
+            'volumetric_liquid_water_content',
+            'LWC'
+        ]
+        
+        for name in possible_names:
+            if name in df.columns:
+                return name
+        
+        # Try to find it from SNOWPACK_PARAMETERS
+        # Code 0506 is typically LWC
+        try:
+            if '0506' in SNOWPACK_PARAMETERS:
+                col_name = SNOWPACK_PARAMETERS['0506'].column_name
+                if col_name in df.columns:
+                    return col_name
+        except Exception:
+            pass
+        
+        return None
+    
     def extract_features_for_interface(
         self,
         profile: "SnowpackProfileType",
-        feature_time: datetime,
-        stall_layer_id: int,  # Kept for compatibility, but unused
+        stall_time: datetime,
+        stall_layer_id: int,
         layer_above_id: int,
-        layer_below_id: int
+        layer_below_id: int,
+        requested_feature_time: Optional[datetime] = None
     ) -> Dict[str, float]:
         """
         Extract all features for a specific interface at a specific time.
         
+        UPDATED: Now uses dynamic lookback based on LWC threshold.
+        
         Args:
             profile: SnowpackProfile object
-            feature_time: When to extract features (e.g., 24h before stall)
+            stall_time: When the stall event started (used to determine lookback)
             stall_layer_id: Unused, kept for compatibility with caller.
             layer_above_id: Layer ID above the interface
             layer_below_id: Layer ID below the interface
+            requested_feature_time: Optional explicit feature time (overrides dynamic)
             
         Returns:
             Dictionary of feature_name: value pairs
         """
         features = {}
+        
+        # Determine feature extraction time
+        if requested_feature_time is not None:
+            # Use explicitly provided time
+            feature_time = requested_feature_time
+            features['lookback_method'] = 'explicit'
+        elif self.config.use_dynamic_lookback:
+            # NEW: Find last dry timestamp
+            feature_time = self.find_last_dry_timestamp(
+                profile, stall_time, layer_above_id, layer_below_id
+            )
+            
+            if feature_time is None:
+                # Fallback to fixed lookback
+                logger.warning(
+                    f"Dynamic lookback failed, using fallback of "
+                    f"{self.config.fallback_lookback_hours}h"
+                )
+                feature_time = stall_time - timedelta(
+                    hours=self.config.fallback_lookback_hours
+                )
+                features['lookback_method'] = 'fallback_fixed'
+            else:
+                features['lookback_method'] = 'dynamic_lwc'
+        else:
+            # Use fixed lookback (old behavior)
+            feature_time = stall_time - timedelta(
+                hours=self.config.fallback_lookback_hours
+            )
+            features['lookback_method'] = 'fixed'
         
         # Get profile at feature extraction time
         profile_df, actual_time = self._get_profile_at_time(
@@ -144,10 +307,12 @@ class LayerFeatureExtractor:
             logger.warning(f"No valid timestamp returned for {feature_time}")
             return features
         
-        # Record actual lookback time
-        # Note: stall_time is not available here, so we record actual time.
-        # The caller (collect_ml_data) will compute the actual lookback.
+        # Record actual extraction time
         features['feature_extraction_time'] = actual_time.isoformat()
+        
+        # Calculate actual lookback hours
+        actual_lookback_hours = (stall_time - actual_time).total_seconds() / 3600
+        features['lookback_hours'] = actual_lookback_hours
         
         # Extract layer above features
         layer_above = self._get_layer_by_id(profile_df, layer_above_id)
@@ -156,6 +321,11 @@ class LayerFeatureExtractor:
                 layer_above, prefix='above'
             )
             features.update(above_features)
+            
+            # NEW: Record LWC at extraction time for verification
+            lwc_col = self._get_lwc_column(profile_df)
+            if lwc_col and lwc_col in layer_above.index:
+                features['above_lwc_at_extraction'] = float(layer_above[lwc_col])
         else:
             logger.warning(f"Layer above (ID={layer_above_id}) not found at {actual_time}")
         
@@ -166,6 +336,11 @@ class LayerFeatureExtractor:
                 layer_below, prefix='below'
             )
             features.update(below_features)
+            
+            # NEW: Record LWC at extraction time for verification
+            lwc_col = self._get_lwc_column(profile_df)
+            if lwc_col and lwc_col in layer_below.index:
+                features['below_lwc_at_extraction'] = float(layer_below[lwc_col])
         else:
             logger.warning(f"Layer below (ID={layer_below_id}) not found at {actual_time}")
         
@@ -176,9 +351,8 @@ class LayerFeatureExtractor:
             )
             features.update(interface_features)
         
-        # Add lookback hours (relative to feature_time, not stall_time)
-        # The caller computes the *actual* lookback from stall time
-        features['requested_lookback_hours'] = self.config.lookback_hours
+        # Add requested lookback hours (for reference)
+        features['requested_lookback_hours'] = self.config.fallback_lookback_hours
         
         return features
     
@@ -519,9 +693,9 @@ def print_feature_summary(features_df: pd.DataFrame):
     print("=" * 80)
     
     print(f"\nTotal examples: {len(features_df)}")
-    if 'stalled' in features_df.columns:
-        pos_count = (features_df['stalled'] == 1).sum()
-        neg_count = (features_df['stalled'] == 0).sum()
+    if 'target' in features_df.columns:
+        pos_count = (features_df['target'] == 1).sum()
+        neg_count = (features_df['target'] == 0).sum()
         print(f"  Positive examples (stall=1): {pos_count}")
         print(f"  Negative examples (stall=0): {neg_count}")
     
@@ -551,6 +725,14 @@ def print_feature_summary(features_df: pd.DataFrame):
         print(f"  Min:     {metrics['min_lookback_hours']:.1f} hours")
         print(f"  Max:     {metrics['max_lookback_hours']:.1f} hours")
     
+    # NEW: Show lookback method breakdown if available
+    if 'lookback_method' in features_df.columns:
+        print(f"\nLookback methods:")
+        method_counts = features_df['lookback_method'].value_counts()
+        for method, count in method_counts.items():
+            pct = count / len(features_df) * 100
+            print(f"  {method}: {count} ({pct:.1f}%)")
+    
     print("=" * 80)
 
 
@@ -566,5 +748,5 @@ if __name__ == "__main__":
     print("LayerFeatureExtractor - Layer ID-based feature extraction")
     print("=" * 80)
     print("Extracts all SNOWPACK parameters from specific layers")
-    print("24 hours before wetting front stalling occurs.")
+    print("using dynamic LWC-based lookback (when both layers were dry).")
     print("=" * 80)

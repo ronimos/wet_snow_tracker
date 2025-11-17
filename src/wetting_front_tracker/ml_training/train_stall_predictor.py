@@ -104,6 +104,12 @@ def save_results(
     """Save all results and plots."""
     output_dir.mkdir(parents=True, exist_ok=True)
     
+    # Save the trained model
+    logger.info("Saving trained model...")
+    model_dir = output_dir / 'trained_model'
+    trainer.save_model(model_dir)
+    logger.info(f"Model saved to {model_dir}")
+    
     # Save model comparison
     logger.info("Saving model comparison plot...")
     plot_model_comparison(
@@ -345,6 +351,12 @@ def main():
     
     logger.info(f"\nAll results saved to: {args.output}")
     logger.info("\nFiles created:")
+    logger.info("  - trained_model/          (Saved model for predictions)")
+    logger.info("      - model.joblib         (Trained model)")
+    logger.info("      - scaler.joblib        (Feature scaler)")
+    logger.info("      - feature_names.json   (Required feature list)")
+    logger.info("      - model_config.json    (Training configuration)")
+    logger.info("      - metadata.json        (Model metadata)")
     logger.info("  - model_comparison.png")
     logger.info("  - feature_importance.png")
     logger.info("  - feature_importance_rankings.csv")
@@ -354,6 +366,12 @@ def main():
     if not args.no_shap:
         logger.info("  - shap_summary.png")
         logger.info("  - shap_waterfall_example.png")
+    
+    logger.info("\n" + "=" * 80)
+    logger.info("MAKING PREDICTIONS WITH SAVED MODEL")
+    logger.info("=" * 80)
+    logger.info("\nTo use the trained model on new data, run:")
+    logger.info(f"  python predict_stall.py --model {args.output}/trained_model --data your_new_data.csv --output predictions.csv")
     
     logger.info("\n" + "=" * 80)
     logger.info("DONE!")

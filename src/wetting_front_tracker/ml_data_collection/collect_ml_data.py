@@ -1,20 +1,18 @@
 """
-collect_ml_data.py
-=====================
+collect_ml_data.py (COMPLETE UPDATED VERSION)
+===============================================
 
 Main script for collecting ML training data from wetting front stalls.
 
-This version:
-- Uses layer ID-based stall tracking
-- Extracts features 24 hours before stalling
-- Collects all available SNOWPACK parameters
-- Generates a balanced training dataset with positive and negative examples
+UPDATED: Now uses dynamic lookback based on LWC threshold instead of fixed 24h.
+Features are extracted from the last timestamp where both layers had LWC < 1%.
 
 Usage:
     python collect_ml_data.py --input data/input --output data/ml_training
 
 Author: Ron Simenhois
 Created: November 2025
+Updated: November 2025 (Dynamic LWC-based lookback)
 """
 import sys
 import argparse
@@ -28,8 +26,6 @@ import numpy as np
 from tqdm import tqdm
 
 # Handle imports
-# Use absolute imports based on your package structure
-# This assumes your 'src' directory is in the Python path
 try:
     from wetting_front_tracker.ml_data_collection.stall_detector import (
         StallDetector,
@@ -42,8 +38,6 @@ try:
         print_feature_summary
     )
 except ImportError:
-    # Add a single fallback for running the script directly
-    # This adds the 'src' directory to the path
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
     from wetting_front_tracker.ml_data_collection.stall_detector import (
         StallDetector,
@@ -56,12 +50,10 @@ except ImportError:
         print_feature_summary
     )
     
-# Try to import from main project
 try:
     from wetting_front_tracker.snowpack_reader import SnowpackProfile
     from wetting_front_tracker.wet_front_tracker import wet_front_lwc
 except ImportError:
-    # This block will be hit if the path wasn't added above
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
     from wetting_front_tracker.snowpack_reader import SnowpackProfile
     from wetting_front_tracker.wet_front_tracker import wet_front_lwc
@@ -93,34 +85,31 @@ class MLDataCollectionConfig:
             min_lwc_threshold=0.04,
             min_wetting_front_height=0.05,
             min_snow_height=0.25,
-            feature_lookback_hours=24.0
+            feature_lookback_hours=24.0  # Now used as fallback
         )
         
-        # Feature extraction parameters
+        # UPDATED: Feature extraction with dynamic lookback
         self.feature_config = FeatureExtractionConfig(
-            lookback_hours=24.0,
+            # NEW: Dynamic lookback settings
+            use_dynamic_lookback=True,          # Enable dynamic lookback
+            lwc_threshold_pct=1.0,              # Both layers must have LWC < 1%
+            max_lookback_hours=72.0,            # Don't look back more than 72h
+            min_lookback_hours=1.0,             # At least 1h before stall
+            fallback_lookback_hours=24.0,       # Fallback if dynamic fails
+            
+            # Unchanged
             extract_all_parameters=True,
+            max_time_tolerance_hours=2.0,
             compute_differences=True,
             compute_ratios=True,
             compute_gradients=True
         )
         
-        # --- NEW: Balanced dataset configuration ---
-        # 'combined': Use nearby and random negatives
-        # 'nearby': Use only nearby negatives
-        # 'random': Use only random negatives
-        # 'none': Only collect positive examples
+        # Balanced dataset configuration
         self.negative_sampling_strategy: str = 'combined'
-        
-        # Target number of negative examples per positive example
-        self.negatives_per_positive: int = 2  # 1:2 ratio
-        
-        # Distance (meters) to define a "nearby" interface for negative sampling
-        self.nearby_distance_m: float = 0.05  # 5 cm
-        
-        # Min distance (meters) to define a "random" interface (avoids stall region)
-        self.random_negative_distance_m: float = 0.10  # 10 cm
-        # --- End of new config ---
+        self.negatives_per_positive: int = 2
+        self.nearby_distance_m: float = 0.05
+        self.random_negative_distance_m: float = 0.10
         
         # Analysis parameters
         self.start_date: Optional[str] = None
@@ -131,7 +120,7 @@ class MLDataCollectionConfig:
         self.save_intermediate = True
         
         # Processing limits
-        self.max_files: Optional[int] = None  # None = process all
+        self.max_files: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -144,24 +133,14 @@ def get_summary_from_pro_file(
 ) -> pd.DataFrame:
     """
     Get summary DataFrame from a .pro file.
-    
-    Args:
-        pro_file: Path to .pro file
-        config: Configuration
-        
-    Returns:
-        Summary DataFrame with wet_front_lwc_height column
     """
     try:
-        # Load profile
         profile = SnowpackProfile(str(pro_file))
         
-        # Calculate summary
         parameters_to_calculate = {
             "wet_front_lwc": wet_front_lwc
         }
         
-        # Build kwargs conditionally
         summary_kwargs: dict[str, Any] = {
             'parameters_to_calculate': parameters_to_calculate
         }
@@ -172,7 +151,6 @@ def get_summary_from_pro_file(
         
         summary = profile.get_full_timeseries_summary(**summary_kwargs)
         
-        # Unpack tuple columns if needed
         if 'wet_front_lwc' in summary.columns:
             summary[['wet_front_lwc_value', 'wet_front_lwc_height']] = pd.DataFrame(
                 summary['wet_front_lwc'].tolist(), 
@@ -189,13 +167,6 @@ def get_summary_from_pro_file(
 def get_all_interfaces(profile_df: pd.DataFrame) -> List[Dict[str, Any]]:
     """
     Get all layer interfaces from a profile DataFrame.
-    
-    Args:
-        profile_df: DataFrame of a profile at a single timestamp
-        
-    Returns:
-        List of interface dicts, e.g.,
-        [{'above_id': id_A, 'below_id': id_B, 'interface_height': h}, ...]
     """
     if 'height' not in profile_df.columns or 'element_ID' not in profile_df.columns:
         logger.warning("Profile missing height or element_ID, cannot get interfaces")
@@ -204,7 +175,6 @@ def get_all_interfaces(profile_df: pd.DataFrame) -> List[Dict[str, Any]]:
     if profile_df.empty:
         return []
         
-    # Ensure profile is sorted by height
     profile_df = profile_df.sort_values(by='height').reset_index()
     
     interfaces = []
@@ -218,7 +188,6 @@ def get_all_interfaces(profile_df: pd.DataFrame) -> List[Dict[str, Any]]:
                 'interface_height': (layer_above['height'] + layer_below['height']) / 2.0
             })
         except Exception as e:
-            # logger.warning(f"Error getting interface between layers {i} and {i+1}: {e}")
             continue        
     return interfaces
 
@@ -235,6 +204,8 @@ def collect_ml_data(
     """
     Main pipeline for collecting ML training data with layer ID tracking.
     
+    UPDATED: Now uses dynamic lookback based on LWC threshold.
+    
     Args:
         input_dir: Directory containing .pro files
         output_dir: Directory to save results
@@ -245,7 +216,7 @@ def collect_ml_data(
     """
     logger.info("=" * 80)
     logger.info("ML Data Collection Pipeline")
-    logger.info("Layer ID-Based Tracking with Balanced Negative Sampling")
+    logger.info("Layer ID-Based Tracking with Dynamic LWC Lookback")
     logger.info("=" * 80)
     
     # Create output directory
@@ -279,24 +250,19 @@ def collect_ml_data(
     
     for pro_file in tqdm(pro_files, desc="Detecting stalls"):
         try:
-            # Load profile
             profile = SnowpackProfile(str(pro_file))
-            
-            # Get summary data
             summary_df = get_summary_from_pro_file(pro_file, config)
             
             if summary_df is None or summary_df.empty:
                 logger.debug(f"No summary for {pro_file.name}")
                 continue
             
-            # Extract wetting front time series
             wetting_front = extract_wetting_front_timeseries(summary_df)
             
             if wetting_front.empty or wetting_front.notna().sum() == 0:
                 logger.debug(f"No wetting front for {pro_file.name}")
                 continue
             
-            # Detect stalls with layer IDs
             station_name = pro_file.stem
             events = stall_detector.find_stalls(
                 profile,
@@ -336,12 +302,16 @@ def collect_ml_data(
     
     # Phase 2: Extract features (Positive and Negative Examples)
     logger.info("\n" + "=" * 80)
-    logger.info("PHASE 2: Extracting Features (Balanced Dataset)")
+    logger.info("PHASE 2: Extracting Features (Dynamic LWC-Based Lookback)")
     logger.info(f"Strategy: {config.negative_sampling_strategy}, Ratio (Pos:Neg): 1:{config.negatives_per_positive}")
+    logger.info(f"Lookback: Dynamic (LWC < {config.feature_config.lwc_threshold_pct}%), "
+                f"max={config.feature_config.max_lookback_hours}h, "
+                f"fallback={config.feature_config.fallback_lookback_hours}h")
     logger.info("=" * 80)
     
     all_features = []
     failed_extractions = 0
+    lookback_stats = {'dynamic_lwc': 0, 'fallback_fixed': 0, 'fixed': 0, 'explicit': 0}
     
     for event in tqdm(stall_events_df.to_dict('records'),
                      desc="Extracting features"):
@@ -349,10 +319,6 @@ def collect_ml_data(
             # Load profile
             profile = SnowpackProfile(str(event['pro_file']))
             
-            # Define feature time (e.g., 24h before stall)
-            feature_time = event['start_time'] - timedelta(
-                hours=config.feature_config.lookback_hours
-            )
             stall_interface_ids = {
                 'above_id': event['layer_above_id'], 
                 'below_id': event['layer_below_id']
@@ -360,9 +326,10 @@ def collect_ml_data(
             stall_height = event['stall_height']
 
             # --- 1. Extract Positive Example ---
+            # NEW: Pass stall_time directly - extractor finds optimal lookback
             positive_features = feature_extractor.extract_features_for_interface(
                 profile,
-                feature_time,
+                event['start_time'],  # Stall start time
                 event['stall_layer_id'],
                 event['layer_above_id'],
                 event['layer_below_id']
@@ -373,23 +340,39 @@ def collect_ml_data(
                 failed_extractions += 1
                 continue
             
-            # Get actual time for negative sampling
+            # Get actual feature extraction time
             actual_feature_time_str = positive_features.get('feature_extraction_time')
             if actual_feature_time_str is None:
-                logger.warning(f"No valid feature time for {event['event_id']}, skipping negatives")
+                logger.warning(f"No valid feature time for {event['event_id']}, skipping")
+                failed_extractions += 1
                 continue
             
             actual_feature_time = pd.to_datetime(actual_feature_time_str)
-            actual_lookback = (event['start_time'] - actual_feature_time).total_seconds() / 3600
+            
+            # Get lookback info (now computed by extractor)
+            actual_lookback = positive_features.get(
+                'lookback_hours', 
+                (event['start_time'] - actual_feature_time).total_seconds() / 3600
+            )
+            lookback_method = positive_features.get('lookback_method', 'unknown')
+            
+            # Track lookback method statistics
+            if lookback_method in lookback_stats:
+                lookback_stats[lookback_method] += 1
+            
+            logger.debug(
+                f"Event {event['event_id']}: lookback={actual_lookback:.1f}h, "
+                f"method={lookback_method}"
+            )
             
             # Add positive example
             event_with_features = {
                 **event, 
                 **positive_features,
-                'stalled': 1,
+                'target': 1,
                 'example_type': 'positive_stall',
                 'distance_from_stall_m': 0.0,
-                'lookback_hours': actual_lookback # Override with actual
+                'lookback_hours': actual_lookback
             }
             all_features.append(event_with_features)
 
@@ -397,7 +380,7 @@ def collect_ml_data(
             if config.negative_sampling_strategy == 'none':
                 continue
 
-            # Get profile at the exact feature time
+            # Get profile at the actual feature extraction time
             try:
                 profile_at_time = profile.data.sel(
                     timestamp=actual_feature_time, method='nearest'
@@ -430,7 +413,6 @@ def collect_ml_data(
             
             # Select samples based on strategy
             if config.negative_sampling_strategy == 'combined':
-                # Prioritize nearby, then fill with random
                 samples_to_add = min(len(nearby_interfaces), config.negatives_per_positive)
                 negative_samples.extend(nearby_interfaces[:samples_to_add])
                 
@@ -449,12 +431,14 @@ def collect_ml_data(
 
             # Extract features for selected negative samples
             for neg_interface in negative_samples:
+                # Use the SAME feature extraction time as positive example
                 neg_features = feature_extractor.extract_features_for_interface(
                     profile,
-                    feature_time, # Use same requested time
-                    0, # Dummy stall_layer_id
+                    event['start_time'],  # Reference stall time
+                    0,  # Dummy stall_layer_id
                     neg_interface['above_id'],
-                    neg_interface['below_id']
+                    neg_interface['below_id'],
+                    requested_feature_time=actual_feature_time  # Use same time as positive
                 )
                 
                 if not neg_features:
@@ -464,14 +448,13 @@ def collect_ml_data(
                 neg_event = {
                     **event, 
                     **neg_features,
-                    'stalled': 0,
+                    'target': 0,
                     'distance_from_stall_m': neg_interface['interface_height'] - stall_height,
-                    'lookback_hours': actual_lookback, # Use same actual lookback
-                    # Overwrite key fields to reflect this interface
+                    'lookback_hours': actual_lookback,
                     'layer_above_id': neg_interface['above_id'],
                     'layer_below_id': neg_interface['below_id'],
-                    'stall_height': neg_interface['interface_height'], # Use interface height
-                    'stall_layer_id': 0, # N/A
+                    'stall_height': neg_interface['interface_height'],
+                    'stall_layer_id': 0,
                 }
                 
                 # Assign type
@@ -497,15 +480,34 @@ def collect_ml_data(
     logger.info(f"\nFeature Extraction Results:")
     logger.info(f"  Positive stall events: {len(stall_events_df)}")
     logger.info(f"  Total examples:        {len(features_df)}")
-    if 'stalled' in features_df.columns:
-        pos_count = (features_df['stalled'] == 1).sum()
-        neg_count = (features_df['stalled'] == 0).sum()
-        logger.info(f"    Positive (stalled=1):  {pos_count}")
-        logger.info(f"    Negative (stalled=0):  {neg_count}")
+    logger.info(f"  Failed extractions:    {failed_extractions}")
+    
+    if 'target' in features_df.columns:
+        pos_count = (features_df['target'] == 1).sum()
+        neg_count = (features_df['target'] == 0).sum()
+        logger.info(f"    Positive (target=1):  {pos_count}")
+        logger.info(f"    Negative (target=0):  {neg_count}")
         if pos_count > 0:
             ratio = neg_count / pos_count
             logger.info(f"    Actual P:N ratio:      1 : {ratio:.1f}")
-            
+    
+    # NEW: Show lookback method statistics
+    logger.info(f"\n  Lookback Method Statistics (positives only):")
+    total_pos = sum(lookback_stats.values())
+    for method, count in lookback_stats.items():
+        if count > 0:
+            pct = count / total_pos * 100 if total_pos > 0 else 0
+            logger.info(f"    {method}: {count} ({pct:.1f}%)")
+    
+    # NEW: Show lookback time distribution
+    if 'lookback_hours' in features_df.columns:
+        pos_lookbacks = features_df[features_df['target'] == 1]['lookback_hours']
+        logger.info(f"\n  Lookback Time Distribution (positives):")
+        logger.info(f"    Mean:   {pos_lookbacks.mean():.1f}h")
+        logger.info(f"    Median: {pos_lookbacks.median():.1f}h")
+        logger.info(f"    Std:    {pos_lookbacks.std():.1f}h")
+        logger.info(f"    Min:    {pos_lookbacks.min():.1f}h")
+        logger.info(f"    Max:    {pos_lookbacks.max():.1f}h")
     
     # Print feature summary
     print_feature_summary(features_df)
@@ -528,11 +530,6 @@ def generate_summary_report(
 ) -> None:
     """
     Generate summary statistics and save to file.
-    
-    Args:
-        stall_events_df: Stall events DataFrame
-        features_df: Features DataFrame
-        output_dir: Output directory
     """
     logger.info("\n" + "=" * 80)
     logger.info("SUMMARY REPORT")
@@ -540,7 +537,7 @@ def generate_summary_report(
     
     report = []
     report.append("ML Training Data Collection Summary")
-    report.append("Layer ID-Based Tracking with Balanced Negative Sampling")
+    report.append("Layer ID-Based Tracking with Dynamic LWC Lookback")
     report.append("=" * 80)
     report.append(f"Collection Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     report.append("")
@@ -564,17 +561,18 @@ def generate_summary_report(
     if not features_df.empty:
         report.append("FULL DATASET (Positive + Negative):")
         report.append(f"  Total examples: {len(features_df)}")
-        pos_count = (features_df['stalled'] == 1).sum()
-        neg_count = (features_df['stalled'] == 0).sum()
-        report.append(f"    Positive (stalled=1):  {pos_count}")
-        report.append(f"    Negative (stalled=0):  {neg_count}")
+        pos_count = (features_df['target'] == 1).sum()
+        neg_count = (features_df['target'] == 0).sum()
+        report.append(f"    Positive (target=1):  {pos_count}")
+        report.append(f"    Negative (target=0):  {neg_count}")
         if pos_count > 0:
             ratio = neg_count / pos_count
             report.append(f"    Actual P:N ratio:      1 : {ratio:.1f}")
         
         if 'example_type' in features_df.columns:
             report.append(f"  Example type breakdown:")
-            report.append(f"    {features_df['example_type'].value_counts().to_string()}")
+            for etype, count in features_df['example_type'].value_counts().items():
+                report.append(f"    {etype}: {count}")
             
         report.append(f"  Extraction success rate (pos): {pos_count / len(stall_events_df) * 100:.1f}%")
         
@@ -591,12 +589,34 @@ def generate_summary_report(
         report.append(f"    Interface: {len(interface_cols)}")
         report.append(f"    Total: {len(feature_cols)}")
         
-        # Lookback times
+        # NEW: Lookback time statistics
         if 'lookback_hours' in features_df.columns:
             report.append(f"  Lookback times (hours):")
             report.append(f"    Mean: {features_df['lookback_hours'].mean():.1f}")
+            report.append(f"    Median: {features_df['lookback_hours'].median():.1f}")
+            report.append(f"    Std: {features_df['lookback_hours'].std():.1f}")
             report.append(f"    Min: {features_df['lookback_hours'].min():.1f}")
             report.append(f"    Max: {features_df['lookback_hours'].max():.1f}")
+        
+        # NEW: Lookback method breakdown
+        if 'lookback_method' in features_df.columns:
+            report.append(f"  Lookback method breakdown:")
+            method_counts = features_df['lookback_method'].value_counts()
+            for method, count in method_counts.items():
+                pct = count / len(features_df) * 100
+                report.append(f"    {method}: {count} ({pct:.1f}%)")
+        
+        # NEW: LWC at extraction time verification
+        if 'above_lwc_at_extraction' in features_df.columns:
+            above_lwc = features_df['above_lwc_at_extraction']
+            below_lwc = features_df['below_lwc_at_extraction']
+            report.append(f"  LWC at extraction time:")
+            report.append(f"    Above layer: mean={above_lwc.mean():.4f}, max={above_lwc.max():.4f}")
+            report.append(f"    Below layer: mean={below_lwc.mean():.4f}, max={below_lwc.max():.4f}")
+            
+            # Check how many actually met the threshold
+            both_dry = ((above_lwc < 0.01) & (below_lwc < 0.01)).sum()
+            report.append(f"    Both layers < 1%: {both_dry}/{len(features_df)} ({both_dry/len(features_df)*100:.1f}%)")
         
         # Missing data
         missing_pct = features_df[feature_cols].isnull().sum() / len(features_df) * 100
@@ -628,7 +648,7 @@ def generate_summary_report(
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description='Collect ML training data from wetting front stalls (Layer ID-based)'
+        description='Collect ML training data from wetting front stalls (Dynamic LWC Lookback)'
     )
     
     parser.add_argument(
@@ -656,7 +676,35 @@ def parse_args():
         '--lookback-hours',
         type=float,
         default=24.0,
-        help='Hours to look back for feature extraction (default: 24.0)'
+        help='Fallback lookback hours if dynamic fails (default: 24.0)'
+    )
+    
+    # NEW: Dynamic lookback arguments
+    parser.add_argument(
+        '--lwc-threshold',
+        type=float,
+        default=1.0,
+        help='LWC threshold (percent) for dynamic lookback (default: 1.0%%)'
+    )
+    
+    parser.add_argument(
+        '--max-lookback',
+        type=float,
+        default=72.0,
+        help='Maximum lookback hours for dynamic search (default: 72.0)'
+    )
+    
+    parser.add_argument(
+        '--min-lookback',
+        type=float,
+        default=1.0,
+        help='Minimum lookback hours (default: 1.0)'
+    )
+    
+    parser.add_argument(
+        '--disable-dynamic-lookback',
+        action='store_true',
+        help='Disable dynamic lookback, use fixed lookback instead'
     )
     
     parser.add_argument(
@@ -682,7 +730,6 @@ def parse_args():
         '--max-files',
         type=int,
         help='Maximum number of files to process (default: all)',
-        # default=10
     )
     
     return parser.parse_args()
@@ -697,7 +744,14 @@ def main():
     config.stall_config.min_duration_hours = args.min_duration
     config.stall_config.height_tolerance_m = args.height_tolerance
     config.stall_config.feature_lookback_hours = args.lookback_hours
-    config.feature_config.lookback_hours = args.lookback_hours
+    
+    # NEW: Configure dynamic lookback
+    config.feature_config.use_dynamic_lookback = not args.disable_dynamic_lookback
+    config.feature_config.lwc_threshold_pct = args.lwc_threshold
+    config.feature_config.max_lookback_hours = args.max_lookback
+    config.feature_config.min_lookback_hours = args.min_lookback
+    config.feature_config.fallback_lookback_hours = args.lookback_hours
+    
     config.start_date = args.start_date
     config.end_date = args.end_date
     config.output_dir = args.output
@@ -707,7 +761,16 @@ def main():
     logger.info(f"  Input directory: {args.input}")
     logger.info(f"  Output directory: {args.output}")
     logger.info(f"  Min stall duration: {args.min_duration}h")
-    logger.info(f"  Feature lookback: {args.lookback_hours}h")
+    
+    # NEW: Show dynamic lookback configuration
+    if config.feature_config.use_dynamic_lookback:
+        logger.info(f"  Feature lookback: DYNAMIC (LWC < {config.feature_config.lwc_threshold_pct}%)")
+        logger.info(f"    Max lookback: {config.feature_config.max_lookback_hours}h")
+        logger.info(f"    Min lookback: {config.feature_config.min_lookback_hours}h")
+        logger.info(f"    Fallback: {config.feature_config.fallback_lookback_hours}h")
+    else:
+        logger.info(f"  Feature lookback: FIXED ({config.feature_config.fallback_lookback_hours}h)")
+    
     logger.info(f"  Height tolerance: {args.height_tolerance}m")
     logger.info(f"  Negative sampling: {config.negative_sampling_strategy}")
     logger.info(f"  P:N ratio (target): 1:{config.negatives_per_positive}")

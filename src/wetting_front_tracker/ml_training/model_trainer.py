@@ -16,7 +16,9 @@ Created: November 2025
 """
 
 import logging
-from dataclasses import dataclass, field
+import json
+import joblib
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any, Union
 
@@ -161,7 +163,7 @@ def get_model_configs() -> Dict[str, Dict[str, Any]]:
         'lightgbm': {
             'model': lgb.LGBMClassifier(
                 random_state=42,
-                n_jobs=-1,
+                n_jobs=1, # Let RandomizedSearchCV can handle the parallelization
                 verbose=-1
             ),
             'param_grid': {
@@ -339,6 +341,13 @@ class ModelTrainer:
         self.feature_names_ = None
         self.best_model_name_ = None
         self.best_model_ = None
+        self.X_train: pd.DataFrame = pd.DataFrame()
+        self.y_train: pd.Series = pd.Series(dtype=float)
+        self.X_val: pd.DataFrame = pd.DataFrame()
+        self.y_val: pd.Series = pd.Series(dtype=float)
+        self.X_test: pd.DataFrame = pd.DataFrame()
+        self.y_test: pd.Series = pd.Series(dtype=float)
+
     
     def prepare_data(
         self,
@@ -362,7 +371,23 @@ class ModelTrainer:
         # Handle missing values
         if X.isnull().any().any():
             logger.warning("Missing values detected - imputing with median")
-            X = X.fillna(X.median())
+            
+            # Calculate medians
+            medians = X.median()
+            
+            # Find columns that are all NaN (median is NaN)
+            all_nan_cols = medians[medians.isnull()].index.tolist()
+            if all_nan_cols:
+                logger.warning(f"Columns with all NaN values detected: {all_nan_cols}. Imputing with 0.")
+                # For all-NaN columns, fill median with 0
+                medians = medians.fillna(0)
+                
+            X = X.fillna(medians)
+
+            # Re-check for any remaining NaNs (should not happen, but good practice)
+            if X.isnull().any().any():
+                logger.error("NaN values still present after imputation. Imputing remaining with 0.")
+                X = X.fillna(0)
         
         # Feature selection
         if feature_selection:
@@ -382,6 +407,19 @@ class ModelTrainer:
         # Scale features
         if self.config.scale_features:
             self.scaler_ = StandardScaler()
+            
+            # Check for constant columns (variance=0) *after* imputation and selection
+            # These columns will cause StandardScaler to fail
+            constant_cols = X.columns[X.var() == 0].tolist()
+            if constant_cols:
+                logger.warning(f"Removing {len(constant_cols)} constant columns before scaling: {constant_cols}")
+                X = X.drop(columns=constant_cols)
+
+            if X.shape[1] == 0:
+                logger.error("No features left after preprocessing. Aborting.")
+                # Return empty dataframes to avoid crashing
+                return pd.DataFrame(), pd.Series(dtype=y.dtype)
+            
             X_scaled = self.scaler_.fit_transform(X)
             X = pd.DataFrame(X_scaled, columns=X.columns, index=X.index)
             logger.info("Features scaled")
@@ -613,6 +651,11 @@ class ModelTrainer:
         # Train all models
         self.results_ = self.train_all_models(X_train, y_train, X_val, y_val)
         
+        # Store split data as class attributes
+        self.X_train, self.y_train = X_train, y_train
+        self.X_val, self.y_val = X_val, y_val
+        self.X_test, self.y_test = X_test, y_test
+        
         # Select best model
         self.best_model_name_, self.best_model_ = self.select_best_model(
             self.results_
@@ -626,36 +669,179 @@ class ModelTrainer:
         
         return self
     
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
-        """Predict using the best model."""
-        if self.best_model_ is None:
-            raise ValueError("No model trained. Call fit() first.")
-        
-        # Apply same preprocessing
-        if self.scaler_ is not None:
-            X = pd.DataFrame(
-                self.scaler_.transform(X),
-                columns=X.columns,
-                index=X.index
-            )
-        
-        return self.best_model_.predict(X)
+    def predict(self, X: pd.DataFrame
+    ) -> np.ndarray:
+            """Predict using the best model."""
+            if self.best_model_ is None:
+                raise ValueError("No model trained. Call fit() first.")
+
+            # 1. Select only the features used during training
+            if self.feature_names_ is not None:
+                # Ensure all required features exist
+                missing = set(self.feature_names_) - set(X.columns)
+                if missing:
+                    raise ValueError(f"Input data is missing columns: {missing}")
+                # Filter and reorder columns to match training data
+                X = X[self.feature_names_]
+
+            # 2. Apply scaling
+            if self.scaler_ is not None:
+                X_scaled = self.scaler_.transform(X)
+                X = pd.DataFrame(X_scaled, columns=X.columns, index=X.index)
+            
+            return self.best_model_.predict(X)
     
-    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+    def predict_proba(self, X: pd.DataFrame
+    ) -> np.ndarray:
         """Predict probabilities using the best model."""
         if self.best_model_ is None:
             raise ValueError("No model trained. Call fit() first.")
-        
-        # Apply same preprocessing
+
+        # 1. Select only the features used during training
+        if self.feature_names_ is not None:
+            # Ensure all required features exist
+            missing = set(self.feature_names_) - set(X.columns)
+            if missing:
+                raise ValueError(f"Input data is missing columns: {missing}")
+            # Filter and reorder columns to match training data
+            X = X[self.feature_names_]
+
+        # 2. Apply scaling
         if self.scaler_ is not None:
-            X = pd.DataFrame(
-                self.scaler_.transform(X),
-                columns=X.columns,
-                index=X.index
-            )
+            X_scaled = self.scaler_.transform(X)
+            X = pd.DataFrame(X_scaled, columns=X.columns, index=X.index)
         
         return self.best_model_.predict_proba(X)
-
+    
+    def save_model(self, save_dir: Union[str, Path]) -> None:
+        """
+        Save trained model, scaler, feature names, and configuration.
+        
+        Args:
+            save_dir: Directory to save model artifacts
+        """
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        
+        if self.best_model_ is None:
+            raise ValueError("No model trained. Call fit() first.")
+        
+        logger.info(f"Saving model to {save_dir}")
+        
+        # Save the trained model
+        model_path = save_dir / 'model.joblib'
+        joblib.dump(self.best_model_, model_path)
+        logger.info(f"  Saved model: {model_path}")
+        
+        # Save the scaler (if used)
+        if self.scaler_ is not None:
+            scaler_path = save_dir / 'scaler.joblib'
+            joblib.dump(self.scaler_, scaler_path)
+            logger.info(f"  Saved scaler: {scaler_path}")
+        
+        # Save feature names
+        features_path = save_dir / 'feature_names.json'
+        with open(features_path, 'w') as f:
+            json.dump(self.feature_names_, f, indent=2)
+        logger.info(f"  Saved feature names: {features_path}")
+        
+        # Save model configuration
+        config_dict = asdict(self.config)
+        config_path = save_dir / 'model_config.json'
+        with open(config_path, 'w') as f:
+            json.dump(config_dict, f, indent=2)
+        logger.info(f"  Saved configuration: {config_path}")
+        
+        # Save metadata
+        metadata = {
+            'best_model_name': self.best_model_name_,
+            'n_features': len(self.feature_names_) if self.feature_names_ else 0,
+            'model_type': type(self.best_model_).__name__,
+            'has_scaler': self.scaler_ is not None,
+        }
+        
+        # Add best model parameters if available
+        if hasattr(self.best_model_, 'get_params'):
+            metadata['model_params'] = self.best_model_.get_params()
+        
+        metadata_path = save_dir / 'metadata.json'
+        with open(metadata_path, 'w') as f:
+            # Convert any non-serializable objects to strings
+            def convert(obj):
+                if isinstance(obj, (np.integer, np.floating)):
+                    return obj.item()
+                elif isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                elif isinstance(obj, Path):
+                    return str(obj)
+                elif obj is None or isinstance(obj, (bool, int, float, str)):
+                    return obj
+                else:
+                    return str(obj)
+            
+            metadata_serializable = {k: convert(v) if not isinstance(v, dict) else 
+                                    {kk: convert(vv) for kk, vv in v.items()}
+                                    for k, v in metadata.items()}
+            json.dump(metadata_serializable, f, indent=2)
+        logger.info(f"  Saved metadata: {metadata_path}")
+        
+        logger.info(f"Model saved successfully to {save_dir}")
+    
+    @classmethod
+    def load_model(cls, load_dir: Union[str, Path]) -> 'ModelTrainer':
+        """
+        Load a trained model from disk.
+        
+        Args:
+            load_dir: Directory containing saved model artifacts
+            
+        Returns:
+            ModelTrainer instance with loaded model
+        """
+        load_dir = Path(load_dir)
+        
+        if not load_dir.exists():
+            raise ValueError(f"Directory {load_dir} does not exist")
+        
+        logger.info(f"Loading model from {load_dir}")
+        
+        # Load configuration
+        config_path = load_dir / 'model_config.json'
+        with open(config_path, 'r') as f:
+            config_dict = json.load(f)
+        config = ModelConfig(**config_dict)
+        
+        # Create trainer instance
+        trainer = cls(config)
+        
+        # Load the model
+        model_path = load_dir / 'model.joblib'
+        trainer.best_model_ = joblib.load(model_path)
+        logger.info(f"  Loaded model: {model_path}")
+        
+        # Load scaler if it exists
+        scaler_path = load_dir / 'scaler.joblib'
+        if scaler_path.exists():
+            trainer.scaler_ = joblib.load(scaler_path)
+            logger.info(f"  Loaded scaler: {scaler_path}")
+        
+        # Load feature names
+        features_path = load_dir / 'feature_names.json'
+        with open(features_path, 'r') as f:
+            trainer.feature_names_ = json.load(f)
+        logger.info(f"  Loaded {len(trainer.feature_names_)} feature names")
+        
+        # Load metadata
+        metadata_path = load_dir / 'metadata.json'
+        with open(metadata_path, 'r') as f:
+            metadata = json.load(f)
+        trainer.best_model_name_ = metadata['best_model_name']
+        
+        logger.info(f"Model loaded successfully: {trainer.best_model_name_}")
+        logger.info(f"  Features: {len(trainer.feature_names_)}")
+        logger.info(f"  Scaler: {'Yes' if trainer.scaler_ is not None else 'No'}")
+        
+        return trainer
 
 # ---------------------------------------------------------------------------
 # Feature Importance Analysis
