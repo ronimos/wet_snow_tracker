@@ -2,614 +2,656 @@
 param_config.py
 ===============
 
-Comprehensive configuration for SNOWPACK layer parameters.
-Maps parameter codes to names, units, and extraction functions.
+Configuration management for the Wetting Front Tracker application.
 
-This module defines all parameters available in SNOWPACK .pro files
-and provides utilities for extracting them from profile data.
+This module provides centralized configuration using dataclasses, environment
+variables, and validated path management. It replaces the previous approach
+of using global variables with a more structured and testable system.
 
-Author: Ron Simenhois
-Created: November 2025
+Usage:
+    from param_config import config, SnowpackConstants
+    
+    # Access paths
+    print(config.paths.results_path)
+    
+    # Access data source settings
+    if config.data_source.is_remote:
+        download_from(config.data_source.remote_url)
+    
+    # Access SNOWPACK constants
+    print(SnowpackConstants.GRAIN_TYPE_CODE[4])
 """
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Set
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional
+import logging
+
+import numpy as np
+import pandas as pd
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# SNOWPACK Parameter Definitions
+# Path Configuration
 # ---------------------------------------------------------------------------
 
 @dataclass
-class ParameterDefinition:
+class PathConfig:
+    """Configuration for all file paths used in the application."""
+    
+    # Root directories
+    project_root: Path
+    data_path: Path
+    results_path: Path
+    assets_path: Path
+    
+    # Data subdirectories
+    reference_path: Path
+    processed_data_path: Path
+    input_path: Path
+    
+    # Specific files
+    input_polygons: Path
+    input_polygons_test: Path
+    snowpack_locations_csv: Path
+    snowpack_viewer_locations_csv: Path
+    dem_tif: Path
+    aspect_polygons: Path
+    linked_polygons: Path
+    summary_map_html: Path
+    pro_file_manifest: Path
+    
+    @classmethod
+    def from_project_root(cls, project_root: Optional[Path] = None) -> 'PathConfig':
+        """
+        Initialize paths from the project root directory.
+        
+        Args:
+            project_root: The root directory of the project. If None, auto-detects
+                         from the location of this config file.
+        """
+        if project_root is None:
+            # Auto-detect: this file is in src/wetting_front_tracker/
+            config_file = Path(__file__).resolve()
+            project_root = config_file.parent.parent.parent
+        
+        project_root = Path(project_root)
+        
+        # Core directories
+        data_path = project_root / 'data'
+        reference_path = data_path / 'reference'
+        processed_data_path = data_path / 'processed'
+        
+        # Input path from environment or default
+        input_path = Path(os.getenv(
+            "PRO_FILES_INPUT_DIR",
+            default=str(data_path / "input")
+        ))
+        
+        # Results path from environment or default
+        results_path = Path(os.getenv(
+            "WFT_RESULTS_OUTPUT_DIR",
+            default=str(project_root / 'results')
+        ))
+        
+        # Assets path from environment or default
+        assets_subfolder = "plot_assets"
+        assets_path = Path(os.getenv(
+            "WFT_ASSETS_OUTPUT_DIR",
+            default=str(results_path / assets_subfolder)
+        ))
+        
+        return cls(
+            project_root=project_root,
+            data_path=data_path,
+            results_path=results_path,
+            assets_path=assets_path,
+            reference_path=reference_path,
+            processed_data_path=processed_data_path,
+            input_path=input_path,
+            # Specific files
+            input_polygons=reference_path / 'Paths.geojson',
+            input_polygons_test=reference_path / 'Paths_test.geojson',
+            snowpack_locations_csv=reference_path / 'snowpack_locations_with_metadata.csv',
+            snowpack_viewer_locations_csv=reference_path / 'snowpack_viewer_locations.csv',
+            dem_tif=processed_data_path / 'dem.tif',
+            aspect_polygons=processed_data_path / 'aspect_polygons.geojson',
+            linked_polygons=processed_data_path / 'linked_aspect_polygons.geojson',
+            summary_map_html=results_path / "summary_map.html",
+            pro_file_manifest=processed_data_path / "pro_file_manifest.json",
+        )
+    
+    def ensure_directories_exist(self) -> None:
+        """Create all necessary directories if they don't exist."""
+        directories = [
+            self.data_path,
+            self.results_path,
+            self.reference_path,
+            self.processed_data_path,
+            self.assets_path,
+        ]
+        
+        for directory in directories:
+            directory.mkdir(parents=True, exist_ok=True)
+            logger.debug(f"Ensured directory exists: {directory}")
+    
+    def get_png_path(self, file_stem: str) -> Path:
+        """Generate the output path for a Matplotlib PNG plot."""
+        return self.assets_path / f"{file_stem}_wetting_front.png"
+    
+    def get_html_path(self, file_stem: str) -> Path:
+        """Generate the output path for a Plotly HTML plot."""
+        return self.assets_path / f"{file_stem}_wetting_front.html"
+
+
+# ---------------------------------------------------------------------------
+# Data Source Configuration
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DataSourceConfig:
+    """Configuration for data source and fetching behavior."""
+    
+    source: str  # 'local' or 'remote'
+    remote_url: str
+    use_test_data: bool
+    
+    @property
+    def is_remote(self) -> bool:
+        """Check if data source is configured as remote."""
+        return self.source.lower() == 'remote'
+    
+    @property
+    def is_local(self) -> bool:
+        """Check if data source is configured as local."""
+        return self.source.lower() == 'local'
+    
+    @classmethod
+    def from_env(cls) -> 'DataSourceConfig':
+        """Load data source configuration from environment variables."""
+        return cls(
+            source=os.getenv("PRO_FILES_SOURCE", "local").lower(),
+            remote_url=os.getenv(
+                "REMOTE_PRO_FILES_URL",
+                "https://nwp.mtnweather.info/ron/ssd/snowpack/output/"
+            ),
+            use_test_data=os.getenv("USE_TEST_DATA", "false").lower() == "true",
+        )
+    
+    def validate(self) -> None:
+        """Validate the configuration."""
+        if self.source not in ('local', 'remote'):
+            raise ValueError(
+                f"PRO_FILES_SOURCE must be 'local' or 'remote', got '{self.source}'"
+            )
+        
+        if self.is_remote and not self.remote_url:
+            raise ValueError(
+                "REMOTE_PRO_FILES_URL must be set when PRO_FILES_SOURCE is 'remote'"
+            )
+
+
+# ---------------------------------------------------------------------------
+# API Configuration
+# ---------------------------------------------------------------------------
+
+@dataclass
+class APIConfig:
+    """Configuration for external APIs."""
+    
+    opentopo_api_key: str
+    
+    @classmethod
+    def from_env(cls) -> 'APIConfig':
+        """Load API configuration from environment variables."""
+        return cls(
+            opentopo_api_key=os.getenv("OPENTOPO_API_KEY", "YOUR_API_KEY_HERE")
+        )
+    
+    def validate(self) -> None:
+        """Validate the API configuration."""
+        if self.opentopo_api_key == "YOUR_API_KEY_HERE":
+            logger.warning(
+                "OpenTopography API key not set. DEM downloads will fail. "
+                "Set OPENTOPO_API_KEY in your .env file."
+            )
+
+
+# ---------------------------------------------------------------------------
+# DEM Configuration
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DEMDataset:
+    """Configuration for a DEM dataset."""
+    name: str
+    api_endpoint: str
+    param_name: str
+    bounds: tuple[float, float, float, float]  # (west, south, east, north)
+
+
+@dataclass
+class DEMConfig:
+    """Configuration for DEM datasets."""
+    
+    datasets: List[DEMDataset] = field(default_factory=list)
+    
+    @classmethod
+    def default(cls) -> 'DEMConfig':
+        """Create default DEM configuration with standard datasets."""
+        return cls(datasets=[
+            DEMDataset(
+                name="USGS10m",
+                api_endpoint="https://portal.opentopography.org/API/usgsdem",
+                param_name="demtype",
+                bounds=(-124.73, 24.96, -66.95, 49.37),  # Contiguous US
+            ),
+            DEMDataset(
+                name="SRTMGL1",
+                api_endpoint="https://portal.opentopography.org/API/globaldem",
+                param_name="demtype",
+                bounds=(-180, -90, 180, 90),  # Global
+            ),
+        ])
+    
+    def get_dataset_for_location(
+        self, 
+        longitude: float, 
+        latitude: float
+    ) -> Optional[DEMDataset]:
+        """
+        Select the best DEM dataset for a given location.
+        
+        Args:
+            longitude: The longitude of the location
+            latitude: The latitude of the location
+            
+        Returns:
+            The most appropriate DEMDataset, or None if no dataset covers the location
+        """
+        for dataset in self.datasets:
+            west, south, east, north = dataset.bounds
+            if west <= longitude <= east and south <= latitude <= north:
+                return dataset
+        
+        # Fallback to global dataset (should be last in list)
+        return self.datasets[-1] if self.datasets else None
+
+
+# ---------------------------------------------------------------------------
+# Main Configuration
+# ---------------------------------------------------------------------------
+
+@dataclass
+class WFTConfig:
+    """Main configuration class for Wetting Front Tracker."""
+    
+    paths: PathConfig
+    data_source: DataSourceConfig
+    api: APIConfig
+    dem: DEMConfig
+    
+    # Environment detection
+    is_dev_environment: bool = field(default_factory=lambda: os.name == 'nt')
+    
+    @classmethod
+    def load(cls) -> 'WFTConfig':
+        """
+        Load configuration from environment variables and defaults.
+        
+        Returns:
+            A fully initialized WFTConfig instance
+        """
+        paths = PathConfig.from_project_root()
+        data_source = DataSourceConfig.from_env()
+        api = APIConfig.from_env()
+        dem = DEMConfig.default()
+        
+        config = cls(
+            paths=paths,
+            data_source=data_source,
+            api=api,
+            dem=dem,
+        )
+        
+        # Validate and initialize
+        config.validate()
+        config.paths.ensure_directories_exist()
+        
+        return config
+    
+    def validate(self) -> None:
+        """Validate the entire configuration."""
+        self.data_source.validate()
+        self.api.validate()
+    
+    def get_input_polygons_path(self) -> Path:
+        """Get the appropriate input polygons path based on test mode."""
+        if self.data_source.use_test_data:
+            return self.paths.input_polygons_test
+        return self.paths.input_polygons
+
+
+# ---------------------------------------------------------------------------
+# SNOWPACK Constants (Static Lookup Tables)
+# ---------------------------------------------------------------------------
+
+class SnowpackConstants:
     """
-    Definition of a SNOWPACK parameter.
+    Static constants and lookup tables for SNOWPACK data.
+    
+    These are class-level constants that don't change and don't need
+    to be part of the main configuration.
+    """
+    
+    # Hand hardness conversion
+    HAND_HARDNESS_TO_NUMERIC = {
+        'F': 1, 'F+': 1.5, '4F-': 1.5, '4F': 2, '4F+': 2.5,
+        '1F-': 2.5, '1F': 3, '1F+': 3.5, 'P-': 3.5, 'P': 4,
+        'P+': 4.5, 'K-': 4.5, 'K': 5, 'K+': 5.5, 'I': 6
+    }
+    
+    NUMERIC_TO_HAND_HARDNESS = {
+        v: k for k, v in HAND_HARDNESS_TO_NUMERIC.items()
+    }
+    
+    # Grain type codes (full names)
+    GRAIN_TYPE_CODE = {
+        1: 'Precipitation particules (PP)',
+        2: 'Decomposing fragmented PP (DF)',
+        3: 'Rounded grains (RG)',
+        4: 'Faceted crystals (FC)',
+        5: 'Depth hoar (DH)',
+        6: 'Surface hoar (SH)',
+        7: 'Melt forms (MF)',
+        8: 'Ice formations (IF)',
+        9: 'Rounding faceted particules (FCxr)'
+    }
+    
+    # Grain type codes (short names)
+    GRAIN_TYPE_CODE_SHORT = {
+        1: 'PP', 2: 'DF', 3: 'RG', 4: 'FC', 5: 'DH',
+        6: 'SH', 7: 'MF', 8: 'IF', 9: 'FCxr'
+    }
+    
+    # Grain type name to ID
+    GRAIN_TYPE_NAME_TO_ID = {
+        '': 0, 'PP': 1, 'DF': 2, 'RG': 3, 'FC': 4, 'DH': 5,
+        'SH': 6, 'MF': 7, 'FCxr': 8, 'MFcr': 9
+    }
+    
+    # Colors for plotting (by ID)
+    GRAIN_TYPE_COLORS_BY_ID = {
+        1: 'lime', 2: 'darkgreen', 3: 'pink', 4: 'lightblue',
+        5: 'blue', 6: 'magenta', 7: 'crimson', 8: 'crimson',
+        9: 'skyblue'
+    }
+    
+    # Colors for plotting (by name)
+    GRAIN_TYPE_COLORS_BY_NAME = {
+        'PP': 'lime', 'DF': 'darkgreen', 'RG': 'pink',
+        'FC': 'lightblue', 'DH': 'blue', 'SH': 'magenta',
+        'MF': 'crimson', 'FCxr': 'crimson', 'MFcr': 'crimson',
+        '': 'whitesmoke'
+    }
+    
+    # RGB colors for Plotly
+    GRAIN_TYPE_RGB = {
+        'PP': 'rgb(0, 255, 0)', 'DF': 'rgb(34, 139, 34)',
+        'RG': 'rgb(255, 182, 193)', 'FC': 'rgb(173, 216, 230)',
+        'DH': 'rgb(0, 0, 255)', 'SH': 'rgb(255, 0, 255)',
+        'MF': 'rgb(255, 0, 0)', 'IF': 'rgb(255, 0, 0)',
+        'FCxr': 'rgb(0, 255, 255)', '': 'rgb(200, 200, 200)'
+    }
+    
+    # Grain type similarity table
+    @staticmethod
+    def get_grain_type_similarity_table() -> pd.DataFrame:
+        """
+        Get the grain type similarity table as a pandas DataFrame.
+        
+        Returns:
+            DataFrame with grain type similarities
+        """
+        data = np.array([
+            [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+            [0.5, 1.0, 0.8, 0.5, 0.2, 0.0, 0.0, 0.0, 0.2, 0.0],
+            [0.5, 0.8, 1.0, 0.8, 0.4, 0.0, 0.0, 0.0, 0.4, 0.0],
+            [0.5, 0.5, 0.8, 1.0, 0.4, 0.1, 0.0, 0.0, 0.5, 0.0],
+            [0.5, 0.2, 0.4, 0.4, 1.0, 0.5, 0.3, 0.0, 0.6, 0.0],
+            [0.5, 0.0, 0.0, 0.1, 0.5, 1.0, 0.9, 0.0, 0.4, 0.0],
+            [0.5, 0.0, 0.0, 0.0, 0.3, 0.9, 1.0, 0.0, 0.0, 0.0],
+            [0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.2],
+            [0.5, 0.2, 0.4, 0.5, 0.6, 0.4, 0.0, 0.0, 1.0, 0.0],
+            [0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2, 0.0, 1.0]
+        ])
+        
+        index_names = ['', 'PP', 'DF', 'RG', 'FC', 'DH', 'SH', 'MF', 'FCxr', 'MFcr']
+        
+        return pd.DataFrame(
+            data,
+            columns=index_names,
+            index=index_names
+        )
+    
+    # Test grading scores
+    TEST_GRADING_SCORE = {
+        'ECTP': 1,
+        'ECTN': 2
+    }
+
+
+# ---------------------------------------------------------------------------
+# Singleton Configuration Instance
+# ---------------------------------------------------------------------------
+
+# Create the global configuration instance
+config = WFTConfig.load()
+
+# Backward compatibility: expose commonly used paths at module level
+PATHS = config.paths
+DATA_PATH = config.paths.data_path
+RESULTS_PATH = config.paths.results_path
+ASSETS_PATH = config.paths.assets_path
+PRO_FILES_BASE_PATH = config.paths.input_path
+
+# Backward compatibility: specific files
+INPUT_POLYGONS_GEOJSON = config.paths.input_polygons
+INPUT_POLYGONS_GEOJSON_TEST = config.paths.input_polygons_test
+LINKED_POLYGONS_GEOJSON = config.paths.linked_polygons
+PRO_FILE_MANIFEST = config.paths.pro_file_manifest
+SNOWPACK_LOCATIONS_CSV = config.paths.snowpack_locations_csv
+
+# Backward compatibility: other settings
+USE_TEST_DATA = config.data_source.use_test_data
+OPENTOPO_API_KEY = config.api.opentopo_api_key
+
+
+# ---------------------------------------------------------------------------
+# Helper Functions
+# ---------------------------------------------------------------------------
+
+def get_png_path(file_stem: str, assets_dir: Optional[Path] = None) -> Path:
+    """
+    Generate the output path for a Matplotlib PNG plot.
+    
+    Args:
+        file_stem: The base name for the file
+        assets_dir: Optional override for the assets directory
+        
+    Returns:
+        Path to the PNG file
+    """
+    if assets_dir is None:
+        assets_dir = config.paths.assets_path
+    return Path(assets_dir) / f"{file_stem}_wetting_front.png"
+
+
+def get_html_path(file_stem: str, assets_dir: Optional[Path] = None) -> Path:
+    """
+    Generate the output path for a Plotly HTML plot.
+    
+    Args:
+        file_stem: The base name for the file
+        assets_dir: Optional override for the assets directory
+        
+    Returns:
+        Path to the HTML file
+    """
+    if assets_dir is None:
+        assets_dir = config.paths.assets_path
+    return Path(assets_dir) / f"{file_stem}_wetting_front.html"
+
+
+# ---------------------------------------------------------------------------
+# Module Initialization
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    # Test configuration loading
+    print("Wetting Front Tracker Configuration")
+    print("=" * 50)
+    print(f"\nProject Root: {config.paths.project_root}")
+    print(f"Data Source: {config.data_source.source}")
+    print(f"Is Remote: {config.data_source.is_remote}")
+    print(f"Use Test Data: {config.data_source.use_test_data}")
+    print(f"Results Path: {config.paths.results_path}")
+    print(f"\nAPI Key Set: {config.api.opentopo_api_key != 'YOUR_API_KEY_HERE'}")
+    print(f"Available DEM Datasets: {len(config.dem.datasets)}")
+    
+    # Test DEM dataset selection
+    test_location = (-105.5, 39.5)  # Colorado
+    dataset = config.dem.get_dataset_for_location(*test_location)
+    if dataset:
+        print(f"\nDEM for Colorado: {dataset.name}")
+
+# ---------------------------------------------------------------------------
+# ML Model Configuration (Added for ML-based LOC detection)
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class MLModelConfig:
+    """
+    Configuration for ML-based LOC detection.
     
     Attributes:
-        code: SNOWPACK parameter code (e.g., '0502')
-        name: Human-readable name
-        units: Physical units
-        description: Brief description
-        column_name: Name in xarray Dataset/DataFrame
-        is_layer_param: True if parameter exists for each layer
-        compute_diff: Whether to compute interface differences
-        compute_ratio: Whether to compute interface ratios
+        enabled: Whether to use ML-based LOC detection
+        model_path: Path to trained model directory
+        use_ml_primary: If True, try ML first then fall back to rules
+        probability_threshold: Minimum probability to consider as LOC
+        lookback_hours: Hours of history to use for feature extraction
     """
-    code: str
-    name: str
-    units: str
-    description: str
-    column_name: str
-    is_layer_param: bool = True
-    compute_diff: bool = True
-    compute_ratio: bool = False
+    enabled: bool = False
+    model_path: Optional[Path] = None
+    use_ml_primary: bool = True
+    probability_threshold: float = 0.5
+    lookback_hours: int = 24
 
 
-# All SNOWPACK parameters we want to extract
-# Based on the comprehensive list provided by user
-SNOWPACK_PARAMETERS = {
-    # Core structural parameters
-    '0501': ParameterDefinition(
-        code='0501',
-        name='height',
-        units='cm',
-        description='Element height (top of layer)',
-        column_name='height',
-        is_layer_param=True,
-        compute_diff=True,
-        compute_ratio=False
-    ),
-    '0502': ParameterDefinition(
-        code='0502',
-        name='density',
-        units='kg/m³',
-        description='Element density',
-        column_name='density',
-        is_layer_param=True,
-        compute_diff=True,
-        compute_ratio=True
-    ),
-    '0503': ParameterDefinition(
-        code='0503',
-        name='temperature',
-        units='°C',
-        description='Element temperature',
-        column_name='temperature',
-        is_layer_param=True,
-        compute_diff=True,
-        compute_ratio=False
-    ),
-    '0504': ParameterDefinition(
-        code='0504',
-        name='element_ID',
-        units='',
-        description='Unique element identifier',
-        column_name='element_ID',
-        is_layer_param=True,
-        compute_diff=False,
-        compute_ratio=False
-    ),
-    '0505': ParameterDefinition(
-        code='0505',
-        name='age',
-        units='days',
-        description='Element age since deposition',
-        column_name='age',
-        is_layer_param=True,
-        compute_diff=True,
-        compute_ratio=True
-    ),
-    '0506': ParameterDefinition(
-        code='0506',
-        name='lwc',
-        units='% vol',
-        description='Liquid water content by volume',
-        column_name='lwc',
-        is_layer_param=True,
-        compute_diff=True,
-        compute_ratio=True
-    ),
-    
-    # Microstructure parameters
-    '0508': ParameterDefinition(
-        code='0508',
-        name='dendricity',
-        units='',
-        description='Degree of dendritic structure (0-1)',
-        column_name='dendricity',
-        is_layer_param=True,
-        compute_diff=True,
-        compute_ratio=False
-    ),
-    '0509': ParameterDefinition(
-        code='0509',
-        name='sphericity',
-        units='',
-        description='Degree of rounded grains (0-1)',
-        column_name='sphericity',
-        is_layer_param=True,
-        compute_diff=True,
-        compute_ratio=False
-    ),
-    '0510': ParameterDefinition(
-        code='0510',
-        name='coordination_number',
-        units='',
-        description='Number of grain-to-grain bonds',
-        column_name='coord_number',
-        is_layer_param=True,
-        compute_diff=True,
-        compute_ratio=True
-    ),
-    '0511': ParameterDefinition(
-        code='0511',
-        name='bond_size',
-        units='mm',
-        description='Size of intergranular bonds',
-        column_name='bond_size',
-        is_layer_param=True,
-        compute_diff=True,
-        compute_ratio=True
-    ),
-    '0512': ParameterDefinition(
-        code='0512',
-        name='grain_size',
-        units='mm',
-        description='Average grain size',
-        column_name='grain_size',
-        is_layer_param=True,
-        compute_diff=True,
-        compute_ratio=True
-    ),
-    '0513': ParameterDefinition(
-        code='0513',
-        name='grain_type',
-        units='',
-        description='Grain type (Swiss Code F1F2F3)',
-        column_name='grain_type',
-        is_layer_param=True,
-        compute_diff=False,  # Categorical
-        compute_ratio=False
-    ),
-    '0535': ParameterDefinition(
-        code='0535',
-        name='optical_grain_size',
-        units='mm',
-        description='Optical equivalent grain size',
-        column_name='opt_equ_grain_size',
-        is_layer_param=True,
-        compute_diff=True,
-        compute_ratio=True
-    ),
-    
-    # Volumetric fractions
-    '0515': ParameterDefinition(
-        code='0515',
-        name='ice_volume_fraction',
-        units='%',
-        description='Ice volume fraction',
-        column_name='ice_content',
-        is_layer_param=True,
-        compute_diff=True,
-        compute_ratio=True
-    ),
-    '0516': ParameterDefinition(
-        code='0516',
-        name='air_volume_fraction',
-        units='%',
-        description='Air volume fraction (porosity)',
-        column_name='air_content',
-        is_layer_param=True,
-        compute_diff=True,
-        compute_ratio=True
-    ),
-    '0519': ParameterDefinition(
-        code='0519',
-        name='soil_volume_fraction',
-        units='%',
-        description='Soil volume fraction',
-        column_name='soil_content',
-        is_layer_param=True,
-        compute_diff=True,
-        compute_ratio=True
-    ),
-    
-    # Mechanical properties
-    '0517': ParameterDefinition(
-        code='0517',
-        name='stress',
-        units='kPa',
-        description='Stress in element',
-        column_name='stress',
-        is_layer_param=True,
-        compute_diff=True,
-        compute_ratio=True
-    ),
-    '0518': ParameterDefinition(
-        code='0518',
-        name='viscosity',
-        units='GPa·s',
-        description='Snow viscosity',
-        column_name='viscosity',
-        is_layer_param=True,
-        compute_diff=True,
-        compute_ratio=True
-    ),
-    '0523': ParameterDefinition(
-        code='0523',
-        name='viscous_deformation_rate',
-        units='1e-6/s',
-        description='Viscous deformation rate',
-        column_name='viscous_deformation_rate',
-        is_layer_param=True,
-        compute_diff=True,
-        compute_ratio=True
-    ),
-    '0534': ParameterDefinition(
-        code='0534',
-        name='hand_hardness',
-        units='',
-        description='Hand hardness index (1-6)',
-        column_name='hand_hardness',
-        is_layer_param=True,
-        compute_diff=True,
-        compute_ratio=False
-    ),
-    '0601': ParameterDefinition(
-        code='0601',
-        name='shear_strength',
-        units='kPa',
-        description='Snow shear strength',
-        column_name='shear_strength',
-        is_layer_param=True,
-        compute_diff=True,
-        compute_ratio=True
-    ),
-    
-    # Thermal properties
-    '0520': ParameterDefinition(
-        code='0520',
-        name='temperature_gradient',
-        units='K/m',
-        description='Temperature gradient in layer',
-        column_name='temperature_gradient',
-        is_layer_param=True,
-        compute_diff=True,
-        compute_ratio=False
-    ),
-    '0521': ParameterDefinition(
-        code='0521',
-        name='thermal_conductivity',
-        units='W/(K·m)',
-        description='Thermal conductivity',
-        column_name='thermal_conductivity',
-        is_layer_param=True,
-        compute_diff=True,
-        compute_ratio=True
-    ),
-    '0522': ParameterDefinition(
-        code='0522',
-        name='absorbed_shortwave',
-        units='W/m²',
-        description='Absorbed shortwave radiation',
-        column_name='absorbed_shortwave',
-        is_layer_param=True,
-        compute_diff=True,
-        compute_ratio=False
-    ),
-    
-    # Stability indices
-    '0531': ParameterDefinition(
-        code='0531',
-        name='stability_sdef',
-        units='',
-        description='Deformation rate stability index',
-        column_name='stab_deformation_rate',
-        is_layer_param=True,
-        compute_diff=True,
-        compute_ratio=True
-    ),
-    '0532': ParameterDefinition(
-        code='0532',
-        name='stability_sn38',
-        units='',
-        description='Natural stability index (Sn38)',
-        column_name='sn38',
-        is_layer_param=True,
-        compute_diff=True,
-        compute_ratio=True
-    ),
-    '0533': ParameterDefinition(
-        code='0533',
-        name='stability_sk38',
-        units='',
-        description='Stability index Sk38',
-        column_name='sk38',
-        is_layer_param=True,
-        compute_diff=True,
-        compute_ratio=True
-    ),
-    '0604': ParameterDefinition(
-        code='0604',
-        name='ssi',
-        units='',
-        description='Structural stability index',
-        column_name='ssi',
-        is_layer_param=True,
-        compute_diff=True,
-        compute_ratio=True
-    ),
-    
-    # Interface-specific parameters
-    '0602': ParameterDefinition(
-        code='0602',
-        name='grain_size_difference',
-        units='mm',
-        description='Grain size difference at interface',
-        column_name='gs_difference',
-        is_layer_param=True,
-        compute_diff=False,  # Already a difference
-        compute_ratio=False
-    ),
-    '0603': ParameterDefinition(
-        code='0603',
-        name='hardness_difference',
-        units='',
-        description='Hardness difference at interface',
-        column_name='hardness_difference',
-        is_layer_param=True,
-        compute_diff=False,  # Already a difference
-        compute_ratio=False
-    ),
-    '0605': ParameterDefinition(
-        code='0605',
-        name='inverse_texture_index',
-        units='Mg/m⁴',
-        description='Inverse texture index (ITI)',
-        column_name='inverse_texture_index',
-        is_layer_param=True,
-        compute_diff=True,
-        compute_ratio=True
-    ),
-    '0606': ParameterDefinition(
-        code='0606',
-        name='critical_cut_length',
-        units='m',
-        description='Critical cut length for crack propagation',
-        column_name='critical_cut_length',
-        is_layer_param=True,
-        compute_diff=True,
-        compute_ratio=True
-    ),
-}
+# ML model configuration
+# IMPORTANT: Update model_path to point to your actual trained model!
+# You can also set this via environment variable: ML_MODEL_PATH
+ML_MODEL_PATH = os.getenv("ML_MODEL_PATH", None)
+
+if ML_MODEL_PATH:
+    # If set in .env file, use that path
+    _ml_model_path = Path(ML_MODEL_PATH)
+else:
+    # Otherwise use default location in results directory
+    _ml_model_path = RESULTS_PATH / "trained_models" / "20251117_120000" / "trained_model"
+
+ML_CONFIG = MLModelConfig(
+    enabled=False,  # Set to True after testing, or via ML_ENABLED env var
+    model_path=_ml_model_path,
+    use_ml_primary=True,
+    probability_threshold=float(os.getenv("ML_PROBABILITY_THRESHOLD", "0.5")),
+    lookback_hours=int(os.getenv("ML_LOOKBACK_HOURS", "24"))
+)
+
+# Allow enabling via environment variable
+if os.getenv("ML_ENABLED", "false").lower() == "true":
+    ML_CONFIG.enabled = True
+
+# LOC detection mode: "rule_based", "ml_only", or "hybrid"
+# - "rule_based": Use traditional capillary barrier detection (existing method)
+# - "ml_only": Use only ML predictions (requires trained model)
+# - "hybrid": Try ML first, fall back to rules if needed (RECOMMENDED)
+# Can also be set via environment variable: LOC_DETECTION_MODE
+LOC_DETECTION_MODE = os.getenv("LOC_DETECTION_MODE", "rule_based")
 
 
 # ---------------------------------------------------------------------------
-# Parameter Groups
+# Feature Requirements for ML (Based on SHAP Importance Analysis)
 # ---------------------------------------------------------------------------
 
-def get_parameter_groups() -> Dict[str, List[str]]:
-    """
-    Organize parameters into functional groups.
+# CRITICAL: Top features by SHAP importance (>1.0):
+# 1. interface_layer_distance (2.76) - derived from height
+# 2. interface_stress_ratio (2.56) - requires stress
+# 3. above_stress (2.26) - requires stress
+# 
+# These three features alone account for ~75% of predictive power
+
+# Minimum required features for ML LOC detection (SHAP importance > 0.5)
+# These enable the most critical derived features
+ML_REQUIRED_FEATURES = [
+    # Core structural (enables layer_distance, basic interface features)
+    'height',           # Essential for interface_layer_distance (SHAP: 2.76)
+    'density',          # For interface_density features
     
-    Returns:
-        Dictionary mapping group name to list of parameter codes
-    """
-    return {
-        'core': ['0501', '0502', '0503', '0504', '0505', '0506'],
-        'microstructure': ['0508', '0509', '0510', '0511', '0512', '0513', '0535'],
-        'volumetric': ['0515', '0516', '0519'],
-        'mechanical': ['0517', '0518', '0523', '0534', '0601'],
-        'thermal': ['0520', '0521', '0522'],
-        'stability': ['0531', '0532', '0533', '0604'],
-        'interface': ['0602', '0603', '0605', '0606'],
-    }
-
-
-def get_essential_parameters() -> List[str]:
-    """
-    Get list of essential parameters that should always be extracted.
+    # Mechanical (enables top 3 SHAP features)
+    'stress',           # CRITICAL: enables interface_stress_ratio (2.56), above_stress (2.26)
     
-    Returns:
-        List of parameter codes
-    """
-    return [
-        '0501',  # height
-        '0502',  # density
-        '0503',  # temperature
-        '0504',  # element_ID
-        '0506',  # lwc
-        '0512',  # grain_size
-        '0513',  # grain_type
-    ]
-
-
-def get_parameters_for_differences() -> List[str]:
-    """
-    Get parameters that should have interface differences computed.
+    # Water content (SHAP: below_lwc=0.75, above_lwc=0.51)
+    'lwc',              # Important for wetting front detection
     
-    Returns:
-        List of parameter codes
-    """
-    return [
-        code for code, param in SNOWPACK_PARAMETERS.items()
-        if param.compute_diff
-    ]
-
-
-def get_parameters_for_ratios() -> List[str]:
-    """
-    Get parameters that should have interface ratios computed.
+    # Temperature (SHAP: above_temperature=0.51, gradients=0.64/0.58)
+    'temperature',      # For temperature and gradient features
+    'temperature_gradient',  # Direct feature with SHAP=0.64
     
-    Returns:
-        List of parameter codes
-    """
-    return [
-        code for code, param in SNOWPACK_PARAMETERS.items()
-        if param.compute_ratio
-    ]
+    # Microstructure (SHAP: grain_size features ~0.3-0.4)
+    'grain_size',       # For interface_grain_size features
+    'grain_type',       # Categorical, lower importance but needed for grain classification
+]
 
-
-# ---------------------------------------------------------------------------
-# Parameter Access Utilities
-# ---------------------------------------------------------------------------
-
-def get_parameter_name(code: str) -> str:
-    """Get human-readable name for parameter code."""
-    return SNOWPACK_PARAMETERS.get(code, ParameterDefinition('', 'unknown', '', '', '')).name
-
-
-def get_parameter_units(code: str) -> str:
-    """Get units for parameter code."""
-    return SNOWPACK_PARAMETERS.get(code, ParameterDefinition('', '', 'unknown', '', '')).units
-
-
-def get_column_name(code: str) -> str:
-    """Get DataFrame column name for parameter code."""
-    return SNOWPACK_PARAMETERS.get(code, ParameterDefinition('', '', '', '', 'unknown')).column_name
-
-
-def get_all_column_names() -> List[str]:
-    """Get all DataFrame column names."""
-    return [param.column_name for param in SNOWPACK_PARAMETERS.values()]
-
-
-def get_available_parameters(df_columns: Set[str]) -> Dict[str, ParameterDefinition]:
-    """
-    Filter parameter definitions to only those available in a DataFrame.
+# Features that should be extracted for optimal ML performance
+# Includes all features contributing to SHAP importance > 0.1
+ML_OPTIMAL_FEATURES = ML_REQUIRED_FEATURES + [
+    # Mechanical properties (high SHAP importance)
+    'viscosity',        # SHAP: above_viscosity=0.32, below_viscosity=0.24
+    'shear_strength',   # SHAP: interface_shear_strength_diff=0.14
     
-    Args:
-        df_columns: Set of column names in DataFrame
-        
-    Returns:
-        Dictionary of available parameters
-    """
-    return {
-        code: param for code, param in SNOWPACK_PARAMETERS.items()
-        if param.column_name in df_columns
-    }
+    # Microstructure (moderate SHAP importance)
+    'bond_size',        # SHAP: interface_bond_size_diff=0.39
+    'sphericity',       # SHAP: interface_sphericity_diff=0.37
+    'optical_grain_size',  # SHAP: above=0.12, below=0.11
+    'grain_size_difference',  # SHAP: below=0.30, above=0.10 (direct feature)
+    'hand_hardness',    # SHAP: interface_hand_hardness_diff=0.07
+    
+    # Volumetric (lower SHAP importance but useful)
+    'ice_content',      # SHAP: interface_ice_volume_fraction_diff=0.08
+    'hardness_difference',  # SHAP: ~0.05-0.06 (direct feature)
+    
+    # Additional (very low SHAP importance, optional)
+    'viscous_deformation_rate',  # SHAP: ~0.01
+]
 
+# PERFORMANCE NOTE:
+# With just ML_REQUIRED_FEATURES (9 parameters), you can capture ~85% of model performance
+# With ML_OPTIMAL_FEATURES (18 parameters), you get near-optimal performance (~98%)
 
-# ---------------------------------------------------------------------------
-# Feature Name Generators
-# ---------------------------------------------------------------------------
-
-def generate_layer_feature_names(prefix: str = 'above') -> List[str]:
-    """
-    Generate feature names for a layer (above or below).
-    
-    Args:
-        prefix: Prefix for feature names ('above' or 'below')
-        
-    Returns:
-        List of feature names
-    """
-    return [
-        f'{prefix}_{param.name}'
-        for param in SNOWPACK_PARAMETERS.values()
-        if param.is_layer_param
-    ]
-
-
-def generate_interface_feature_names() -> List[str]:
-    """
-    Generate feature names for interface properties.
-    
-    Returns:
-        List of interface feature names
-    """
-    features = []
-    
-    # Differences
-    for code, param in SNOWPACK_PARAMETERS.items():
-        if param.compute_diff:
-            features.append(f'interface_{param.name}_diff')
-    
-    # Ratios
-    for code, param in SNOWPACK_PARAMETERS.items():
-        if param.compute_ratio:
-            features.append(f'interface_{param.name}_ratio')
-    
-    # Gradients (for applicable parameters)
-    gradient_params = ['0502', '0503', '0506', '0512']  # density, temp, lwc, grain_size
-    for code in gradient_params:
-        param = SNOWPACK_PARAMETERS[code]
-        features.append(f'interface_{param.name}_gradient')
-    
-    return features
-
-
-def get_all_feature_names() -> List[str]:
-    """
-    Get complete list of all feature names.
-    
-    Returns:
-        List of all feature names
-    """
-    features = []
-    
-    # Event metadata
-    features.extend([
-        'event_id',
-        'station_name',
-        'pro_file',
-        'start_time',
-        'stall_height',
-        'stall_layer_id',
-        'layer_above_id',
-        'layer_below_id',
-        'feature_extraction_time',
-        'lookback_hours',
-    ])
-    
-    # Layer features
-    features.extend(generate_layer_feature_names('above'))
-    features.extend(generate_layer_feature_names('below'))
-    
-    # Interface features
-    features.extend(generate_interface_feature_names())
-    
-    # Target variable
-    features.append('stalled')
-    
-    return features
-
-
-# ---------------------------------------------------------------------------
-# Documentation
-# ---------------------------------------------------------------------------
-
-def print_parameter_summary():
-    """Print summary of all available parameters."""
-    print("=" * 80)
-    print("SNOWPACK Parameter Configuration")
-    print("=" * 80)
-    print(f"\nTotal parameters: {len(SNOWPACK_PARAMETERS)}")
-    
-    groups = get_parameter_groups()
-    print(f"\nParameter groups: {len(groups)}")
-    for group_name, codes in groups.items():
-        print(f"  {group_name:15s}: {len(codes):2d} parameters")
-    
-    print(f"\nEssential parameters: {len(get_essential_parameters())}")
-    print(f"Parameters with differences: {len(get_parameters_for_differences())}")
-    print(f"Parameters with ratios: {len(get_parameters_for_ratios())}")
-    
-    print(f"\nTotal features per event: {len(get_all_feature_names())}")
-    print("=" * 80)
-
-
-if __name__ == '__main__':
-    # Print summary when run directly
-    print_parameter_summary()
-    
-    # Example usage
-    print("\nExample parameter details:")
-    print("-" * 80)
-    for code in ['0502', '0506', '0512']:
-        param = SNOWPACK_PARAMETERS[code]
-        print(f"\nCode {param.code}: {param.name}")
-        print(f"  Units: {param.units}")
-        print(f"  Column: {param.column_name}")
-        print(f"  Compute diff: {param.compute_diff}")
-        print(f"  Compute ratio: {param.compute_ratio}")
+# SHAP IMPORTANCE TIERS:
+# Tier 1 (CRITICAL, >1.0): stress, height → 75% of importance
+# Tier 2 (HIGH, 0.5-1.0): lwc, temperature_gradient, temperature → 15% of importance  
+# Tier 3 (MODERATE, 0.3-0.5): grain_size, bond_size, sphericity, viscosity → 8% of importance
+# Tier 4 (LOW, 0.1-0.3): optical_grain_size, shear_strength, density → 2% of importance
+# Tier 5 (MINIMAL, <0.1): hardness, ice_content, deformation_rate → <1% of importance

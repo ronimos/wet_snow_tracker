@@ -37,7 +37,7 @@ from matplotlib.patches import PathPatch
 from matplotlib.path import Path as MplPath
 from PIL import Image
 
-from .param_config import RESULTS_PATH, ASSETS_PATH, get_html_path, get_png_path
+from .param_config import config, get_html_path, get_png_path
 
 # Constants
 ASSETS_SUBFOLDER_NAME = "plot_assets"  # Relative path from results directory
@@ -660,7 +660,7 @@ def plot_summary_matplotlib(
         configure_plot_aesthetics(fig, ax, metadata, colormesh, central_date)
         
         # Save figure
-        output_path = get_png_path(file_stem, assets_dir)
+        output_path = config.paths.get_png_path(file_stem) #get_png_path(file_stem, assets_dir)
         plt.savefig(output_path, dpi=MATPLOTLIB_DPI)
         plt.close(fig)
         
@@ -1093,7 +1093,7 @@ def create_folium_map(
         )
         
         # Save map data
-        map_data_path = RESULTS_PATH / "map_data.geojson"
+        map_data_path = config.paths.results_path / "map_data.geojson"
         final_gdf.to_file(map_data_path, driver='GeoJSON')
         
         # Calculate map center
