@@ -3,21 +3,12 @@ model_trainer.py
 ==================
 
 ML model training, tuning, and comparison for wetting front stall prediction.
-
-This module provides:
-- Multiple model training and comparison
-- Hyperparameter tuning
-- Feature selection (statistical, permutation, SHAP)
-- Cross-validation with proper time-series handling
-- Model evaluation and visualization
-
-Author: Ron Simenhois
-Created: November 2025
 """
 
 import logging
 import json
 import joblib
+import warnings
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any, Union
@@ -30,9 +21,12 @@ from sklearn.model_selection import (
     cross_val_score, 
     TimeSeriesSplit,
     RandomizedSearchCV,
-    GridSearchCV
+    GridSearchCV,
+    train_test_split
 )
 from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.inspection import permutation_importance
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
@@ -48,11 +42,9 @@ from sklearn.ensemble import (
     ExtraTreesClassifier
 )
 from sklearn.linear_model import LogisticRegression
-from sklearn.svm import SVC
 import xgboost as xgb
 import lightgbm as lgb
 
-# Optional imports for advanced features
 try:
     import shap
     SHAP_AVAILABLE = True
@@ -68,58 +60,27 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ModelConfig:
-    """Configuration for model training."""
-    
-    # Data splitting
     test_size: float = 0.2
     validation_size: float = 0.2
     random_state: int = 42
-    
-    # Cross-validation
     cv_folds: int = 5
-    use_time_series_cv: bool = True  # Important for temporal data
-    
-    # Feature selection
+    use_time_series_cv: bool = True
     remove_low_variance: bool = True
     variance_threshold: float = 0.01
     remove_correlated: bool = True
     correlation_threshold: float = 0.95
-    
-    # Scaling
     scale_features: bool = True
-    
-    # Hyperparameter tuning
     tune_hyperparameters: bool = True
-    tuning_method: str = 'random'  # 'random' or 'grid'
+    tuning_method: str = 'random'
     n_iter_random: int = 50
     tuning_cv_folds: int = 3
-    
-    # Model selection
     models_to_train: List[str] = field(default_factory=lambda: [
-        'random_forest',
-        'gradient_boosting', 
-        'xgboost',
-        'lightgbm',
-        'logistic_regression'
+        'random_forest', 'gradient_boosting', 'xgboost', 'lightgbm'
     ])
-    
-    # Feature importance
     compute_permutation_importance: bool = True
     compute_shap_values: bool = True
-    n_permutations: int = 10
-
-
-# ---------------------------------------------------------------------------
-# Model Definitions
-# ---------------------------------------------------------------------------
 
 def get_model_configs() -> Dict[str, Dict[str, Any]]:
-    """
-    Get default model configurations and hyperparameter search spaces.
-    
-    Returns:
-        Dictionary mapping model names to their configs
-    """
     configs = {
         'random_forest': {
             'model': RandomForestClassifier(random_state=42, n_jobs=-1),
@@ -144,11 +105,7 @@ def get_model_configs() -> Dict[str, Dict[str, Any]]:
             }
         },
         'xgboost': {
-            'model': xgb.XGBClassifier(
-                random_state=42,
-                n_jobs=-1,
-                eval_metric='logloss'
-            ),
+            'model': xgb.XGBClassifier(random_state=42, n_jobs=-1, eval_metric='logloss'),
             'param_grid': {
                 'n_estimators': [100, 200, 300],
                 'learning_rate': [0.01, 0.05, 0.1, 0.2],
@@ -161,11 +118,7 @@ def get_model_configs() -> Dict[str, Dict[str, Any]]:
             }
         },
         'lightgbm': {
-            'model': lgb.LGBMClassifier(
-                random_state=42,
-                n_jobs=1, # Let RandomizedSearchCV can handle the parallelization
-                verbose=-1
-            ),
+            'model': lgb.LGBMClassifier(random_state=42, n_jobs=1, verbose=-1),
             'param_grid': {
                 'n_estimators': [100, 200, 300],
                 'learning_rate': [0.01, 0.05, 0.1, 0.2],
@@ -178,669 +131,240 @@ def get_model_configs() -> Dict[str, Dict[str, Any]]:
             }
         },
         'logistic_regression': {
-            'model': LogisticRegression(
-                random_state=42,
-                max_iter=1000,
-                n_jobs=-1
-            ),
+            'model': LogisticRegression(random_state=42, max_iter=1000, n_jobs=-1),
             'param_grid': {
                 'C': [0.001, 0.01, 0.1, 1, 10, 100],
-                'penalty': ['l1', 'l2', 'elasticnet', None],
+                'penalty': ['l1', 'l2'],
                 'solver': ['liblinear', 'saga'],
-                'class_weight': ['balanced', None]
-            }
-        },
-        'extra_trees': {
-            'model': ExtraTreesClassifier(random_state=42, n_jobs=-1),
-            'param_grid': {
-                'n_estimators': [100, 200, 300],
-                'max_depth': [10, 20, 30, None],
-                'min_samples_split': [2, 5, 10],
-                'min_samples_leaf': [1, 2, 4],
-                'max_features': ['sqrt', 'log2', 0.3],
                 'class_weight': ['balanced', None]
             }
         }
     }
-    
     return configs
-
 
 # ---------------------------------------------------------------------------
 # Feature Selection
 # ---------------------------------------------------------------------------
 
 class FeatureSelector:
-    """
-    Comprehensive feature selection using multiple strategies.
-    """
-    
-    def __init__(
-        self,
-        variance_threshold: float = 0.01,
-        correlation_threshold: float = 0.95
-    ):
+    def __init__(self, variance_threshold: float = 0.01, correlation_threshold: float = 0.95):
         self.variance_threshold = variance_threshold
         self.correlation_threshold = correlation_threshold
-        self.removed_features_ = {}
-        self.feature_stats_ = {}
     
-    def remove_low_variance(
-        self,
-        X: pd.DataFrame,
-        y: pd.Series = None
-    ) -> pd.DataFrame:
-        """Remove features with low variance."""
-        variances = X.var()
+    def remove_low_variance(self, X: pd.DataFrame) -> pd.DataFrame:
+        if X.isnull().any().any():
+            variances = X.fillna(X.median()).var()
+        else:
+            variances = X.var()
         low_var = variances[variances < self.variance_threshold].index.tolist()
-        
-        self.removed_features_['low_variance'] = low_var
-        self.feature_stats_['variances'] = variances
-        
-        logger.info(f"Removed {len(low_var)} low-variance features")
+        if low_var:
+            logger.info(f"Removed {len(low_var)} low-variance features")
         return X.drop(columns=low_var)
     
-    def remove_correlated(
-        self,
-        X: pd.DataFrame,
-        y: pd.Series = None
-    ) -> pd.DataFrame:
-        """Remove highly correlated features."""
-        corr_matrix = X.corr().abs()
-        
-        # Get upper triangle of correlation matrix
-        upper = corr_matrix.where(
-            np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
-        )
-        
-        # Find features with correlation > threshold
-        to_drop = [
-            column for column in upper.columns
-            if any(upper[column] > self.correlation_threshold)
-        ]
-        
-        self.removed_features_['high_correlation'] = to_drop
-        self.feature_stats_['correlation_matrix'] = corr_matrix
-        
-        logger.info(f"Removed {len(to_drop)} highly correlated features")
+    def remove_correlated(self, X: pd.DataFrame) -> pd.DataFrame:
+        X_calc = X.fillna(X.median()) if X.isnull().any().any() else X
+        corr_matrix = X_calc.corr().abs()
+        upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+        to_drop = [column for column in upper.columns if any(upper[column] > self.correlation_threshold)]
+        if to_drop:
+            logger.info(f"Removed {len(to_drop)} highly correlated features")
         return X.drop(columns=to_drop)
-    
-    def get_feature_importance_scores(
-        self,
-        X: pd.DataFrame,
-        y: pd.Series,
-        method: str = 'mutual_info'
-    ) -> pd.Series:
-        """
-        Get feature importance scores using various methods.
-        
-        Args:
-            X: Feature matrix
-            y: Target variable
-            method: 'mutual_info', 'chi2', or 'f_classif'
-        """
-        from sklearn.feature_selection import (
-            mutual_info_classif,
-            chi2,
-            f_classif
-        )
-        
-        if method == 'mutual_info':
-            scores = mutual_info_classif(X, y, random_state=42)
-        elif method == 'chi2':
-            # Ensure non-negative features for chi2
-            X_nonneg = X - X.min() + 1e-5
-            scores, _ = chi2(X_nonneg, y)
-        elif method == 'f_classif':
-            scores, _ = f_classif(X, y)
-        else:
-            raise ValueError(f"Unknown method: {method}")
-        
-        return pd.Series(scores, index=X.columns).sort_values(ascending=False)
-    
-    def select_k_best(
-        self,
-        X: pd.DataFrame,
-        y: pd.Series,
-        k: int = 50,
-        method: str = 'mutual_info'
-    ) -> pd.DataFrame:
-        """Select top k features by importance score."""
-        scores = self.get_feature_importance_scores(X, y, method)
-        top_features = scores.head(k).index.tolist()
-        
-        removed = set(X.columns) - set(top_features)
-        self.removed_features_[f'select_{k}_best'] = list(removed)
-        self.feature_stats_[f'{method}_scores'] = scores
-        
-        logger.info(f"Selected top {k} features by {method}")
-        return X[top_features]
-
 
 # ---------------------------------------------------------------------------
 # Model Trainer
 # ---------------------------------------------------------------------------
 
 class ModelTrainer:
-    """
-    Train, tune, and compare multiple ML models.
-    """
-    
     def __init__(self, config: Optional[ModelConfig] = None):
-        """
-        Initialize trainer.
-        
-        Args:
-            config: Training configuration
-        """
         self.config = config or ModelConfig()
         self.models_ = {}
         self.results_ = {}
         self.scaler_ = None
+        self.imputer_ = None
         self.feature_selector_ = None
         self.feature_names_ = None
         self.best_model_name_ = None
         self.best_model_ = None
-        self.X_train: pd.DataFrame = pd.DataFrame()
-        self.y_train: pd.Series = pd.Series(dtype=float)
-        self.X_val: pd.DataFrame = pd.DataFrame()
-        self.y_val: pd.Series = pd.Series(dtype=float)
-        self.X_test: pd.DataFrame = pd.DataFrame()
-        self.y_test: pd.Series = pd.Series(dtype=float)
-
-    
-    def prepare_data(
-        self,
-        X: pd.DataFrame,
-        y: pd.Series,
-        feature_selection: bool = True
-    ) -> Tuple[pd.DataFrame, pd.Series]:
-        """
-        Prepare data for training.
         
-        Args:
-            X: Feature matrix
-            y: Target variable
-            feature_selection: Whether to perform feature selection
-            
-        Returns:
-            Processed X and y
-        """
+        self.X_train = pd.DataFrame()
+        self.y_train = pd.Series(dtype=float)
+        self.X_val = pd.DataFrame()
+        self.y_val = pd.Series(dtype=float)
+        self.X_test = pd.DataFrame()
+        self.y_test = pd.Series(dtype=float)
+
+    def prepare_data(self, X: pd.DataFrame, y: pd.Series) -> Tuple[pd.DataFrame, pd.Series]:
         logger.info(f"Initial features: {X.shape[1]}")
         
-        # Handle missing values
-        if X.isnull().any().any():
-            logger.warning("Missing values detected - imputing with median")
+        # 1. Feature Selection
+        self.feature_selector_ = FeatureSelector(
+            variance_threshold=self.config.variance_threshold,
+            correlation_threshold=self.config.correlation_threshold
+        )
+        if self.config.remove_low_variance:
+            X = self.feature_selector_.remove_low_variance(X)
+        if self.config.remove_correlated:
+            X = self.feature_selector_.remove_correlated(X)
             
-            # Calculate medians
-            medians = X.median()
-            
-            # Find columns that are all NaN (median is NaN)
-            all_nan_cols = medians[medians.isnull()].index.tolist()
-            if all_nan_cols:
-                logger.warning(f"Columns with all NaN values detected: {all_nan_cols}. Imputing with 0.")
-                # For all-NaN columns, fill median with 0
-                medians = medians.fillna(0)
-                
-            X = X.fillna(medians)
+        # 2. Remove 100% NaN Columns
+        all_nan_cols = X.columns[X.isna().all()].tolist()
+        if all_nan_cols:
+            logger.warning(f"Dropping {len(all_nan_cols)} columns that are 100% NaN")
+            X = X.drop(columns=all_nan_cols)
 
-            # Re-check for any remaining NaNs (should not happen, but good practice)
-            if X.isnull().any().any():
-                logger.error("NaN values still present after imputation. Imputing remaining with 0.")
-                X = X.fillna(0)
+        self.feature_names_ = X.columns.tolist()
+        logger.info(f"Selected {len(self.feature_names_)} features")
+
+        # 3. Impute
+        self.imputer_ = SimpleImputer(strategy='median')
+        X_imputed = self.imputer_.fit_transform(X)
+        X = pd.DataFrame(X_imputed, columns=self.feature_names_, index=X.index)
         
-        # Feature selection
-        if feature_selection:
-            self.feature_selector_ = FeatureSelector(
-                variance_threshold=self.config.variance_threshold,
-                correlation_threshold=self.config.correlation_threshold
-            )
-            
-            if self.config.remove_low_variance:
-                X = self.feature_selector_.remove_low_variance(X, y)
-            
-            if self.config.remove_correlated:
-                X = self.feature_selector_.remove_correlated(X, y)
-            
-            logger.info(f"After feature selection: {X.shape[1]} features")
-        
-        # Scale features
+        # 4. Scale
         if self.config.scale_features:
             self.scaler_ = StandardScaler()
-            
-            # Check for constant columns (variance=0) *after* imputation and selection
-            # These columns will cause StandardScaler to fail
             constant_cols = X.columns[X.var() == 0].tolist()
             if constant_cols:
-                logger.warning(f"Removing {len(constant_cols)} constant columns before scaling: {constant_cols}")
                 X = X.drop(columns=constant_cols)
-
-            if X.shape[1] == 0:
-                logger.error("No features left after preprocessing. Aborting.")
-                # Return empty dataframes to avoid crashing
-                return pd.DataFrame(), pd.Series(dtype=y.dtype)
+                self.feature_names_ = X.columns.tolist()
             
+            if X.shape[1] == 0:
+                raise ValueError("No features left after preprocessing.")
+                
             X_scaled = self.scaler_.fit_transform(X)
-            X = pd.DataFrame(X_scaled, columns=X.columns, index=X.index)
+            X = pd.DataFrame(X_scaled, columns=self.feature_names_, index=X.index)
             logger.info("Features scaled")
         
-        self.feature_names_ = X.columns.tolist()
         return X, y
     
-    def split_data(
-        self,
-        X: pd.DataFrame,
-        y: pd.Series
-    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, 
-               pd.Series, pd.Series, pd.Series]:
-        """
-        Split data into train/val/test sets.
-        
-        Returns:
-            X_train, X_val, X_test, y_train, y_val, y_test
-        """
-        from sklearn.model_selection import train_test_split
-        
-        # First split: train+val vs test
+    def split_data(self, X: pd.DataFrame, y: pd.Series):
         X_temp, X_test, y_temp, y_test = train_test_split(
-            X, y,
-            test_size=self.config.test_size,
-            random_state=self.config.random_state,
-            stratify=y
+            X, y, test_size=self.config.test_size,
+            random_state=self.config.random_state, stratify=y
         )
-        
-        # Second split: train vs val
-        val_size_adjusted = self.config.validation_size / (1 - self.config.test_size)
+        val_size_adj = self.config.validation_size / (1 - self.config.test_size)
         X_train, X_val, y_train, y_val = train_test_split(
-            X_temp, y_temp,
-            test_size=val_size_adjusted,
-            random_state=self.config.random_state,
-            stratify=y_temp
+            X_temp, y_temp, test_size=val_size_adj,
+            random_state=self.config.random_state, stratify=y_temp
         )
-        
-        logger.info(f"Data split: train={len(X_train)}, "
-                   f"val={len(X_val)}, test={len(X_test)}")
-        
         return X_train, X_val, X_test, y_train, y_val, y_test
     
-    def tune_hyperparameters(
-        self,
-        model,
-        param_grid: Dict,
-        X_train: pd.DataFrame,
-        y_train: pd.Series
-    ):
-        """
-        Tune model hyperparameters.
-        
-        Returns:
-            Best estimator
-        """
+    def tune_hyperparameters(self, model, param_grid, X_train, y_train):
         cv = TimeSeriesSplit(n_splits=self.config.tuning_cv_folds) \
-             if self.config.use_time_series_cv \
-             else self.config.tuning_cv_folds
+             if self.config.use_time_series_cv else self.config.tuning_cv_folds
         
         if self.config.tuning_method == 'random':
             search = RandomizedSearchCV(
-                model,
-                param_grid,
-                n_iter=self.config.n_iter_random,
-                cv=cv,
-                scoring='roc_auc',
-                n_jobs=-1,
-                random_state=self.config.random_state,
-                verbose=1
+                model, param_grid, n_iter=self.config.n_iter_random,
+                cv=cv, scoring='roc_auc', n_jobs=-1,
+                random_state=self.config.random_state, verbose=1
             )
-        else:  # grid
+        else:
             search = GridSearchCV(
-                model,
-                param_grid,
-                cv=cv,
-                scoring='roc_auc',
-                n_jobs=-1,
-                verbose=1
+                model, param_grid, cv=cv, scoring='roc_auc',
+                n_jobs=-1, verbose=1
             )
-        
         search.fit(X_train, y_train)
-        logger.info(f"Best params: {search.best_params_}")
-        logger.info(f"Best CV score: {search.best_score_:.4f}")
-        
         return search.best_estimator_
     
-    def train_model(
-        self,
-        model_name: str,
-        X_train: pd.DataFrame,
-        y_train: pd.Series,
-        X_val: pd.DataFrame,
-        y_val: pd.Series
-    ) -> Dict[str, Any]:
-        """Train a single model and evaluate it."""
+    def train_model(self, model_name, X_train, y_train, X_val, y_val):
         logger.info(f"Training {model_name}...")
+        configs = get_model_configs()
+        model = configs[model_name]['model']
         
-        model_configs = get_model_configs()
-        if model_name not in model_configs:
-            raise ValueError(f"Unknown model: {model_name}")
-        
-        config = model_configs[model_name]
-        model = config['model']
-        
-        # Tune hyperparameters if requested
         if self.config.tune_hyperparameters:
             model = self.tune_hyperparameters(
-                model,
-                config['param_grid'],
-                X_train,
-                y_train
+                model, configs[model_name]['param_grid'], X_train, y_train
             )
         else:
             model.fit(X_train, y_train)
         
-        # Evaluate on validation set
-        y_val_pred = model.predict(X_val)
-        y_val_proba = model.predict_proba(X_val)[:, 1] if hasattr(model, 'predict_proba') else None
+        y_pred = model.predict(X_val)
+        y_proba = model.predict_proba(X_val)[:, 1] if hasattr(model, 'predict_proba') else None
         
-        results = {
+        res = {
             'model': model,
-            'model_name': model_name,
-            'params': model.get_params(),
-            'accuracy': accuracy_score(y_val, y_val_pred),
-            'precision': precision_score(y_val, y_val_pred, zero_division=0),
-            'recall': recall_score(y_val, y_val_pred, zero_division=0),
-            'f1': f1_score(y_val, y_val_pred, zero_division=0),
-            'confusion_matrix': confusion_matrix(y_val, y_val_pred)
+            'accuracy': accuracy_score(y_val, y_pred),
+            'f1': f1_score(y_val, y_pred, zero_division=0),
+            'roc_auc': roc_auc_score(y_val, y_proba) if y_proba is not None else 0
         }
-        
-        if y_val_proba is not None:
-            results['roc_auc'] = roc_auc_score(y_val, y_val_proba)
-            results['y_val_proba'] = y_val_proba
-        
-        logger.info(f"{model_name} - Val ROC-AUC: {results.get('roc_auc', 'N/A'):.4f}")
-        
-        return results
+        logger.info(f"{model_name} Val AUC: {res['roc_auc']:.4f}")
+        return res
     
-    def train_all_models(
-        self,
-        X_train: pd.DataFrame,
-        y_train: pd.Series,
-        X_val: pd.DataFrame,
-        y_val: pd.Series
-    ) -> Dict[str, Dict[str, Any]]:
-        """Train all configured models."""
-        results = {}
-        
-        for model_name in self.config.models_to_train:
-            try:
-                results[model_name] = self.train_model(
-                    model_name,
-                    X_train,
-                    y_train,
-                    X_val,
-                    y_val
-                )
-            except Exception as e:
-                logger.error(f"Error training {model_name}: {e}")
-                continue
-        
-        return results
-    
-    def select_best_model(
-        self,
-        results: Dict[str, Dict[str, Any]],
-        metric: str = 'roc_auc'
-    ) -> Tuple[str, Any]:
-        """Select the best model based on a metric."""
-        best_score = -np.inf
-        best_name = None
-        
-        for name, res in results.items():
-            if metric in res and res[metric] > best_score:
-                best_score = res[metric]
-                best_name = name
-        
-        logger.info(f"Best model: {best_name} ({metric}={best_score:.4f})")
-        return best_name, results[best_name]['model']
-    
-    def evaluate_test_set(
-        self,
-        model,
-        X_test: pd.DataFrame,
-        y_test: pd.Series
-    ) -> Dict[str, Any]:
-        """Final evaluation on test set."""
-        y_pred = model.predict(X_test)
-        y_proba = model.predict_proba(X_test)[:, 1] if hasattr(model, 'predict_proba') else None
-        
-        results = {
-            'accuracy': accuracy_score(y_test, y_pred),
-            'precision': precision_score(y_test, y_pred, zero_division=0),
-            'recall': recall_score(y_test, y_pred, zero_division=0),
-            'f1': f1_score(y_test, y_pred, zero_division=0),
-            'confusion_matrix': confusion_matrix(y_test, y_pred),
-            'classification_report': classification_report(y_test, y_pred)
-        }
-        
-        if y_proba is not None:
-            results['roc_auc'] = roc_auc_score(y_test, y_proba)
-        
-        return results
-    
-    def fit(
-        self,
-        X: pd.DataFrame,
-        y: pd.Series
-    ) -> "ModelTrainer":
-        """
-        Complete training pipeline.
-        
-        Args:
-            X: Feature matrix
-            y: Target variable (binary: 0=no stall, 1=stall)
-            
-        Returns:
-            Self for chaining
-        """
-        logger.info("Starting model training pipeline")
-        
-        # Prepare data
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> "ModelTrainer":
         X, y = self.prepare_data(X, y)
-        
-        # Split data
         X_train, X_val, X_test, y_train, y_val, y_test = self.split_data(X, y)
         
-        # Train all models
-        self.results_ = self.train_all_models(X_train, y_train, X_val, y_val)
-        
-        # Store split data as class attributes
         self.X_train, self.y_train = X_train, y_train
         self.X_val, self.y_val = X_val, y_val
         self.X_test, self.y_test = X_test, y_test
         
-        # Select best model
-        self.best_model_name_, self.best_model_ = self.select_best_model(
-            self.results_
-        )
+        for name in self.config.models_to_train:
+            try:
+                self.results_[name] = self.train_model(name, X_train, y_train, X_val, y_val)
+            except Exception as e:
+                logger.error(f"Failed to train {name}: {e}")
         
-        # Final evaluation on test set
-        test_results = self.evaluate_test_set(self.best_model_, X_test, y_test)
-        self.results_[f'{self.best_model_name_}_test'] = test_results
+        best_score = -1
+        for name, res in self.results_.items():
+            if res['roc_auc'] > best_score:
+                best_score = res['roc_auc']
+                self.best_model_name_ = name
+                self.best_model_ = res['model']
         
-        logger.info(f"Test set results:\n{test_results['classification_report']}")
+        logger.info(f"Best model: {self.best_model_name_}")
+        test_pred = self.best_model_.predict(X_test)
+        test_proba = self.best_model_.predict_proba(X_test)[:, 1]
         
+        self.results_[f'{self.best_model_name_}_test'] = {
+            'accuracy': accuracy_score(y_test, test_pred),
+            'roc_auc': roc_auc_score(y_test, test_proba),
+            'report': classification_report(y_test, test_pred)
+        }
         return self
     
-    def predict(self, X: pd.DataFrame
-    ) -> np.ndarray:
-            """Predict using the best model."""
-            if self.best_model_ is None:
-                raise ValueError("No model trained. Call fit() first.")
+    def _preprocess_for_prediction(self, X: pd.DataFrame) -> pd.DataFrame:
+        if self.feature_names_ is None:
+            raise ValueError("Model not trained.")
+        missing = set(self.feature_names_) - set(X.columns)
+        if missing:
+            for c in missing: X[c] = np.nan
+        X = X[self.feature_names_]
+        if self.imputer_:
+            X = pd.DataFrame(self.imputer_.transform(X), columns=self.feature_names_, index=X.index)
+        if self.scaler_:
+            X = pd.DataFrame(self.scaler_.transform(X), columns=self.feature_names_, index=X.index)
+        return X
 
-            # 1. Select only the features used during training
-            if self.feature_names_ is not None:
-                # Ensure all required features exist
-                missing = set(self.feature_names_) - set(X.columns)
-                if missing:
-                    raise ValueError(f"Input data is missing columns: {missing}")
-                # Filter and reorder columns to match training data
-                X = X[self.feature_names_]
-
-            # 2. Apply scaling
-            if self.scaler_ is not None:
-                X_scaled = self.scaler_.transform(X)
-                X = pd.DataFrame(X_scaled, columns=X.columns, index=X.index)
-            
-            return self.best_model_.predict(X)
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        if self.best_model_ is None: raise ValueError("No model loaded.")
+        X = self._preprocess_for_prediction(X)
+        return self.best_model_.predict(X)
     
-    def predict_proba(self, X: pd.DataFrame
-    ) -> np.ndarray:
-        """Predict probabilities using the best model."""
-        if self.best_model_ is None:
-            raise ValueError("No model trained. Call fit() first.")
-
-        # 1. Select only the features used during training
-        if self.feature_names_ is not None:
-            # Ensure all required features exist
-            missing = set(self.feature_names_) - set(X.columns)
-            if missing:
-                raise ValueError(f"Input data is missing columns: {missing}")
-            # Filter and reorder columns to match training data
-            X = X[self.feature_names_]
-
-        # 2. Apply scaling
-        if self.scaler_ is not None:
-            X_scaled = self.scaler_.transform(X)
-            X = pd.DataFrame(X_scaled, columns=X.columns, index=X.index)
-        
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        if self.best_model_ is None: raise ValueError("No model loaded.")
+        X = self._preprocess_for_prediction(X)
         return self.best_model_.predict_proba(X)
     
     def save_model(self, save_dir: Union[str, Path]) -> None:
-        """
-        Save trained model, scaler, feature names, and configuration.
-        
-        Args:
-            save_dir: Directory to save model artifacts
-        """
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
-        
-        if self.best_model_ is None:
-            raise ValueError("No model trained. Call fit() first.")
-        
-        logger.info(f"Saving model to {save_dir}")
-        
-        # Save the trained model
-        model_path = save_dir / 'model.joblib'
-        joblib.dump(self.best_model_, model_path)
-        logger.info(f"  Saved model: {model_path}")
-        
-        # Save the scaler (if used)
-        if self.scaler_ is not None:
-            scaler_path = save_dir / 'scaler.joblib'
-            joblib.dump(self.scaler_, scaler_path)
-            logger.info(f"  Saved scaler: {scaler_path}")
-        
-        # Save feature names
-        features_path = save_dir / 'feature_names.json'
-        with open(features_path, 'w') as f:
+        joblib.dump(self.best_model_, save_dir / 'model.joblib')
+        if self.scaler_: joblib.dump(self.scaler_, save_dir / 'scaler.joblib')
+        if self.imputer_: joblib.dump(self.imputer_, save_dir / 'imputer.joblib')
+        with open(save_dir / 'feature_names.json', 'w') as f:
             json.dump(self.feature_names_, f, indent=2)
-        logger.info(f"  Saved feature names: {features_path}")
-        
-        # Save model configuration
-        config_dict = asdict(self.config)
-        config_path = save_dir / 'model_config.json'
-        with open(config_path, 'w') as f:
-            json.dump(config_dict, f, indent=2)
-        logger.info(f"  Saved configuration: {config_path}")
-        
-        # Save metadata
-        metadata = {
-            'best_model_name': self.best_model_name_,
-            'n_features': len(self.feature_names_) if self.feature_names_ else 0,
-            'model_type': type(self.best_model_).__name__,
-            'has_scaler': self.scaler_ is not None,
-        }
-        
-        # Add best model parameters if available
-        if hasattr(self.best_model_, 'get_params'):
-            metadata['model_params'] = self.best_model_.get_params()
-        
-        metadata_path = save_dir / 'metadata.json'
-        with open(metadata_path, 'w') as f:
-            # Convert any non-serializable objects to strings
-            def convert(obj):
-                if isinstance(obj, (np.integer, np.floating)):
-                    return obj.item()
-                elif isinstance(obj, np.ndarray):
-                    return obj.tolist()
-                elif isinstance(obj, Path):
-                    return str(obj)
-                elif obj is None or isinstance(obj, (bool, int, float, str)):
-                    return obj
-                else:
-                    return str(obj)
+        with open(save_dir / 'metadata.json', 'w') as f:
+            json.dump({'best_model': self.best_model_name_}, f, indent=2)
             
-            metadata_serializable = {k: convert(v) if not isinstance(v, dict) else 
-                                    {kk: convert(vv) for kk, vv in v.items()}
-                                    for k, v in metadata.items()}
-            json.dump(metadata_serializable, f, indent=2)
-        logger.info(f"  Saved metadata: {metadata_path}")
-        
-        logger.info(f"Model saved successfully to {save_dir}")
-    
     @classmethod
     def load_model(cls, load_dir: Union[str, Path]) -> 'ModelTrainer':
-        """
-        Load a trained model from disk.
-        
-        Args:
-            load_dir: Directory containing saved model artifacts
-            
-        Returns:
-            ModelTrainer instance with loaded model
-        """
         load_dir = Path(load_dir)
-        
-        if not load_dir.exists():
-            raise ValueError(f"Directory {load_dir} does not exist")
-        
-        logger.info(f"Loading model from {load_dir}")
-        
-        # Load configuration
-        config_path = load_dir / 'model_config.json'
-        with open(config_path, 'r') as f:
-            config_dict = json.load(f)
-        config = ModelConfig(**config_dict)
-        
-        # Create trainer instance
-        trainer = cls(config)
-        
-        # Load the model
-        model_path = load_dir / 'model.joblib'
-        trainer.best_model_ = joblib.load(model_path)
-        logger.info(f"  Loaded model: {model_path}")
-        
-        # Load scaler if it exists
-        scaler_path = load_dir / 'scaler.joblib'
-        if scaler_path.exists():
-            trainer.scaler_ = joblib.load(scaler_path)
-            logger.info(f"  Loaded scaler: {scaler_path}")
-        
-        # Load feature names
-        features_path = load_dir / 'feature_names.json'
-        with open(features_path, 'r') as f:
-            trainer.feature_names_ = json.load(f)
-        logger.info(f"  Loaded {len(trainer.feature_names_)} feature names")
-        
-        # Load metadata
-        metadata_path = load_dir / 'metadata.json'
-        with open(metadata_path, 'r') as f:
-            metadata = json.load(f)
-        trainer.best_model_name_ = metadata['best_model_name']
-        
-        logger.info(f"Model loaded successfully: {trainer.best_model_name_}")
-        logger.info(f"  Features: {len(trainer.feature_names_)}")
-        logger.info(f"  Scaler: {'Yes' if trainer.scaler_ is not None else 'No'}")
-        
+        trainer = cls()
+        trainer.best_model_ = joblib.load(load_dir / 'model.joblib')
+        if (load_dir / 'scaler.joblib').exists(): trainer.scaler_ = joblib.load(load_dir / 'scaler.joblib')
+        if (load_dir / 'imputer.joblib').exists(): trainer.imputer_ = joblib.load(load_dir / 'imputer.joblib')
+        with open(load_dir / 'feature_names.json', 'r') as f: trainer.feature_names_ = json.load(f)
         return trainer
 
 # ---------------------------------------------------------------------------
@@ -848,322 +372,108 @@ class ModelTrainer:
 # ---------------------------------------------------------------------------
 
 class FeatureImportanceAnalyzer:
-    """
-    Analyze feature importance using multiple methods including SHAP.
-    """
-    
-    def __init__(self, model, X: pd.DataFrame, feature_names: List[str]):
-        """
-        Initialize analyzer.
-        
-        Args:
-            model: Trained model
-            X: Feature matrix used for training
-            feature_names: Names of features
-        """
+    def __init__(self, model, X, feature_names):
         self.model = model
         self.X = X
         self.feature_names = feature_names
         self.importance_scores_ = {}
-    
-    def get_builtin_importance(self) -> Optional[pd.Series]:
-        """Get built-in feature importance if available."""
+
+    def analyze_all(self, X_val, y_val, compute_shap=True, compute_permutation=True, shap_sample_size=100):
+        res = {}
         if hasattr(self.model, 'feature_importances_'):
-            importances = self.model.feature_importances_
-            return pd.Series(importances, index=self.feature_names).sort_values(ascending=False)
-        return None
-    
-    def get_permutation_importance(
-        self,
-        X_val: pd.DataFrame,
-        y_val: pd.Series,
-        n_repeats: int = 10
-    ) -> pd.DataFrame:
-        """
-        Calculate permutation importance.
+            res['builtin'] = pd.Series(self.model.feature_importances_, index=self.feature_names).sort_values(ascending=False)
         
-        Returns:
-            DataFrame with importance scores and std
-        """
-        from sklearn.inspection import permutation_importance
-        
-        logger.info("Computing permutation importance...")
-        result = permutation_importance(
-            self.model,
-            X_val,
-            y_val,
-            n_repeats=n_repeats,
-            random_state=42,
-            n_jobs=-1
-        )
-        
-        importance_df = pd.DataFrame({
-            'feature': self.feature_names,
-            'importance_mean': result.importances_mean,
-            'importance_std': result.importances_std
-        }).sort_values('importance_mean', ascending=False)
-        
-        return importance_df
-    
-    def get_shap_values(
-        self,
-        X_sample: Optional[pd.DataFrame] = None,
-        sample_size: int = 100
-    ) -> Tuple[Any, np.ndarray]:
-        """
-        Calculate SHAP values.
-        
-        Args:
-            X_sample: Sample data for SHAP (use subset for speed)
-            sample_size: Number of samples to use
-            
-        Returns:
-            Tuple of (explainer, shap_values)
-        """
-        if not SHAP_AVAILABLE:
-            raise ImportError("SHAP not installed. Install with: pip install shap")
-        
-        # Sample data for computational efficiency
-        if X_sample is None:
-            if len(self.X) > sample_size:
-                X_sample = self.X.sample(n=sample_size, random_state=42)
-            else:
-                X_sample = self.X
-        
-        logger.info(f"Computing SHAP values for {len(X_sample)} samples...")
-        
-        # Choose appropriate explainer based on model type
-        if isinstance(self.model, (RandomForestClassifier, ExtraTreesClassifier, 
-                                  GradientBoostingClassifier)):
-            explainer = shap.TreeExplainer(self.model)
-        elif isinstance(self.model, (xgb.XGBClassifier, lgb.LGBMClassifier)):
-            explainer = shap.TreeExplainer(self.model)
-        else:
-            # Use KernelExplainer for other models (slower)
-            explainer = shap.KernelExplainer(
-                self.model.predict_proba,
-                shap.sample(self.X, 100)
-            )
-        
-        shap_values = explainer.shap_values(X_sample)
-        
-        # For binary classification, some models return list of arrays
-        if isinstance(shap_values, list):
-            shap_values = shap_values[1]  # Use positive class
-        
-        return explainer, shap_values
-    
-    def get_shap_feature_importance(
-        self,
-        shap_values: np.ndarray,
-        X_sample: pd.DataFrame
-    ) -> pd.Series:
-        """
-        Get feature importance from SHAP values.
-        
-        Args:
-            shap_values: SHAP values array
-            X_sample: Sample used for SHAP
-            
-        Returns:
-            Series of mean absolute SHAP values per feature
-        """
-        # Mean absolute SHAP value for each feature
-        importance = np.abs(shap_values).mean(axis=0)
-        return pd.Series(importance, index=X_sample.columns).sort_values(ascending=False)
-    
-    def analyze_all(
-        self,
-        X_val: pd.DataFrame,
-        y_val: pd.Series,
-        compute_shap: bool = True,
-        shap_sample_size: int = 100
-    ) -> Dict[str, Any]:
-        """
-        Run all feature importance analyses.
-        
-        Returns:
-            Dictionary with all importance scores
-        """
-        results = {}
-        
-        # Built-in importance
-        builtin = self.get_builtin_importance()
-        if builtin is not None:
-            results['builtin'] = builtin
-            logger.info(f"Top 5 features (built-in): {builtin.head().to_dict()}")
-        
-        # Permutation importance
-        perm_importance = self.get_permutation_importance(X_val, y_val)
-        results['permutation'] = perm_importance
-        logger.info(f"Top 5 features (permutation): "
-                   f"{perm_importance.head()['feature'].tolist()}")
-        
-        # SHAP values
+        if compute_permutation:
+            logger.info("Computing permutation importance...")
+            try:
+                perm = permutation_importance(self.model, X_val, y_val, n_repeats=10, random_state=42, n_jobs=-1)
+                res['permutation'] = pd.Series(perm.importances_mean, index=self.feature_names).sort_values(ascending=False)
+            except Exception as e:
+                logger.warning(f"Permutation importance failed: {e}")
+
         if compute_shap and SHAP_AVAILABLE:
             try:
-                explainer, shap_values = self.get_shap_values(
-                    X_sample=X_val.head(shap_sample_size)
-                )
-                shap_importance = self.get_shap_feature_importance(
-                    shap_values,
-                    X_val.head(shap_sample_size)
-                )
-                results['shap'] = shap_importance
-                results['shap_values'] = shap_values
-                results['shap_explainer'] = explainer
-                logger.info(f"Top 5 features (SHAP): {shap_importance.head().to_dict()}")
+                # Save the specific sample used so we can plot it later!
+                X_samp = X_val.sample(min(len(X_val), shap_sample_size), random_state=42)
+                
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", message=".*LightGBM binary classifier.*")
+                    if hasattr(self.model, 'estimators_') or 'XGB' in str(type(self.model)) or 'LGBM' in str(type(self.model)):
+                        explainer = shap.TreeExplainer(self.model)
+                    else:
+                        explainer = shap.KernelExplainer(self.model.predict_proba, X_samp)
+                    
+                    shap_values = explainer.shap_values(X_samp)
+                
+                if isinstance(shap_values, list): shap_values = shap_values[1]
+                elif len(np.shape(shap_values)) == 3: shap_values = shap_values[:, :, 1]
+                
+                res['shap'] = pd.Series(np.abs(shap_values).mean(axis=0), index=self.feature_names).sort_values(ascending=False)
+                res['shap_values'] = shap_values
+                res['shap_data'] = X_samp  # <--- CRITICAL: Return the data matching the values
+                res['shap_explainer'] = explainer
             except Exception as e:
-                logger.error(f"Error computing SHAP values: {e}")
+                logger.warning(f"SHAP failed: {e}")
         
-        self.importance_scores_ = results
-        return results
-
+        self.importance_scores_ = res
+        return res
 
 # ---------------------------------------------------------------------------
 # Visualization
 # ---------------------------------------------------------------------------
 
-def plot_model_comparison(
-    results: Dict[str, Dict[str, Any]],
-    save_path: Optional[Path] = None
-):
-    """Plot comparison of model performances."""
+def plot_model_comparison(results, save_path=None):
     metrics = ['accuracy', 'precision', 'recall', 'f1', 'roc_auc']
-    
-    # Prepare data
     data = []
     for model_name, res in results.items():
-        if 'test' in model_name:
-            continue
+        if 'test' in model_name: continue
         row = {'Model': model_name}
-        for metric in metrics:
-            if metric in res:
-                row[metric] = res[metric]
+        for m in metrics:
+            if m in res: row[m] = res[m]
         data.append(row)
     
     df = pd.DataFrame(data)
-    
-    # Plot
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
     axes = axes.flatten()
-    
     for idx, metric in enumerate(metrics):
         if metric in df.columns:
             ax = axes[idx]
-            df_sorted = df.sort_values(metric, ascending=False)
-            ax.barh(df_sorted['Model'], df_sorted[metric])
-            ax.set_xlabel(metric.upper())
-            ax.set_title(f'Model Comparison - {metric.upper()}')
-            ax.grid(axis='x', alpha=0.3)
-    
-    # Remove empty subplot
+            df.sort_values(metric, ascending=False).plot(kind='barh', x='Model', y=metric, ax=ax, legend=False)
+            ax.set_title(metric.upper())
     fig.delaxes(axes[-1])
-    
     plt.tight_layout()
-    
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        logger.info(f"Saved model comparison plot to {save_path}")
-    
+    if save_path: plt.savefig(save_path, dpi=300, bbox_inches='tight')
     return fig
 
-
-def plot_feature_importance(
-    importance_dict: Dict[str, Any],
-    top_n: int = 20,
-    save_path: Optional[Path] = None
-):
-    """Plot feature importance from multiple methods."""
-    n_methods = len([k for k in importance_dict.keys() 
-                     if k not in ['shap_values', 'shap_explainer']])
+def plot_feature_importance(importance_dict, top_n=20, save_path=None):
+    methods = [k for k in importance_dict.keys() if k not in ['shap_values', 'shap_explainer', 'shap_data']]
+    if not methods: return
+    fig, axes = plt.subplots(1, len(methods), figsize=(6 * len(methods), 8))
+    if len(methods) == 1: axes = [axes]
     
-    fig, axes = plt.subplots(1, n_methods, figsize=(7 * n_methods, 8))
-    if n_methods == 1:
-        axes = [axes]
-    
-    idx = 0
-    
-    # Built-in importance
-    if 'builtin' in importance_dict:
+    for idx, method in enumerate(methods):
         ax = axes[idx]
-        top_features = importance_dict['builtin'].head(top_n)
-        ax.barh(range(len(top_features)), top_features.values)
-        ax.set_yticks(range(len(top_features)))
-        ax.set_yticklabels(top_features.index)
-        ax.set_xlabel('Importance')
-        ax.set_title('Built-in Feature Importance')
-        ax.invert_yaxis()
-        idx += 1
-    
-    # Permutation importance
-    if 'permutation' in importance_dict:
-        ax = axes[idx]
-        perm_df = importance_dict['permutation'].head(top_n)
-        ax.barh(range(len(perm_df)), perm_df['importance_mean'].values)
-        ax.set_yticks(range(len(perm_df)))
-        ax.set_yticklabels(perm_df['feature'].values)
-        ax.set_xlabel('Importance')
-        ax.set_title('Permutation Feature Importance')
-        ax.invert_yaxis()
-        idx += 1
-    
-    # SHAP importance
-    if 'shap' in importance_dict:
-        ax = axes[idx]
-        top_features = importance_dict['shap'].head(top_n)
-        ax.barh(range(len(top_features)), top_features.values)
-        ax.set_yticks(range(len(top_features)))
-        ax.set_yticklabels(top_features.index)
-        ax.set_xlabel('Mean |SHAP value|')
-        ax.set_title('SHAP Feature Importance')
-        ax.invert_yaxis()
-        idx += 1
+        series = importance_dict[method].head(top_n).iloc[::-1]
+        ax.barh(range(len(series)), series.values)
+        ax.set_yticks(range(len(series)))
+        ax.set_yticklabels(series.index)
+        ax.set_title(f'{method.title()} Importance')
     
     plt.tight_layout()
-    
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        logger.info(f"Saved feature importance plot to {save_path}")
-    
+    if save_path: plt.savefig(save_path, dpi=300, bbox_inches='tight')
     return fig
 
-
-def plot_shap_summary(
-    shap_values: np.ndarray,
-    X: pd.DataFrame,
-    save_path: Optional[Path] = None
-):
-    """Create SHAP summary plot."""
-    if not SHAP_AVAILABLE:
-        logger.warning("SHAP not available")
-        return None
-    
+def plot_shap_summary(shap_values, X, save_path=None):
+    """Create SHAP summary plot (Beeswarm)."""
+    if not SHAP_AVAILABLE: return None
     fig = plt.figure(figsize=(10, 8))
+    # Use the exact X data that generated the shap_values
     shap.summary_plot(shap_values, X, show=False)
-    
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         logger.info(f"Saved SHAP summary plot to {save_path}")
-    
     return fig
 
-
-# ---------------------------------------------------------------------------
-# Example Usage
-# ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
-    # Example workflow
     logging.basicConfig(level=logging.INFO)
-    
-    print("=" * 80)
-    print("ML Model Training and Comparison Module")
-    print("=" * 80)
-    print("\nThis module provides:")
-    print("  • Multiple model training and tuning")
-    print("  • Feature selection (statistical + SHAP)")
-    print("  • Cross-validation")
-    print("  • Comprehensive evaluation")
-    print("  • Feature importance analysis")
-    print("=" * 80)
+    print("Model Trainer Module")

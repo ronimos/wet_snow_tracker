@@ -172,18 +172,18 @@ class TestPlotLOCDetection:
         
         # Plot ML Detections
         ml_colors = {
-            'ml_0.3': ('blue', 0.2, '0.3'),
-            'ml_0.5': ('blue', 0.4, '0.5'),
-            'ml_0.7': ('blue', 0.6, '0.7'),
-            'ml_0.9': ('blue', 0.9, '0.9')
+            'ml_0.3': ('red', 0.9, '0.3', 'x'),
+            'ml_0.5': ('orange', 0.9, '0.5', 'o'),
+            'ml_0.7': ('magenta', 0.9, '0.7', 's'),
+            'ml_0.9': ('blue', 0.9, '0.9', '^'),
         }
         
-        for key, (color, alpha, thresh_label) in ml_colors.items():
+        for key, (color, alpha, thresh_label, marker) in ml_colors.items():
             if key in ml_results:
                 df = ml_results[key]
                 # df.index is timestamp, df['loc_height'] is the Y value
                 ax.scatter(df.index, df['loc_height'],
-                          color=color, s=80, marker='x',
+                          c=color, s=80, marker=marker,
                           alpha=alpha, label=f'ML (p>{thresh_label})', zorder=4)
 
         # Formatting

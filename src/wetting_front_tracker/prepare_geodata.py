@@ -42,7 +42,10 @@ from shapely import union_all
 from shapely.geometry import LinearRing, Polygon, mapping, shape
 from tqdm import tqdm
 
-from .param_config import config
+try:
+    from .param_config import config
+except ImportError: # For direct script execution
+    from param_config import config 
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)

@@ -1,0 +1,25 @@
+{
+  "test_size": 0.2,
+  "validation_size": 0.2,
+  "random_state": 42,
+  "cv_folds": 5,
+  "use_time_series_cv": true,
+  "remove_low_variance": true,
+  "variance_threshold": 0.01,
+  "remove_correlated": true,
+  "correlation_threshold": 0.95,
+  "scale_features": true,
+  "tune_hyperparameters": true,
+  "tuning_method": "random",
+  "n_iter_random": 30,
+  "tuning_cv_folds": 3,
+  "models_to_train": [
+    "random_forest",
+    "xgboost",
+    "lightgbm",
+    "gradient_boosting"
+  ],
+  "compute_permutation_importance": true,
+  "compute_shap_values": true,
+  "n_permutations": 10
+}
