@@ -60,13 +60,78 @@ except ImportError:
         MLLocDetector, 
         create_hybrid_loc_detector
     )   
-    
+  
 try:
     import diagnostic_wrapper
     diagnostic_wrapper.enable_diagnostics()
 except ImportError:
     pass
+
 logger = logging.getLogger(__name__)
+
+
+# --- Picklable Wrapper Classes (Fix for Multiprocessing Error) ---
+
+class LocResultStandardizer:
+    """
+    Wraps a detection function to ensure it always returns a list of (height, prob) tuples.
+    Defined at module level to ensure it can be pickled by multiprocessing.
+    """
+    def __init__(self, func: Callable):
+        self.func = func
+
+    def __call__(self, df: pd.DataFrame) -> list[tuple[float, float]]:
+        try:
+            res = self.func(df)
+        except Exception:
+            return []
+        
+        if res is None: return []
+        
+        if isinstance(res, dict):
+            # Handle Height directly
+            if 'loc_height' in res: 
+                return [(res['loc_height'], 1.0)]
+            # Handle Depth -> Height conversion
+            if 'loc_depth' in res and 'height' in df.columns:
+                hs = df['height'].max()
+                if pd.notna(hs):
+                    return [(hs - res['loc_depth'], 1.0)]
+        
+        if isinstance(res, tuple): return [res]
+        
+        if isinstance(res, list): return res
+
+        # Fallback for scalar return
+        try:
+            return [(float(res), 1.0)]
+        except:
+            return []
+
+class MLDetectorCallable:
+    """
+    Callable wrapper for ML-only detection.
+    Loads the detector lazily on the worker process to ensure picklability and reduce overhead.
+    """
+    def __init__(self, model_path: Path, probability_threshold: float, top_n: int):
+        self.model_path = model_path
+        self.probability_threshold = probability_threshold
+        self.top_n = top_n
+        self._detector = None
+
+    @property
+    def detector(self):
+        if self._detector is None:
+            try:
+                from .ml_loc_detector import MLLocDetector
+            except ImportError:
+                from ml_loc_detector import MLLocDetector
+            self._detector = MLLocDetector(self.model_path, self.probability_threshold)
+        return self._detector
+
+    def __call__(self, df):
+        return self.detector.find_ml_loc(df, top_n=self.top_n)
+
 
 def get_loc_detection_function(mode: str, ml_config: MLModelConfig, top_n: int = 5):
     """Select LOC detection function."""
@@ -75,51 +140,22 @@ def get_loc_detection_function(mode: str, ml_config: MLModelConfig, top_n: int =
     except ImportError:
         from wet_front_tracker import find_wet_slab_loc
     
-    # Helper to wrap single-return functions into list-return
-    def list_wrapper(func):
-        def wrapper(df):
-            try:
-                res = func(df)
-            except Exception:
-                return []
-            
-            if res is None: return []
-            
-            if isinstance(res, dict):
-                # Handle Height directly
-                if 'loc_height' in res: 
-                    return [(res['loc_height'], 1.0)]
-                # Handle Depth -> Height conversion
-                if 'loc_depth' in res and 'height' in df.columns:
-                    hs = df['height'].max()
-                    if pd.notna(hs):
-                        return [(hs - res['loc_depth'], 1.0)]
-            
-            if isinstance(res, tuple): return [res]
-            
-            # Fallback for scalar return
-            try:
-                return [(float(res), 1.0)]
-            except:
-                return []
-        return wrapper
-
     if mode == "rule_based":
         logger.info("Using rule-based LOC detection")
-        return list_wrapper(find_wet_slab_loc)
+        return LocResultStandardizer(find_wet_slab_loc)
     
     elif mode == "ml_only":
         if not ml_config.enabled or ml_config.model_path is None:
-            return list_wrapper(find_wet_slab_loc)
+            logger.warning("ML config disabled or path missing, falling back to rule-based.")
+            return LocResultStandardizer(find_wet_slab_loc)
         
         logger.info(f"Using ML-only LOC detection")
-        detector = MLLocDetector(ml_config.model_path, ml_config.probability_threshold)
-        # Return a lambda that calls find_ml_loc with top_n
-        return lambda df: detector.find_ml_loc(df, top_n=top_n)
+        return MLDetectorCallable(ml_config.model_path, ml_config.probability_threshold, top_n)
     
     elif mode == "hybrid":
         if not ml_config.enabled or ml_config.model_path is None:
-            return list_wrapper(find_wet_slab_loc)
+            logger.warning("ML config disabled or path missing, falling back to rule-based.")
+            return LocResultStandardizer(find_wet_slab_loc)
         
         logger.info(f"Using hybrid LOC detection")
         return create_hybrid_loc_detector(
@@ -130,7 +166,7 @@ def get_loc_detection_function(mode: str, ml_config: MLModelConfig, top_n: int =
             top_n=top_n
         )
     else:
-        return list_wrapper(find_wet_slab_loc)
+        return LocResultStandardizer(find_wet_slab_loc)
     
 
 def generate_pro_file_manifest(base_path: Path, manifest_path: Path):
@@ -455,10 +491,11 @@ def run_ml_data_collection(input_path: Path, output_dir: Path, central_date: dat
     )
     
     feature_config = FeatureExtractionConfig(
-        use_dynamic_lookback=True,
-        lwc_threshold_pct=1.0,
-        max_lookback_hours=72.0,
-        fallback_lookback_hours=24.0
+        lookback_hours=24.0,
+        extract_all_parameters=True,
+        compute_differences=True,
+        compute_ratios=True,
+        compute_gradients=True
     )
     
     pro_files = list(input_path.rglob('*.pro'))
@@ -468,29 +505,79 @@ def run_ml_data_collection(input_path: Path, output_dir: Path, central_date: dat
     extractor = LayerFeatureExtractor(feature_config)
     all_features = []
     
-    for pro_file in tqdm(pro_files, desc="Processing files"):
-        try:
-            from .snowpack_reader import SnowpackProfile
-            profile = SnowpackProfile(pro_file)
-            stalls = detector.detect_stalls(profile)
-            for stall in stalls:
-                features = extractor.extract_features_for_stall(profile, stall)
-                if features is not None:
-                    all_features.append(features)
-        except Exception as e:
-            logging.warning(f"Error processing {pro_file.name}: {e}")
-            continue
+    # Import data collection implementation
+    # We reuse the logic from collect_ml_data.py by calling it here would be ideal
+    # But for now, let's use a simplified version or the one imported
+    try:
+        from .ml_data_collection.collect_ml_data import collect_ml_data, MLDataCollectionConfig
+        
+        collection_config = MLDataCollectionConfig()
+        collection_config.output_dir = output_dir
+        collection_config.stall_config = stall_config
+        collection_config.feature_config = feature_config
+        # Ensure negative sampling is on by default
+        collection_config.negative_sampling_strategy = 'combined' 
+        
+        stall_df, features_df = collect_ml_data(input_path, output_dir, collection_config)
+        
+        if features_df.empty:
+            return None
+            
+        output_file = output_dir / "ml_training_dataset.csv"
+        return output_file
+        
+    except ImportError:
+        # Fallback if collect_ml_data isn't importable
+        logging.warning("Using fallback collection loop (might lack negative sampling)")
+        for pro_file in tqdm(pro_files, desc="Processing files"):
+            try:
+                from .snowpack_reader import SnowpackProfile
+                from .wet_front_tracker import wet_front_lwc
+                
+                profile = SnowpackProfile(str(pro_file))
+                
+                # Needed for stall detector
+                summary = profile.get_full_timeseries_summary(
+                    parameters_to_calculate={"wet_front_lwc": wet_front_lwc}
+                )
+                if 'wet_front_lwc' in summary.columns:
+                     summary[['wet_front_lwc_value', 'wet_front_lwc_height']] = pd.DataFrame(
+                        summary['wet_front_lwc'].tolist(), index=summary.index)
+                
+                wetting_front = summary['wet_front_lwc_height']
+                station_name = pro_file.stem
+                
+                stalls = detector.find_stalls(profile, wetting_front, station_name)
+                
+                for stall in stalls:
+                    # This only collects POSITIVE examples
+                    features = extractor.extract_features_for_interface(
+                        profile, 
+                        stall.start_time - timedelta(hours=24),
+                        stall.stall_layer_id,
+                        stall.layer_above_id,
+                        stall.layer_below_id
+                    )
+                    if features:
+                        row = stall.to_dict()
+                        row.update(features)
+                        row['stalled'] = 1
+                        all_features.append(row)
+                        
+            except Exception as e:
+                logging.warning(f"Error processing {pro_file.name}: {e}")
+                continue
     
-    if not all_features:
-        logging.error("No training data collected!")
-        return None
-    
-    df = pd.DataFrame(all_features)
-    output_file = output_dir / f"ml_training_dataset_{central_date.strftime('%Y%m%d')}.csv"
-    df.to_csv(output_file, index=False)
-    
-    logging.info(f"Collected {len(df)} examples. Saved to {output_file}")
-    return output_file
+        if not all_features:
+            logging.error("No training data collected!")
+            return None
+        
+        df = pd.DataFrame(all_features)
+        output_file = output_dir / f"ml_training_dataset_{central_date.strftime('%Y%m%d')}.csv"
+        df.to_csv(output_file, index=False)
+        
+        logging.info(f"Collected {len(df)} examples. Saved to {output_file}")
+        return output_file
 
 
 def run_ml_training(
@@ -591,6 +678,8 @@ def run_ml_training(
 
     except Exception as e:
         logging.warning(f"Could not save all plots: {e}")
+    
+    return model_dir
 
 
 def parse_args() -> argparse.Namespace:
@@ -600,7 +689,7 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("--regenerate-data", action="store_true", help="Force regeneration of all processed data.")
-    parser.add_argument("-d", "--date", dest="central_date", default="2025-05-09 12:00", help="Central date and time.")
+    parser.add_argument("-d", "--date", dest="central_date", default="2025-04-06 18:00", help="Central date and time.")
     parser.add_argument("-s", "--start", dest="start_date", help="Start date.")
     parser.add_argument("-e", "--end", dest="end_date", help="End date.")
     parser.add_argument("-i", "--input-dir", dest="input_dir", type=Path, default=None, help="Override input dir.")
