@@ -37,11 +37,11 @@ except ImportError:
 try:
     from .wet_front_tracker import (find_time_to_loc, get_highest_wet_point,
                                     get_total_snow_depth, lwc_above_weak,
-                                    wet_front_lwc, find_wet_slab_loc_bottom_half)
+                                    wet_front_lwc, find_wet_slab_loc)
 except ImportError:
     from wet_front_tracker import (find_time_to_loc, get_highest_wet_point,
                                     get_total_snow_depth, lwc_above_weak,
-                                    wet_front_lwc, find_wet_slab_loc_bottom_half)
+                                    wet_front_lwc, find_wet_slab_loc)
 try:
     from .plotting import (plot_summary_matplotlib,
                            plot_summary_plotly,
@@ -351,7 +351,7 @@ def process_single_profile(pro_file_path: Path,
     """Handles the full analysis workflow for a single polygon."""
     try:
         if loc_detector is None:
-            loc_detector = find_wet_slab_loc_bottom_half
+            loc_detector = find_wet_slab_loc
             
         profile, file_stem = _initialize_and_validate_profile(pro_file_path, aspect)
         if not profile or not profile.data or not file_stem:

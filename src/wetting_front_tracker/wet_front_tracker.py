@@ -240,31 +240,146 @@ def _find_largest_gs_diff_non_wet_top(df: pd.DataFrame) -> Tuple[Optional[float]
     return float(best_interface['gs_difference']), float(best_interface['height'])
 
 
-def find_wet_slab_loc_bottom_half(df: pd.DataFrame) -> Tuple[Optional[float], Optional[float]]:
+def find_wet_slab_loc(profile_data, min_depth_below_surface=0.20):
     """
-    Finds the wet slab LOC only within the bottom half of the snowpack.
-    
-    Weak layers in the lower part of the snowpack are often more critical
-    as they can potentially fail under the load of a larger slab.
+    Find Layer of Concern (LOC) in snowpack, excluding near-surface layers.
     
     Args:
-        df: A DataFrame representing a single day's snow profile.
-            Must contain a 'height' column.
-
+        profile_data: xarray Dataset with snowpack profile
+        min_depth_below_surface: Minimum depth from surface (meters)
+            Default is 0.20m (20cm) to exclude surface layers
+    
     Returns:
-        A tuple containing (gs_difference, height) of the LOC within the 
-        bottom half, or (None, None) if no suitable layer is found.
+        Dictionary with LOC properties or None
     """
-    if not _validate_dataframe(df, ['height']):
-        return None, None
-
-    total_depth = df['height'].max()
-    mid_point = total_depth / 2
-
-    # Filter to only the lower half
-    bottom_half_df = df[df['height'] <= mid_point].copy()
-
-    return find_wet_slab_loc(bottom_half_df)
+    from .snowpack_reader import SnowpackProfile
+    
+    # Get total snow depth
+    hs = get_total_snow_depth(profile_data)
+    
+    if hs < min_depth_below_surface:
+        logger.debug(f"Snow too shallow: {hs:.2f}m < {min_depth_below_surface:.2f}m")
+        return None
+    
+    # Define search region (HEIGHT from ground, not DEPTH from surface)
+    # Height = distance from ground up
+    # Depth = distance from surface down
+    # Relationship: depth = hs - height
+    
+    max_search_height = hs - min_depth_below_surface  # Top of search (20cm below surface)
+    min_search_height = 0  # Ground
+    
+    logger.debug(f"Searching between {min_search_height:.2f}m (ground) and "
+                f"{max_search_height:.2f}m (hs={hs:.2f}m - 0.20m)")
+    
+    # Get last profile (most recent)
+    last_timestamp = profile_data.timestamp.values[-1]
+    last_profile = profile_data.sel(timestamp=last_timestamp)
+    
+    # Convert to DataFrame
+    df = last_profile.to_dataframe().reset_index()
+    
+    # Remove timestamp if present
+    if 'timestamp' in df.columns:
+        df = df.drop(columns=['timestamp'])
+    
+    # Filter to search region
+    df_search = df[
+        (df['height'] >= min_search_height) & 
+        (df['height'] <= max_search_height)
+    ].copy()
+    
+    if df_search.empty:
+        logger.debug("No layers in search region")
+        return None
+    
+    # Sort by height
+    df_search = df_search.sort_values('height')
+    
+    # Look for weak layer indicators
+    # Priority 1: Faceted crystals, depth hoar, surface hoar buried
+    weak_grain_types = ['FC', 'DH', 'SH']
+    
+    if 'grain_type' in df_search.columns:
+        weak_mask = df_search['grain_type'].isin(weak_grain_types)
+        
+        if weak_mask.any():
+            # Take deepest (lowest height) weak layer
+            weak_layers = df_search[weak_mask]
+            loc_row = weak_layers.loc[weak_layers['height'].idxmin()]
+            
+            loc_height = float(loc_row['height'])
+            loc_depth = hs - loc_height
+            
+            logger.info(f"Found weak grain LOC at {loc_depth:.2f}m depth "
+                       f"({loc_row['grain_type']}) - height {loc_height:.2f}m")
+            
+            return {
+                'loc_height': loc_height,
+                'loc_depth': loc_depth,
+                'grain_type': str(loc_row.get('grain_type', 'Unknown')),
+                'density': float(loc_row.get('density', np.nan)),
+                'temperature': float(loc_row.get('temperature', np.nan)),
+                'detection_method': 'grain_type'
+            }
+    
+    # Priority 2: Large density contrasts (interfaces)
+    if 'density' in df_search.columns and len(df_search) >= 2:
+        df_search['density_diff'] = df_search['density'].diff()
+        
+        # Look for large negative gradient (weak layer above dense layer)
+        min_gradient = -50  # kg/m³
+        
+        if df_search['density_diff'].min() < min_gradient:
+            loc_idx = df_search['density_diff'].idxmin()
+            loc_row = df_search.loc[loc_idx]
+            
+            loc_height = float(loc_row['height'])
+            loc_depth = hs - loc_height
+            
+            logger.info(f"Found density contrast LOC at {loc_depth:.2f}m depth "
+                       f"(Δρ={loc_row['density_diff']:.1f} kg/m³) - height {loc_height:.2f}m")
+            
+            return {
+                'loc_height': loc_height,
+                'loc_depth': loc_depth,
+                'grain_type': str(loc_row.get('grain_type', 'Unknown')),
+                'density': float(loc_row.get('density', np.nan)),
+                'temperature': float(loc_row.get('temperature', np.nan)),
+                'density_contrast': float(loc_row['density_diff']),
+                'detection_method': 'density_contrast'
+            }
+    
+    # Priority 3: Temperature gradient anomalies
+    if 'temperature_gradient' in df_search.columns:
+        # High temperature gradients indicate faceting conditions
+        high_tg_threshold = 10  # °C/m
+        
+        high_tg_mask = df_search['temperature_gradient'].abs() > high_tg_threshold
+        
+        if high_tg_mask.any():
+            high_tg_layers = df_search[high_tg_mask]
+            loc_row = high_tg_layers.loc[high_tg_layers['height'].idxmin()]
+            
+            loc_height = float(loc_row['height'])
+            loc_depth = hs - loc_height
+            
+            logger.info(f"Found high TG LOC at {loc_depth:.2f}m depth "
+                       f"(∇T={loc_row['temperature_gradient']:.1f} °C/m) - height {loc_height:.2f}m")
+            
+            return {
+                'loc_height': loc_height,
+                'loc_depth': loc_depth,
+                'grain_type': str(loc_row.get('grain_type', 'Unknown')),
+                'density': float(loc_row.get('density', np.nan)),
+                'temperature': float(loc_row.get('temperature', np.nan)),
+                'temperature_gradient': float(loc_row['temperature_gradient']),
+                'detection_method': 'temperature_gradient'
+            }
+    
+    logger.debug(f"No LOC found in {len(df_search)} layers between "
+                f"{min_search_height:.2f}m and {max_search_height:.2f}m")
+    return None
 
 
 def largest_fc_dh_gs_diff_bottom_half(df: pd.DataFrame) -> Tuple[Optional[float], Optional[float]]:
