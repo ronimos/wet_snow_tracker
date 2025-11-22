@@ -50,6 +50,7 @@ dependencies = [
     "plotly>=6.5.0",
     "rasterio>=1.4.3",
     "rioxarray>=0.15.0",
+    "pytest>=8.4.2",
 ]
 
 [project.optional-dependencies]

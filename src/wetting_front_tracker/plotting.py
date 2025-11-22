@@ -37,7 +37,11 @@ from matplotlib.patches import PathPatch
 from matplotlib.path import Path as MplPath
 from PIL import Image
 
-from .param_config import config, get_html_path, get_png_path
+try:
+    from .param_config import config, get_html_path, get_png_path   
+except ImportError: # For direct script execution
+    from param_config import config, get_html_path, get_png_path
+
 
 # Constants
 ASSETS_SUBFOLDER_NAME = "plot_assets"  # Relative path from results directory
@@ -458,11 +462,7 @@ def plot_line_series(
 ) -> None:
     """
     Plots primary data series (HS, LOC, Wet Front) on the axes.
-
-    Args:
-        ax: Matplotlib axes object
-        df: Summary DataFrame with data series
-        central_date: Reference date, plotted as vertical line
+    UPDATED: Handles multiple LOC columns (Top-N candidates).
     """
     # Total snow depth
     if 'hs' in df.columns:
@@ -476,8 +476,39 @@ def plot_line_series(
             zorder=10
         )
     
-    # Weak layer height
-    if 'weak_layer_height' in df.columns:
+    # Identify and plot LOC columns
+    # Look for both the legacy/primary 'weak_layer_height' and indexed ones
+    loc_cols = [c for c in df.columns if c.startswith('weak_layer_height')]
+    
+    # Prioritize indexed columns if available to control style by rank
+    if any(c.startswith('weak_layer_height_') for c in loc_cols):
+        # Sort by index (0, 1, 2...)
+        loc_cols = sorted(
+            [c for c in loc_cols if '_' in c and c.split('_')[-1].isdigit()],
+            key=lambda x: int(x.split('_')[-1])
+        )
+        
+        for i, col in enumerate(loc_cols):
+            # Rank 0 = Solid Black
+            # Rank > 0 = Dashed Black with decreasing opacity
+            style = '-' if i == 0 else '--'
+            alpha = 1.0 if i == 0 else max(0.4, 1.0 - (i * 0.3))
+            width = 2.0 if i == 0 else 1.5
+            label = 'Weak Layer (Primary)' if i == 0 else f'Weak Layer (Alt {i})'
+            
+            if col in df.columns:
+                ax.plot(
+                    df.index,
+                    df[col],
+                    label=label,
+                    color='black',
+                    linestyle=style,
+                    linewidth=width,
+                    alpha=alpha,
+                    zorder=10
+                )
+    # Fallback for backward compatibility (single column)
+    elif 'weak_layer_height' in df.columns:
         ax.plot(
             df.index,
             df['weak_layer_height'],
@@ -491,7 +522,6 @@ def plot_line_series(
         wet_front = df['wet_front_lwc_height']
         is_valid = wet_front.notna()
         
-        # Find segment boundaries
         starts = wet_front.index[
             is_valid & ~is_valid.shift(1, fill_value=False).astype(bool)
         ]
@@ -499,7 +529,6 @@ def plot_line_series(
             is_valid & ~is_valid.shift(-1, fill_value=False).astype(bool)
         ]
         
-        # Plot each segment
         for i, (start, end) in enumerate(zip(starts, ends)):
             segment = wet_front.loc[start:end]
             label = 'Deepest Wet Front (LWC > 3%)' if i == 0 else None
@@ -531,7 +560,6 @@ def plot_line_series(
             color='purple',
             fontsize=10
         )
-
 
 def configure_plot_aesthetics(
     fig: Figure,
@@ -744,7 +772,46 @@ def create_plotly_figure(
             line=dict(color='darkblue')
         ))
     
-    if 'weak_layer_height' in df.columns:
+    # --- Plot LOC Candidates (Primary + Alternatives) ---
+    loc_cols = [c for c in df.columns if c.startswith('weak_layer_height_')]
+    
+    # Sort columns numerically (height_0, height_1)
+    loc_cols = sorted(
+        [c for c in loc_cols if c.split('_')[-1].isdigit()],
+        key=lambda x: int(x.split('_')[-1])
+    )
+    
+    if loc_cols:
+        for i, col in enumerate(loc_cols):
+            rank = int(col.split('_')[-1])
+            
+            # Determine Style
+            name = 'Weak Layer (Primary)' if rank == 0 else f'Weak Layer (Alt {rank})'
+            dash = 'solid' if rank == 0 else 'dash'
+            width = 2 if rank == 0 else 1.5
+            
+            # Custom hover text with probability if available
+            prob_col = f'weak_layer_prob_{rank}'
+            hover_template = None
+            if prob_col in df.columns:
+                hover_template = (
+                    "<b>%{y:.2f} cm</b><br>" +
+                    "Date: %{x}<br>" +
+                    "Prob: %{customdata:.2f}<extra></extra>"
+                )
+            
+            fig.add_trace(go.Scatter(
+                x=df.index,
+                y=df[col],
+                name=name,
+                mode='lines',
+                line=dict(color='black', width=width, dash=dash),
+                customdata=df[prob_col] if prob_col in df.columns else None,
+                hovertemplate=hover_template
+            ))
+            
+    elif 'weak_layer_height' in df.columns:
+        # Fallback for legacy data
         fig.add_trace(go.Scatter(
             x=df.index,
             y=df['weak_layer_height'],
