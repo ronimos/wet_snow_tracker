@@ -508,7 +508,15 @@ def lwc_above_weak(
     if not _validate_dataframe(df, required_cols):
         return None, None
 
-    _, weak_layer_height = weak_layer_func(df)
+    try:
+        result = weak_layer_func(df)
+        # Handle case where weak_layer_func returns None instead of (None, None)
+        if result is None:
+            return None, None
+        _, weak_layer_height = result
+    except (TypeError, ValueError) as e:
+        logger.debug(f"Could not unpack result from weak_layer_func: {e}")
+        return None, None
 
     if weak_layer_height is None:
         return None, None
@@ -554,7 +562,15 @@ def avg_lwc_above_weak(
     if not _validate_dataframe(df, required_cols):
         return None
 
-    _, weak_layer_height = weak_layer_func(df)
+    try:
+        result = weak_layer_func(df)
+        # Handle case where weak_layer_func returns None instead of (None, None)
+        if result is None:
+            return None
+        _, weak_layer_height = result
+    except (TypeError, ValueError) as e:
+        logger.debug(f"Could not unpack result from weak_layer_func: {e}")
+        return None
 
     if weak_layer_height is None:
         return None

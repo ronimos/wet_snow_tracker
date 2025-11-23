@@ -475,7 +475,7 @@ if os.getenv("ML_ENABLED", "false").lower() == "true":
 if _ml_model_path and _ml_model_path.exists():
     ML_CONFIG.enabled = True
 
-LOC_DETECTION_MODE = os.getenv("LOC_DETECTION_MODE", "rule_based")
+LOC_DETECTION_MODE = os.getenv("LOC_DETECTION_MODE", "hybrid")  # 'rule-based', 'ml-only', 'hybrid'
 
 # ---------------------------------------------------------------------------
 # Feature Requirements for ML

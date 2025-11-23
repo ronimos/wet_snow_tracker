@@ -61,11 +61,6 @@ except ImportError:
         create_hybrid_loc_detector
     )   
   
-try:
-    import diagnostic_wrapper
-    diagnostic_wrapper.enable_diagnostics()
-except ImportError:
-    pass
 
 logger = logging.getLogger(__name__)
 
@@ -711,6 +706,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-ml-tune", action="store_true", help="Skip hyperparameter tuning.")
     parser.add_argument("--no-ml-shap", action="store_true", help="Skip SHAP analysis.")
     parser.add_argument("--promote-model", action="store_true", help="If training succeeds, copy the model to assets/models/production.")
+    parser.add_argument("--enable-diagnostics", action="store_true", help="Enable diagnostic wrapper for debugging")
     
     return parser.parse_args()
 
@@ -725,6 +721,14 @@ def main():
     )    
     
     args = parse_args()
+    
+    if args.enable_diagnostics:
+       try:
+           import diagnostic_wrapper
+           diagnostic_wrapper.enable_diagnostics()
+           logging.info("Diagnostic wrapper enabled")
+       except ImportError:
+           logging.warning("Could not import diagnostic_wrapper")
     
     # --- Handle ML Training Workflows ---
     if args.collect_ml_data:
