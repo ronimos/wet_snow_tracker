@@ -587,6 +587,38 @@ def avg_lwc_above_weak(
     return float(avg_lwc * 100.0) if pd.notna(avg_lwc) else None
 
 
+def mean_lwc_above_reference(
+    df: pd.DataFrame,
+    reference_height: Optional[float] = None
+) -> Optional[float]:
+    """
+    Calculate mean LWC above a reference height (or ground if no reference).
+    
+    Args:
+        df: Daily snow profile DataFrame
+        reference_height: Height of reference layer (LOC). If None, uses ground (0m)
+    
+    Returns:
+        Mean LWC as percentage (0-100), or None if no layers exist
+    """
+    required_cols = ['lwc', 'height']
+    if not _validate_dataframe(df, required_cols):
+        return None
+    
+    # Use ground (0m) if no reference height provided
+    ref_height = reference_height if reference_height is not None else 0.0
+    
+    # Get all layers above reference
+    layers_above = df[df['height'] > ref_height]
+    
+    if layers_above.empty:
+        return None
+    
+    # Calculate mean and convert to percentage
+    avg_lwc = layers_above['lwc'].mean()
+    return float(avg_lwc * 100.0) if pd.notna(avg_lwc) else None
+
+
 # ---------------------------------------------------------------------------
 # Time Series Analysis
 # ---------------------------------------------------------------------------

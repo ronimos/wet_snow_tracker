@@ -37,11 +37,13 @@ except ImportError:
 try:
     from .wet_front_tracker import (find_time_to_loc, get_highest_wet_point,
                                     get_total_snow_depth, lwc_above_weak,
-                                    wet_front_lwc, find_wet_slab_loc)
+                                    wet_front_lwc, find_wet_slab_loc,
+                                    mean_lwc_above_reference)
 except ImportError:
     from wet_front_tracker import (find_time_to_loc, get_highest_wet_point,
                                     get_total_snow_depth, lwc_above_weak,
-                                    wet_front_lwc, find_wet_slab_loc)
+                                    wet_front_lwc, find_wet_slab_loc,
+                                    mean_lwc_above_reference)
 try:
     from .plotting import (plot_summary_matplotlib,
                            plot_summary_plotly,
@@ -60,7 +62,9 @@ except ImportError:
         MLLocDetector, 
         create_hybrid_loc_detector
     )   
-  
+
+# Diagnostic wrapper is loaded conditionally based on --enable-diagnostics flag
+# (see parse_args and main function)
 
 logger = logging.getLogger(__name__)
 
@@ -364,6 +368,16 @@ def process_single_profile(pro_file_path: Path,
         def loc_adapter(df):
             res = loc_detector(df)
             return res[0] if res and len(res) > 0 else None
+        
+        # Wrapper to calculate mean LWC above LOC (or ground if no LOC)
+        def mean_lwc_wrapper(df):
+            res = loc_detector(df)
+            if res and len(res) > 0:
+                loc_height = res[0][0]  # First LOC's height
+                return mean_lwc_above_reference(df, loc_height)
+            else:
+                # No LOC detected, use ground as reference
+                return mean_lwc_above_reference(df, 0.0)
 
         raw_summary = profile.get_full_timeseries_summary(
             parameters_to_calculate={
@@ -371,7 +385,8 @@ def process_single_profile(pro_file_path: Path,
                 "weak_layer": loc_detector, # Returns list of tuples
                 "wet_front_lwc": wet_front_lwc,
                 "highest_wet_point": get_highest_wet_point,
-                "lwc_above_weak": lambda df: lwc_above_weak(df, loc_adapter) # Uses adapter
+                "lwc_above_weak": lambda df: lwc_above_weak(df, loc_adapter), # Uses adapter
+                "mean_lwc_above_loc": mean_lwc_wrapper  # New metric
             },
             start_date=str(min_date_in_data),
             end_date=str(max_date_in_data),
@@ -433,11 +448,23 @@ def process_single_profile(pro_file_path: Path,
             
         # 3. Pick Worst Case
         worst_case_time = _get_worst_case_time(candidate_times)
+        
+        # --- Check Mean LWC Threshold (3%) ---
+        mean_lwc_threshold_met = False
+        max_mean_lwc = None
+        if 'mean_lwc_above_loc' in summary_full.columns:
+            # Check if mean LWC ever reaches 3% within the analysis window
+            max_mean_lwc = summary_full['mean_lwc_above_loc'].max()
+            if pd.notna(max_mean_lwc) and max_mean_lwc >= 3.0:
+                mean_lwc_threshold_met = True
+                logging.info(f"{file_stem}: Mean LWC threshold met (max={max_mean_lwc:.2f}%)")
 
         return {
             "station_name": station_metadata.get('stationName', file_stem),
             "file_stem": file_stem,
-            "time_to_loc": worst_case_time,  # Use the worst-case time for the map
+            "time_to_loc": worst_case_time,
+            "mean_lwc_threshold_met": mean_lwc_threshold_met,
+            "max_mean_lwc": max_mean_lwc,
             "central_date_str": central_date_arg.strftime('%Y-%m-%d %H:%M') if central_date_arg else None
         }
 
@@ -706,7 +733,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-ml-tune", action="store_true", help="Skip hyperparameter tuning.")
     parser.add_argument("--no-ml-shap", action="store_true", help="Skip SHAP analysis.")
     parser.add_argument("--promote-model", action="store_true", help="If training succeeds, copy the model to assets/models/production.")
-    parser.add_argument("--enable-diagnostics", action="store_true", help="Enable diagnostic wrapper for debugging")
+    
+    # Diagnostic Args
+    parser.add_argument("--enable-diagnostics", action="store_true", help="Enable diagnostic wrapper for debugging (wraps functions to track statistics).")
     
     return parser.parse_args()
 
@@ -722,13 +751,14 @@ def main():
     
     args = parse_args()
     
+    # --- Enable Diagnostics if requested ---
     if args.enable_diagnostics:
-       try:
-           import diagnostic_wrapper
-           diagnostic_wrapper.enable_diagnostics()
-           logging.info("Diagnostic wrapper enabled")
-       except ImportError:
-           logging.warning("Could not import diagnostic_wrapper")
+        try:
+            import diagnostic_wrapper
+            diagnostic_wrapper.enable_diagnostics()
+            logging.info("Diagnostic wrapper enabled")
+        except ImportError:
+            logging.warning("Could not import diagnostic_wrapper - diagnostics disabled")
     
     # --- Handle ML Training Workflows ---
     if args.collect_ml_data:
