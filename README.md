@@ -1,6 +1,6 @@
 # Wetting Front Tracker
 
-A sophisticated avalanche forecasting system that predicts wet slab avalanche risk by analyzing liquid water infiltration into snowpack layers. The system combines SNOWPACK model output with machine learning to identify when and where water penetration reaches critical weak layers.
+An avalanche forecasting system to help forecasters predicting wet slab avalanche risk by analyzing liquid water infiltration into snowpack layers. The system combines SNOWPACK model output with machine learning to identify when and where water penetration reaches critical weak layers.
 
 ## Overview
 
@@ -38,7 +38,7 @@ The system uses physically-motivated thresholds derived from snow science litera
 
 Traditional avalanche forecasting relies on point observations and manual snowpack assessment. The Wetting Front Tracker overcomes key limitations:
 
-- **Temporal coverage**: Hourly SNOWPACK model output vs. daily observations
+- **Temporal coverage**: Hourly SNOWPACK model input vs. daily observations
 - **Spatial coverage**: Automated processing of hundreds of locations
 - **Objective criteria**: ML-based LOC detection removes observer bias
 - **Forward-looking**: Forecasts when conditions will become critical
@@ -46,57 +46,57 @@ Traditional avalanche forecasting relies on point observations and manual snowpa
 ## System Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     Input Data                               │
-│  • SNOWPACK .pro files (time series profiles)               │
-│  • Polygon geometries (aspect-specific terrain units)       │
-│  • Digital Elevation Model (for aspect calculation)         │
-└────────────────────┬────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                     Input Data                           │
+│  • SNOWPACK .pro files (time series profiles)            │
+│  • Polygon geometries (aspect-specific terrain units)    │
+│  • Digital Elevation Model (for aspect calculation)      │
+└────────────────────┬─────────────────────────────────────┘
                      │
                      v
-┌─────────────────────────────────────────────────────────────┐
-│                 Data Processing Layer                        │
-│  • Profile reading & validation (snowpack_reader.py)        │
-│  • Geospatial polygon linking (prepare_geodata.py)          │
-│  • Time series extraction                                   │
-└────────────────────┬────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                 Data Processing Layer                    │
+│  • Profile reading & validation (snowpack_reader.py)     │
+│  • Geospatial polygon linking (prepare_geodata.py)       │
+│  • Time series extraction                                │
+└────────────────────┬─────────────────────────────────────┘
                      │
                      v
-┌─────────────────────────────────────────────────────────────┐
-│                  Analysis Engine                             │
-│  ┌────────────────────────────────────────────────────┐    │
-│  │  Wetting Front Detection (wet_front_tracker.py)   │    │
-│  │  • LWC threshold analysis (4%)                     │    │
-│  │  • Deepest wet layer identification                │    │
-│  │  • Mean LWC calculation (3% threshold)             │    │
-│  └────────────────────────────────────────────────────┘    │
-│  ┌────────────────────────────────────────────────────┐    │
-│  │  LOC Detection (ml_loc_detector.py)                │    │
-│  │  • ML-based prediction (XGBoost/LightGBM)          │    │
-│  │  • Rule-based fallback (capillary barriers)        │    │
-│  │  • Hybrid mode with confidence scoring             │    │
-│  └────────────────────────────────────────────────────┘    │
-│  ┌────────────────────────────────────────────────────┐    │
-│  │  Temporal Analysis (find_time_to_loc)              │    │
-│  │  • Wetting event isolation                         │    │
-│  │  • Penetration timing calculation                  │    │
-│  │  • Multi-candidate worst-case selection            │    │
-│  └────────────────────────────────────────────────────┘    │
-│  ┌────────────────────────────────────────────────────┐    │
-│  │  Risk Synthesis                                     │    │
-│  │  • Time-to-LOC priority ranking                    │    │
-│  │  • Mean LWC threshold evaluation                   │    │
-│  │  • Color code assignment                           │    │
-│  └────────────────────────────────────────────────────┘    │
-└────────────────────┬────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                  Analysis Engine                         │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │  Wetting Front Detection (wet_front_tracker.py)    │  │
+│  │  • LWC threshold analysis (4%)                     │  │
+│  │  • Deepest wet layer identification                │  │
+│  │  • Mean LWC calculation (3% threshold)             │  │
+│  └────────────────────────────────────────────────────┘  │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │  LOC Detection (ml_loc_detector.py)                │  │
+│  │  • ML-based prediction (XGBoost/LightGBM)          │  │
+│  │  • Rule-based fallback (capillary barriers)        │  │
+│  │  • Hybrid mode with confidence scoring             │  │
+│  └────────────────────────────────────────────────────┘  │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │  Temporal Analysis (find_time_to_loc)              │  │
+│  │  • Wetting event isolation                         │  │
+│  │  • Penetration timing calculation                  │  │
+│  │  • Multi-candidate worst-case selection            │  │
+│  └────────────────────────────────────────────────────┘  │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │  Risk Synthesis                                    │  │
+│  │  • Time-to-LOC priority ranking                    │  │
+│  │  • Mean LWC threshold evaluation                   │  │
+│  │  • Color code assignment                           │  │
+│  └────────────────────────────────────────────────────┘  │
+└────────────────────┬─────────────────────────────────────┘
                      │
                      v
-┌─────────────────────────────────────────────────────────────┐
-│                 Visualization Layer                          │
-│  • Matplotlib plots (wetting front evolution)               │
-│  • Plotly interactive plots (zoomable time series)          │
-│  • Folium maps (geospatial risk visualization)              │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                 Visualization Layer                      │
+│  • Matplotlib plots (wetting front evolution)            │
+│  • Plotly interactive plots (zoomable time series)       │
+│  • Folium maps (geospatial risk visualization)           │
+└──────────────────────────────────────────────────────────┘
 ```
 
 ## Installation
