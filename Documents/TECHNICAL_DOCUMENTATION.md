@@ -692,9 +692,26 @@ def detect_stall(profile_timeseries):
 - `stall_duration`: 12 hours minimum
 - `tolerance`: 5cm vertical movement
 
-**Rationale**:
-- Shorter duration: Too sensitive to noise
-- Longer duration: Misses brief stalls before breakthrough
+**Rationale for 12-hour threshold**:
+
+This threshold balances multiple considerations (detailed justification in `ML_12_HOUR_THRESHOLD_RATIONALE.md`):
+
+1. **Physical significance**: Sufficient time for dangerous water accumulation at capillary barriers (Hirashima et al., 2010; Avanzi et al., 2016)
+
+2. **Operational relevance**: Aligns with avalanche forecasting timescales where "days since isothermal conditions" predicts wet slab risk (Mitterer & Schweizer, 2013; Baggi & Schweizer, 2009). Field observations show wet slabs often occur 12-48 hours after sustained warming begins.
+
+3. **Data quality**: 
+   - Shorter duration (6h): Too sensitive to diurnal melt-freeze cycles and measurement noise
+   - Longer duration (24h): Misses rapid-onset events and reduces training data volume
+   - 12 hours: Minimum for sustained accumulation while excluding transient fluctuations
+
+4. **ML training considerations**:
+   - Provides adequate positive examples (~20-30% of candidates)
+   - Excludes brief pauses that aren't avalanche-relevant
+   - Allows 24h feature lookback to capture pre-stall conditions
+   - Enables prediction 12-24h before peak danger
+
+The threshold represents a synthesis of physical process timescales, operational forecasting practice, and ML training best practices rather than a single definitive study.
 
 #### Negative Sampling Strategy
 
