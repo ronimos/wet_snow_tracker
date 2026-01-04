@@ -1,884 +1,1295 @@
 """
-main.py
-=======
+plotting.py
+===========
 
-This script serves as the main entry point and orchestrator for the Wetting 
-Front Tracker application.
+Visualization functions for the Wetting Front Tracker application.
+
+This module creates:
+- Static plots (Matplotlib PNG) for detailed analysis
+- Interactive plots (Plotly HTML) with zoom/pan capabilities
+- Summary map (Folium) showing risk levels across all polygons
+
+Author: Ron Simenhois
+Last Updated: October 12, 2025
 """
-import argparse
+
 import logging
-import multiprocessing
-import os
-import shutil
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
-from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
-import pandas as pd
+import folium
+from folium.plugins import MiniMap
 import geopandas as gpd
+import matplotlib
+import matplotlib.colors as mcolors
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
 import numpy as np
-from tqdm import tqdm
-import json
+import pandas as pd
+import plotly.graph_objects as go
+import xarray as xr
+from branca.element import Element, MacroElement, Template
+from folium import GeoJson, GeoJsonPopup, GeoJsonTooltip
+from matplotlib.axes import Axes
+from matplotlib.collections import QuadMesh
+from matplotlib.figure import Figure
+from matplotlib.patches import PathPatch
+from matplotlib.path import Path as MplPath
+from PIL import Image
 
 try:
-    from .param_config import config, MLModelConfig, ML_CONFIG, LOC_DETECTION_MODE
-except ImportError:
-    from param_config import config, MLModelConfig, ML_CONFIG, LOC_DETECTION_MODE
-try:
-    from .prepare_geodata import (link_polygons_to_pro_files,
-                                prepare_aspect_polygons)
-except ImportError:
-    from prepare_geodata import (link_polygons_to_pro_files,
-                                prepare_aspect_polygons)
-try:
-    from .snowpack_reader import SnowpackProfile
-except ImportError:
-    from snowpack_reader import SnowpackProfile
-try:
-    from .wet_front_tracker import (find_time_to_loc, get_highest_wet_point,
-                                    get_total_snow_depth, lwc_above_weak,
-                                    wet_front_lwc, find_wet_slab_loc,
-                                    mean_lwc_above_reference)
-except ImportError:
-    from wet_front_tracker import (find_time_to_loc, get_highest_wet_point,
-                                    get_total_snow_depth, lwc_above_weak,
-                                    wet_front_lwc, find_wet_slab_loc,
-                                    mean_lwc_above_reference)
-try:
-    from .plotting import (plot_summary_matplotlib,
-                           plot_summary_plotly,
-                           create_folium_map)
-except ImportError:
-    from plotting import (plot_summary_matplotlib,
-                           plot_summary_plotly,
-                           create_folium_map)
-try:
-    from .ml_loc_detector import (
-        MLLocDetector, 
-        create_hybrid_loc_detector
-    )
-except ImportError:
-    from ml_loc_detector import (
-        MLLocDetector, 
-        create_hybrid_loc_detector
-    )   
+    from .param_config import config, get_html_path, get_png_path   
+except ImportError: # For direct script execution
+    from param_config import config, get_html_path, get_png_path
 
-# Diagnostic wrapper is loaded conditionally based on --enable-diagnostics flag
-# (see parse_args and main function)
+
+# Constants
+ASSETS_SUBFOLDER_NAME = "plot_assets"  # Relative path from results directory
+
+matplotlib.use('Agg')
 
 logger = logging.getLogger(__name__)
 
 
-# --- Picklable Wrapper Classes (Fix for Multiprocessing Error) ---
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-class LocResultStandardizer:
+# Thumbnail settings
+THUMBNAIL_MAX_SIZE = (800, 534)
+THUMBNAIL_OPTIMIZE = True
+
+# Plot dimensions
+MATPLOTLIB_FIGSIZE = (14, 8)
+MATPLOTLIB_DPI = 300
+
+# LWC colormap settings
+LWC_COLORMAP_COLORS = ["white", "blue", "orange", "red"]
+LWC_VMIN = 0
+LWC_VMAX = 500
+LWC_COLORBAR_TICKS = [0, 100, 200, 300, 400, 500]
+LWC_COLORBAR_LABELS = ['0', '1', '2', '3', '4', '5+']
+
+# Time to LOC color scheme (hours)
+TIME_TO_LOC_COLORS = {
+    'imminent': ('darkred', 0, 24),       # 0-24h
+    'near': ('orange', 24, 48),           # 24-48h  
+    'moderate': ('yellow', 48, 72),       # 48-72h
+    'recent': ('red', -24, 0),            # -24-0h
+    'past_near': ('lightblue', -48, -24), # -48--24h
+    'past_far': ('darkblue', -72, -48),   # -72--48h
+    'unknown': ('gray', None, None)       # No data
+}
+
+# Aspect mapping
+ASPECT_MAP = {
+    'N': 'north',
+    'E': 'east',
+    'S': 'south',
+    'W': 'west',
+    'Flat': 'flat'
+}
+
+# External visualization URL
+SNOWPACK_VIEWER_BASE_URL = "https://mtnweather.info/nwp/caw/snowpack/spvizll.php"
+
+# Map settings
+MAP_DEFAULT_LOCATION = [40, -105]
+MAP_DEFAULT_ZOOM = 8
+
+
+# ---------------------------------------------------------------------------
+# Validation Functions
+# ---------------------------------------------------------------------------
+
+class PlottingError(Exception):
+    """Raised when plotting operations fail."""
+    pass
+
+
+def validate_dataframe(df: pd.DataFrame, required_cols: Optional[List[str]] = None) -> None:
     """
-    Wraps a detection function to ensure it always returns a list of (height, prob) tuples.
-    Defined at module level to ensure it can be pickled by multiprocessing.
+    Validates a DataFrame has required columns and data.
+    
+    Args:
+        df: DataFrame to validate
+        required_cols: List of required column names
+        
+    Raises:
+        PlottingError: If validation fails
     """
-    def __init__(self, func: Callable):
-        self.func = func
+    if df.empty:
+        raise PlottingError("DataFrame is empty")
+    
+    if required_cols:
+        missing = [col for col in required_cols if col not in df.columns]
+        if missing:
+            raise PlottingError(f"Missing required columns: {missing}")
 
-    def __call__(self, df: pd.DataFrame) -> list[tuple[float, float]]:
-        try:
-            res = self.func(df)
-        except Exception:
-            return []
-        
-        if res is None: return []
-        
-        if isinstance(res, dict):
-            # Handle Height directly
-            if 'loc_height' in res: 
-                return [(res['loc_height'], 1.0)]
-            # Handle Depth -> Height conversion
-            if 'loc_depth' in res and 'height' in df.columns:
-                hs = df['height'].max()
-                if pd.notna(hs):
-                    return [(hs - res['loc_depth'], 1.0)]
-        
-        if isinstance(res, tuple): return [res]
-        
-        if isinstance(res, list): return res
 
-        # Fallback for scalar return
-        try:
-            return [(float(res), 1.0)]
-        except:
-            return []
-
-class MLDetectorCallable:
+def validate_metadata(metadata: Dict[str, Any], required_keys: Optional[List[str]] = None) -> None:
     """
-    Callable wrapper for ML-only detection.
-    Loads the detector lazily on the worker process to ensure picklability and reduce overhead.
+    Validates metadata dictionary has required keys.
+    
+    Args:
+        metadata: Metadata dictionary to validate
+        required_keys: List of required keys
+        
+    Raises:
+        PlottingError: If validation fails
     """
-    def __init__(self, model_path: Path, probability_threshold: float, top_n: int):
-        self.model_path = model_path
-        self.probability_threshold = probability_threshold
-        self.top_n = top_n
-        self._detector = None
-
-    @property
-    def detector(self):
-        if self._detector is None:
-            try:
-                from .ml_loc_detector import MLLocDetector
-            except ImportError:
-                from ml_loc_detector import MLLocDetector
-            self._detector = MLLocDetector(self.model_path, self.probability_threshold)
-        return self._detector
-
-    def __call__(self, df):
-        return self.detector.find_ml_loc(df, top_n=self.top_n)
+    if not metadata:
+        raise PlottingError("Metadata dictionary is empty")
+    
+    if required_keys:
+        missing = [key for key in required_keys if key not in metadata]
+        if missing:
+            logger.warning(f"Missing metadata keys: {missing}")
 
 
-def get_loc_detection_function(mode: str, ml_config: MLModelConfig, top_n: int = 5):
-    """Select LOC detection function."""
-    try:    
-        from .wet_front_tracker import find_wet_slab_loc
-    except ImportError:
-        from wet_front_tracker import find_wet_slab_loc
-    
-    if mode == "rule_based":
-        logger.info("Using rule-based LOC detection")
-        return LocResultStandardizer(find_wet_slab_loc)
-    
-    elif mode == "ml_only":
-        if not ml_config.enabled or ml_config.model_path is None:
-            logger.warning("ML config disabled or path missing, falling back to rule-based.")
-            return LocResultStandardizer(find_wet_slab_loc)
-        
-        logger.info(f"Using ML-only LOC detection")
-        return MLDetectorCallable(ml_config.model_path, ml_config.probability_threshold, top_n)
-    
-    elif mode == "hybrid":
-        if not ml_config.enabled or ml_config.model_path is None:
-            logger.warning("ML config disabled or path missing, falling back to rule-based.")
-            return LocResultStandardizer(find_wet_slab_loc)
-        
-        logger.info(f"Using hybrid LOC detection")
-        return create_hybrid_loc_detector(
-            model_path=ml_config.model_path,
-            use_ml_primary=ml_config.use_ml_primary,
-            ml_threshold=ml_config.probability_threshold,
-            rule_based_fallback=find_wet_slab_loc,
-            top_n=top_n
-        )
-    else:
-        return LocResultStandardizer(find_wet_slab_loc)
-    
+# ---------------------------------------------------------------------------
+# Image Processing
+# ---------------------------------------------------------------------------
 
-def generate_pro_file_manifest(base_path: Path, manifest_path: Path):
-    """Recursively scans a directory for .pro files and saves their paths."""
-    logging.info(f"Scanning for .pro files under {base_path}...")
-    pro_files = list(base_path.rglob('*.pro'))
-    manifest = {file.name: str(file.resolve()) for file in pro_files}
-    with open(manifest_path, 'w') as f:
-        json.dump(manifest, f, indent=4)
-    logging.info(f"Pro file manifest with {len(manifest)} entries saved to {manifest_path}")
-    
-    
-def ensure_pro_file_is_local(file_name: str, local_input_path: Path, remote_base_url: str, central_date: datetime):
-    """Checks if a .pro file exists locally and is fresh."""
-    local_file_path = local_input_path / file_name
-    
-    if local_file_path.exists():
-        mod_time_ts = os.path.getmtime(local_file_path)
-        mod_time_dt = datetime.fromtimestamp(mod_time_ts, tz=timezone.utc)
-        central_date_utc = central_date.replace(tzinfo=timezone.utc)
-        if (central_date_utc - mod_time_dt) < timedelta(hours=12):
-            logging.debug(f"'{file_name}' is fresh. Skipping download.")
-            return
-
-    logging.info(f"Downloading '{file_name}'...")
-    remote_file_url = f"{remote_base_url.rstrip('/')}/{file_name}"
-    logging.warning(f"Placeholder: Pretending to download from {remote_file_url} to {local_file_path}")
-    
-    
-def _initialize_and_validate_profile(pro_file_path: Path, aspect: str) -> tuple[SnowpackProfile | None, str | None]:
-    """Initializes a SnowpackProfile object and validates its data."""
-    profile = SnowpackProfile(pro_file_path)
-    file_stem = f"{pro_file_path.stem}_{aspect}"
-    profile.metadata['aspect'] = aspect
-
-    if profile.data is None or 'timestamp' not in profile.data.coords:
-        logging.warning("No valid data or timestamps in '%s'. Skipping.", pro_file_path.name)
-        return None, None
-    return profile, file_stem
-
-def _unpack_and_prepare_summary(summary_df: pd.DataFrame, max_locs: int = 3) -> pd.DataFrame:
+def create_thumbnail(
+    source_path: Path,
+    output_path: Path,
+    max_size: Tuple[int, int] = THUMBNAIL_MAX_SIZE
+) -> bool:
     """
-    Unpacks summary columns, handling multiple LOC candidates.
-    Creates columns: weak_layer_height, weak_layer_prob (for best),
-    plus weak_layer_height_1, weak_layer_prob_1, etc.
+    Creates a web-optimized PNG thumbnail from a larger image.
+
+    Args:
+        source_path: Path to the source PNG image
+        output_path: Path to save the thumbnail
+        max_size: Maximum (width, height) for the thumbnail
+
+    Returns:
+        True if successful, False otherwise
     """
-# 1. Expand Multiple LOCs
-    if 'weak_layer' in summary_df.columns:
-        
-        def expand_locs(row):
-            locs = row['weak_layer']
-            # Handle list of tuples vs single value/NaN
-            if not isinstance(locs, list): 
-                return pd.Series([np.nan] * (max_locs * 2))
-            
-            vals = []
-            for i in range(max_locs):
-                if i < len(locs):
-                    # Append Height, Prob
-                    vals.extend([locs[i][0], locs[i][1]])
-                else:
-                    vals.extend([np.nan, np.nan])
-            return pd.Series(vals)
-
-        # Create column names
-        cols = []
-        for i in range(max_locs):
-            cols.extend([f'weak_layer_height_{i}', f'weak_layer_prob_{i}'])
-            
-        expanded = summary_df.apply(expand_locs, axis=1)
-        expanded.columns = cols
-        
-        # Only concat expanded columns, do not pre-initialize them
-        summary_df = pd.concat([summary_df, expanded], axis=1)
-        
-        # Alias index 0 to the standard name for backward compatibility
-        # This assumes expanded columns are now present and unique
-        if f'weak_layer_height_0' in summary_df.columns:
-            summary_df['weak_layer_height'] = summary_df['weak_layer_height_0']
-            summary_df['weak_layer_prob'] = summary_df['weak_layer_prob_0']
-
-    # 2. Standard Unpacking
-    rename_map = {"wet_front_lwc_value": "wet_front_lwc_val"} # Just to clean up
-    summary_df.rename(columns=rename_map, inplace=True)
-
-    numeric_cols = ['wet_front_lwc_height', 'hs']
-    for col in numeric_cols:
-        if col in summary_df.columns:
-            summary_df[col] = pd.to_numeric(summary_df[col], errors='coerce')
-            
-    return summary_df
-
-def _persist_loc_height(summary_df: pd.DataFrame, reference_date: datetime) -> pd.DataFrame:
-    """Persists the LOC height through the melt event."""
-    if 'weak_layer_height' not in summary_df.columns or 'wet_front_lwc_height' not in summary_df.columns:
-        return summary_df
-
-    is_wet = summary_df['wet_front_lwc_height'].notna()
-    event_starts = is_wet & ~is_wet.shift(1, fill_value=False)
-    all_start_times = summary_df.index[event_starts]
-
-    relevant_start_times = all_start_times[all_start_times <= reference_date]
-
-    if relevant_start_times.empty:
-        return summary_df
-    
-    trigger_time = relevant_start_times[-1]
-
-    lookback_window_end = trigger_time
-    lookback_window_start = lookback_window_end - timedelta(days=2)
-    pre_melt_df = summary_df.loc[lookback_window_start:lookback_window_end]
-    
-    valid_pre_melt_locs = pre_melt_df['weak_layer_height'].dropna()
-    initial_lock_height = np.nan if valid_pre_melt_locs.empty else valid_pre_melt_locs.iloc[-1]
-
-    if pd.isna(initial_lock_height):
-        return summary_df
-        
-    persisted_loc = summary_df['weak_layer_height'].copy()
-    wet_season_mask: pd.Series = summary_df.index >= trigger_time
-    
-    wet_loc_series: pd.Series = summary_df.loc[wet_season_mask, 'weak_layer_height']
-    anchored_series = pd.concat([pd.Series([initial_lock_height]), wet_loc_series.reset_index(drop=True)])
-    
-    running_max_loc = anchored_series.cummax().iloc[1:].values
-    
-    persisted_loc.loc[wet_season_mask] = running_max_loc
-    persisted_loc_filled = persisted_loc.ffill()
-    persisted_loc_filled[summary_df['hs'] < persisted_loc_filled] = np.nan
-    summary_df['weak_layer_height'] = persisted_loc_filled
-    
-    return summary_df
-
-def _get_worst_case_time(times: list[float]) -> float | None:
-    """
-    Selects the most critical time_to_loc from a list of candidates.
-    Priority order (Highest Risk to Lowest):
-    1. Imminent (0 to 24h)
-    2. Recent (-24 to 0h)
-    3. Near Future (24 to 48h)
-    4. Moderate Future (48 to 72h)
-    5. Past Near (-48 to -24h)
-    6. Past Far (-72 to -48h)
-    7. Everything else (Safe/Unknown)
-    """
-    valid_times = [t for t in times if pd.notna(t)]
-    if not valid_times:
-        return None
-
-    # Priority buckets (min_inc, max_exc)
-    # Lower index = Higher Priority
-    buckets = [
-        (0, 24),        # Imminent (Dark Red)
-        (-24, 0),       # Recent (Red)
-        (24, 48),       # Near (Orange)
-        (48, 72),       # Moderate (Yellow)
-        (-48, -24),     # Past Near (Light Blue)
-        (-72, -48),     # Past Far (Dark Blue)
-    ]
-
-    for min_t, max_t in buckets:
-        for t in valid_times:
-            if min_t <= t < max_t:
-                return t
-                
-    # If no times fell into risk buckets, return the minimum positive time 
-    # (soonest future), or max negative (most recent past)
-    positive_times = [t for t in valid_times if t >= 0]
-    if positive_times:
-        return min(positive_times)
-    
-    return max(valid_times)
-
-
-def process_single_profile(pro_file_path: Path, 
-                           aspect: str, 
-                           start_date_arg: str | None = None, 
-                           end_date_arg: str | None = None, 
-                           central_date_arg: datetime | None = None,
-                           assets_path: Path | None = None,
-                           loc_detector: Callable | None = None) -> dict[str, Any] | None:
-    """Handles the full analysis workflow for a single polygon."""
     try:
-        if loc_detector is None:
-            loc_detector = find_wet_slab_loc
-            
-        profile, file_stem = _initialize_and_validate_profile(pro_file_path, aspect)
-        if not profile or not profile.data or not file_stem:
-            return None
-        
-        if central_date_arg:
-            min_date_in_data = central_date_arg - timedelta(days=7)
-            max_date_in_data = central_date_arg + timedelta(hours=72)
-        else:
-            min_date_in_data = pd.to_datetime(profile.data.timestamp.values[0])
-            max_date_in_data = pd.to_datetime(profile.data.timestamp.values[-1])
-
-        # Unwrap list-based LOC results for lwc_above_weak
-        # lwc_above_weak expects a function returning (height, prob) or None
-        def loc_adapter(df):
-            res = loc_detector(df)
-            return res[0] if res and len(res) > 0 else None
-        
-        # Wrapper to calculate mean LWC above LOC (or ground if no LOC)
-        def mean_lwc_wrapper(df):
-            res = loc_detector(df)
-            if res and len(res) > 0:
-                loc_height = res[0][0]  # First LOC's height
-                return mean_lwc_above_reference(df, loc_height)
-            else:
-                # No LOC detected, use ground as reference
-                return mean_lwc_above_reference(df, 0.0)
-
-        raw_summary = profile.get_full_timeseries_summary(
-            parameters_to_calculate={
-                "hs": get_total_snow_depth, 
-                "weak_layer": loc_detector, # Returns list of tuples
-                "wet_front_lwc": wet_front_lwc,
-                "highest_wet_point": get_highest_wet_point,
-                "lwc_above_weak": lambda df: lwc_above_weak(df, loc_adapter), # Uses adapter
-                "mean_lwc_above_loc": mean_lwc_wrapper  # New metric
-            },
-            start_date=str(min_date_in_data),
-            end_date=str(max_date_in_data),
-        ).copy()
-        
-        if raw_summary.empty:
-            return None
-
-        prepared_summary = _unpack_and_prepare_summary(raw_summary)
-        referance_date = central_date_arg or datetime.now()
-        
-        # Persist LOC height (Applied primarily to the 'weak_layer_height' alias)
-        # NOTE: Ideally we would persist ALL candidates, but for now we persist the primary
-        # to ensure the main logic holds. The Multi-LOC logic below uses raw unpacked values.
-        summary_full = _persist_loc_height(prepared_summary, referance_date)
-
-        if start_date_arg is None or end_date_arg is None:
-            logging.error("Analysis window start/end dates are missing.")
-            return None
-        
-        # --- Plotting Logic ---
-        start_dt, end_dt = pd.to_datetime(start_date_arg), pd.to_datetime(end_date_arg)
-        is_in_window = (summary_full.index >= start_dt) & (summary_full.index <= end_dt)
-        summary_for_plot = summary_full[is_in_window]
-
-        full_season_plot_data = profile.data[['lwc', 'height']]
-        is_in_lwc_window = (full_season_plot_data.timestamp >= start_dt) & (full_season_plot_data.timestamp <= end_dt)
-        lwc_data_for_plot = full_season_plot_data.sel(timestamp=is_in_lwc_window)
-
-        station_metadata = profile.metadata
-        del profile
-
-        if not summary_for_plot.empty:
-            plot_summary_matplotlib(summary_for_plot, file_stem, station_metadata, lwc_data_for_plot, central_date_arg, assets_path)
-            plot_summary_plotly(summary_full, file_stem, station_metadata, central_date_arg, assets_path)
-        else:
-            logging.warning(f"No snowpack data found for {file_stem} in window.")
-
-        # --- UPDATED: Multi-Candidate Time Calculation ---
-        candidate_times = []
-        
-        # 1. Check Primary (Legacy column)
-        t0 = find_time_to_loc(summary_full, reference_date=referance_date)
-        candidate_times.append(t0)
-        
-        # 2. Check Alternatives (weak_layer_height_1, _2, etc.)
-        # We need to iterate columns because find_time_to_loc hardcodes 'weak_layer_height'
-        loc_cols = [c for c in summary_full.columns if c.startswith('weak_layer_height_') and c != 'weak_layer_height_0']
-        
-        for col in loc_cols:
-            # Create a temporary view where this candidate is the "weak_layer_height"
-            temp_df = summary_full.copy()
-            temp_df['weak_layer_height'] = temp_df[col]
-            # Apply persistence to this candidate too (optional but recommended)
-            temp_df = _persist_loc_height(temp_df, referance_date)
-            
-            t_alt = find_time_to_loc(temp_df, reference_date=referance_date)
-            candidate_times.append(t_alt)
-            
-        # 3. Pick Worst Case
-        worst_case_time = _get_worst_case_time(candidate_times)
-        
-        # --- Check Mean LWC Threshold (3%) ---
-        mean_lwc_threshold_met = False
-        max_mean_lwc = None
-        if 'mean_lwc_above_loc' in summary_full.columns:
-            # Check if mean LWC ever reaches 3% within the analysis window
-            max_mean_lwc = summary_full['mean_lwc_above_loc'].max()
-            if pd.notna(max_mean_lwc) and max_mean_lwc >= 3.0:
-                mean_lwc_threshold_met = True
-                logging.info(f"{file_stem}: Mean LWC threshold met (max={max_mean_lwc:.2f}%)")
-
-        return {
-            "station_name": station_metadata.get('stationName', file_stem),
-            "file_stem": file_stem,
-            "time_to_loc": worst_case_time,
-            "mean_lwc_threshold_met": mean_lwc_threshold_met,
-            "max_mean_lwc": max_mean_lwc,
-            "central_date_str": central_date_arg.strftime('%Y-%m-%d %H:%M') if central_date_arg else None
-        }
-
-    except Exception as e:
-        logging.error(f"Error processing {pro_file_path.name} for aspect {aspect}: {e}", exc_info=True)
-        return None
+        with Image.open(source_path) as img:
+            img.thumbnail(max_size)
+            img.save(output_path, "PNG", optimize=THUMBNAIL_OPTIMIZE)
+        logger.debug(f"Created thumbnail: {output_path}")
+        return True
     
-    
-def worker_wrapper(task_tuple: tuple) -> dict[str, Any] | None:
-    """Wrapper function for multiprocessing."""
-    return process_single_profile(*task_tuple)
-
-def _get_closest_synoptic_time(reference_time: datetime) -> datetime:
-    """Finds the closest standard synoptic time (00, 06, 12, 18 UTC)."""
-    base_date = reference_time.date()
-    candidates = [
-        datetime.combine(base_date, datetime.min.time()).replace(hour=h)
-        for h in [0, 6, 12, 18]
-    ]
-    candidates.insert(0, candidates[0] - timedelta(hours=6))
-    candidates.append(candidates[1] + timedelta(days=1))
-    return min(candidates, key=lambda dt: abs(reference_time - dt))
-
-
-def run_ml_data_collection(input_path: Path, output_dir: Path, central_date: datetime) -> Path | None:
-    """Run ML training data collection workflow."""
-    try:
-        from .ml_data_collection.stall_detector import StallDetector, StallDetectionConfig
-        from .ml_data_collection.feature_extractor import LayerFeatureExtractor, FeatureExtractionConfig
-    except ImportError:
-        logging.error("ML data collection modules not found.")
-        return None
-    
-    logging.info("=" * 80)
-    logging.info("ML TRAINING DATA COLLECTION")
-    logging.info(f"Input: {input_path}")
-    logging.info(f"Output: {output_dir}")
-    
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    stall_config = StallDetectionConfig(
-        min_duration_hours=12.0,
-        max_duration_hours=240.0,
-        min_lwc_threshold=0.04,
-        feature_lookback_hours=24.0
-    )
-    
-    feature_config = FeatureExtractionConfig(
-        lookback_hours=24.0,
-        extract_all_parameters=True,
-        compute_differences=True,
-        compute_ratios=True,
-        compute_gradients=True
-    )
-    
-    pro_files = list(input_path.rglob('*.pro'))
-    logging.info(f"Found {len(pro_files)} .pro files")
-    
-    detector = StallDetector(stall_config)
-    extractor = LayerFeatureExtractor(feature_config)
-    all_features = []
-    
-    # Import data collection implementation
-    # We reuse the logic from collect_ml_data.py by calling it here would be ideal
-    # But for now, let's use a simplified version or the one imported
-    try:
-        from .ml_data_collection.collect_ml_data import collect_ml_data, MLDataCollectionConfig
-        
-        collection_config = MLDataCollectionConfig()
-        collection_config.output_dir = output_dir
-        collection_config.stall_config = stall_config
-        collection_config.feature_config = feature_config
-        # Ensure negative sampling is on by default
-        collection_config.negative_sampling_strategy = 'combined' 
-        
-        stall_df, features_df = collect_ml_data(input_path, output_dir, collection_config)
-        
-        if features_df.empty:
-            return None
-            
-        output_file = output_dir / "ml_training_dataset.csv"
-        return output_file
-        
-    except ImportError:
-        # Fallback if collect_ml_data isn't importable
-        logging.warning("Using fallback collection loop (might lack negative sampling)")
-        for pro_file in tqdm(pro_files, desc="Processing files"):
-            try:
-                from .snowpack_reader import SnowpackProfile
-                from .wet_front_tracker import wet_front_lwc
-                
-                profile = SnowpackProfile(str(pro_file))
-                
-                # Needed for stall detector
-                summary = profile.get_full_timeseries_summary(
-                    parameters_to_calculate={"wet_front_lwc": wet_front_lwc}
-                )
-                if 'wet_front_lwc' in summary.columns:
-                     summary[['wet_front_lwc_value', 'wet_front_lwc_height']] = pd.DataFrame(
-                        summary['wet_front_lwc'].tolist(), index=summary.index)
-                
-                wetting_front = summary['wet_front_lwc_height']
-                station_name = pro_file.stem
-                
-                stalls = detector.find_stalls(profile, wetting_front, station_name)
-                
-                for stall in stalls:
-                    # This only collects POSITIVE examples
-                    features = extractor.extract_features_for_interface(
-                        profile, 
-                        stall.start_time - timedelta(hours=24),
-                        stall.stall_layer_id,
-                        stall.layer_above_id,
-                        stall.layer_below_id
-                    )
-                    if features:
-                        row = stall.to_dict()
-                        row.update(features)
-                        row['stalled'] = 1
-                        all_features.append(row)
-                        
-            except Exception as e:
-                logging.warning(f"Error processing {pro_file.name}: {e}")
-                continue
-    
-        if not all_features:
-            logging.error("No training data collected!")
-            return None
-        
-        df = pd.DataFrame(all_features)
-        output_file = output_dir / f"ml_training_dataset_{central_date.strftime('%Y%m%d')}.csv"
-        df.to_csv(output_file, index=False)
-        
-        logging.info(f"Collected {len(df)} examples. Saved to {output_file}")
-        return output_file
-
-
-def run_ml_training(
-    training_data_path: Path,
-    output_dir: Path,
-    models_to_train: list,
-    tune_hyperparameters: bool = True,
-    compute_shap: bool = True
-) -> Path:
-    """Run ML model training workflow."""
-    try:
-        from .ml_training.model_trainer import ModelTrainer, ModelConfig
-        from .ml_training.model_trainer import FeatureImportanceAnalyzer
-        from .ml_training.model_trainer import plot_model_comparison, plot_feature_importance, plot_shap_summary
-    except ImportError:
-        logging.error("ML training modules not found.")
-        return None
-    
-    logging.info("=" * 80)
-    logging.info("ML MODEL TRAINING")
-    logging.info(f"Data: {training_data_path}")
-    
-    # Load training data
-    df = pd.read_csv(training_data_path)
-    
-    metadata_cols = [
-        'event_id', 'pro_file', 'start_time', 'end_time',
-        'stall_layer_id', 'layer_above_id', 'layer_below_id',
-        'feature_extraction_time', 'lookback_hours', 'station_name',
-        'duration_hours', 'confidence', 'n_data_points', 'is_ongoing',
-        'lookback_method', 'above_lwc_at_extraction', 'below_lwc_at_extraction',
-    ]
-    
-    irrelevant_cols = [
-        'distance_from_stall_m', 'example_type', 'requested_lookback_hours'
-    ]
-    
-    target_col = 'target' if 'target' in df.columns else 'stalled'
-    feature_cols = [c for c in df.columns
-                   if c not in metadata_cols and c not in irrelevant_cols and c != target_col]
-    
-    X = df[feature_cols].copy()
-    y = df[target_col].copy()
-    
-    config = ModelConfig(
-        models_to_train=models_to_train,
-        tune_hyperparameters=tune_hyperparameters,
-        tuning_method='random',
-        n_iter_random=30,
-        cv_folds=5,
-        use_time_series_cv=True,
-        compute_shap_values=compute_shap,
-        scale_features=True,
-        remove_low_variance=True,
-        remove_correlated=True
-    )
-    
-    trainer = ModelTrainer(config)
-    trainer.fit(X, y)
-    
-    # Feature importance
-    if compute_shap:
-        analyzer = FeatureImportanceAnalyzer(trainer.best_model_, trainer.X_train, trainer.feature_names_)
-        importance_results = analyzer.analyze_all(
-            trainer.X_val, trainer.y_val, compute_shap=True, shap_sample_size=min(200, len(trainer.X_val))
-        )
-    
-    output_dir.mkdir(parents=True, exist_ok=True)
-    model_dir = output_dir / 'trained_model'
-    trainer.save_model(model_dir)
-    
-    # Save artifacts
-    try:
-        plot_model_comparison(
-            trainer.results_,
-            save_path=output_dir / 'model_comparison.png'
-        )
-        logging.info(f"Saved: {output_dir / 'model_comparison.png'}")
-        
-        if compute_shap and 'shap' in importance_results:
-            plot_feature_importance(
-                importance_results,
-                top_n=30,
-                save_path=output_dir / 'feature_importance.png'
-            )
-            logging.info(f"Saved: {output_dir / 'feature_importance.png'}")
-            
-            # UPDATED: Use the matching 'shap_data' from the results
-            if 'shap_values' in importance_results and 'shap_data' in importance_results:
-                plot_shap_summary(
-                    importance_results['shap_values'],
-                    importance_results['shap_data'],  # <--- USE THIS instead of trainer.X_val.head()
-                    save_path=output_dir / 'shap_summary.png'
-                )
-                logging.info(f"Saved: {output_dir / 'shap_summary.png'}")
-            else:
-                logging.warning("SHAP values present but shap_data missing. Cannot plot summary.")
-
-    except Exception as e:
-        logging.warning(f"Could not save all plots: {e}")
-    
-    return model_dir
-
-
-def parse_args() -> argparse.Namespace:
-    """Sets up and parses command-line arguments."""
-    parser = argparse.ArgumentParser(
-        description="Run wet snow tracker analysis on SNOWPACK .pro files.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-    parser.add_argument("--regenerate-data", action="store_true", help="Force regeneration of all processed data.")
-    parser.add_argument("-d", "--date", dest="central_date", default="2025-04-06 18:00", help="Central date and time.")
-    parser.add_argument("-s", "--start", dest="start_date", help="Start date.")
-    parser.add_argument("-e", "--end", dest="end_date", help="End date.")
-    parser.add_argument("-i", "--input-dir", dest="input_dir", type=Path, default=None, help="Override input dir.")
-    parser.add_argument("-o", "--output-dir", dest="output_dir", type=Path, default=None, help="Override output dir.")
-    parser.add_argument("-a", "--assets-dir", dest="assets_dir", type=Path, default=None, help="Override plot assets dir.")
-    
-    # ML Args
-    parser.add_argument("--loc-mode", dest="loc_mode", choices=["rule_based", "ml_only", "hybrid"], default=None, help="LOC detection mode.")
-    parser.add_argument("--ml-model-path", dest="ml_model_path", type=Path, default=None, help="Override ML model path.")
-    parser.add_argument("--ml-models-dir", dest="ml_models_dir", type=Path, default=config.paths.models_path, help="Directory to search for production models.")
-    parser.add_argument("--ml-threshold", dest="ml_threshold", type=float, default=None, help="ML probability threshold.")
-    
-    # Training Args
-    parser.add_argument("--collect-ml-data", action="store_true", help="Collect ML training data.")
-    parser.add_argument("--train-ml-model", action="store_true", help="Train a new ML model.")
-    parser.add_argument("--ml-training-data", dest="ml_training_data", type=Path, default=None, help="Path to ML dataset.")
-    parser.add_argument("--ml-training-output", dest="ml_training_output", type=Path, default=None, help="Output dir for trained model.")
-    parser.add_argument("--ml-training-models", dest="ml_training_models", nargs='+', default=['xgboost', 'lightgbm', 'random_forest'], help="Models to train.")
-    parser.add_argument("--no-ml-tune", action="store_true", help="Skip hyperparameter tuning.")
-    parser.add_argument("--no-ml-shap", action="store_true", help="Skip SHAP analysis.")
-    parser.add_argument("--promote-model", action="store_true", help="If training succeeds, copy the model to assets/models/production.")
-    
-    # Diagnostic Args
-    parser.add_argument("--enable-diagnostics", action="store_true", help="Enable diagnostic wrapper for debugging (wraps functions to track statistics).")
-    
-    return parser.parse_args()
-
-
-def main():
-    """Main orchestrator for the entire analysis."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        filename="wetting_front_tracker.log",
-        filemode="w"
-    )    
-    
-    args = parse_args()
-    
-    # --- Enable Diagnostics if requested ---
-    if args.enable_diagnostics:
-        try:
-            import diagnostic_wrapper
-            diagnostic_wrapper.enable_diagnostics()
-            logging.info("Diagnostic wrapper enabled")
-        except ImportError:
-            logging.warning("Could not import diagnostic_wrapper - diagnostics disabled")
-    
-    # --- Handle ML Training Workflows ---
-    if args.collect_ml_data:
-        input_path = args.input_dir or config.paths.input_path
-        output_dir = args.ml_training_output or (config.paths.results_path / 'trained_models' / datetime.now().strftime('%Y%m%d_%H%M%S'))
-        central_date = datetime.strptime(args.central_date.split()[0], '%Y-%m-%d') if args.central_date else datetime.now()
-        
-        dataset_path = run_ml_data_collection(input_path, output_dir, central_date)
-        if dataset_path:
-            logging.info(f"ML data collection complete: {dataset_path}")
-        return
-    
-    if args.train_ml_model:
-        if not args.ml_training_data or not args.ml_training_data.exists():
-            logging.error("--ml-training-data is required and must exist.")
-            return
-            
-        output_dir = args.ml_training_output or (config.paths.results_path / 'trained_models' / datetime.now().strftime('%Y%m%d_%H%M%S'))
-        
-        model_dir = run_ml_training(
-            args.ml_training_data,
-            output_dir,
-            args.ml_training_models,
-            tune_hyperparameters=not args.no_ml_tune,
-            compute_shap=not args.no_ml_shap
-        )
-        
-        # Promotion Logic
-        if model_dir and args.promote_model:
-            target_dir = config.paths.models_path / "production"
-            logging.info(f"Promoting model to: {target_dir}")
-            
-            if target_dir.exists():
-                logging.warning(f"Overwriting existing production model at {target_dir}")
-                shutil.rmtree(target_dir)
-            
-            shutil.copytree(model_dir, target_dir)
-            logging.info("Model promotion complete.")
-            
-        return
-
-    # --- Normal Analysis Workflow ---
-    input_path = args.input_dir or config.paths.input_path
-    output_path = args.output_dir or config.paths.results_path
-    assets_path = args.assets_dir or config.paths.plot_assets_path
-    output_path.mkdir(parents=True, exist_ok=True)
-    assets_path.mkdir(parents=True, exist_ok=True)
-
-    # Date handling
-    try:
-        initial_ref_time = datetime.strptime(args.central_date, '%Y-%m-%d %H:%M')
-    except ValueError:
-        initial_ref_time = datetime.strptime(args.central_date, '%Y-%m-%d')
-
-    central_date = _get_closest_synoptic_time(initial_ref_time)
-    start_date = (central_date - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
-    end_date = (central_date + timedelta(hours=72)).strftime('%Y-%m-%d %H:%M:%S')
-
-    # LOC Configuration
-    loc_mode = args.loc_mode or LOC_DETECTION_MODE
-    ml_config = ML_CONFIG
-    
-    # If user overrides model path, use it
-    if args.ml_model_path:
-        ml_config.model_path = args.ml_model_path
-        ml_config.enabled = True
-    elif not ml_config.model_path and config.paths.models_path.exists():
-        # Fallback to checking internal assets if no path found yet
-        for item in config.paths.models_path.iterdir():
-            if item.is_dir() and (item / "model.joblib").exists():
-                ml_config.model_path = item
-                ml_config.enabled = True
-                break
-
-    if args.ml_threshold is not None:
-        ml_config.probability_threshold = args.ml_threshold
-
-    loc_detector = get_loc_detection_function(loc_mode, ml_config)
-
-    # Geodata & Processing
-    if args.regenerate_data or not config.paths.linked_polygons.exists():
-        generate_pro_file_manifest(input_path, config.paths.pro_file_manifest)
-        prepare_aspect_polygons(config.get_input_polygons_path(), config.paths.aspect_polygons, args.regenerate_data)
-        link_polygons_to_pro_files(config.paths.aspect_polygons, config.paths.snowpack_locations_csv, config.paths.linked_polygons)
-
-    try:
-        linked_gdf = gpd.read_file(config.paths.linked_polygons)
-        with open(config.paths.pro_file_manifest, 'r') as f:
-            pro_file_manifest = json.load(f)
     except FileNotFoundError:
-        logging.error("Geodata not found. Run with --regenerate-data.")
-        return
+        logger.warning(f"Source image not found: {source_path}")
+        return False
+    
+    except Exception as e:
+        logger.error(f"Failed to create thumbnail: {e}")
+        return False
 
-    if config.data_source.is_remote:
-        required_files = {Path(p).name for p in linked_gdf['pro_file_path'].unique()}
-        for file_name in tqdm(required_files, desc="Updating files"):
-            ensure_pro_file_is_local(file_name, input_path, config.data_source.remote_url, central_date)
 
-    tasks = []
-    for poly in linked_gdf.itertuples(index=False):
-        file_name = Path(str(poly.pro_file_path)).name
-        if full_pro_path_str := pro_file_manifest.get(file_name):
-            tasks.append((Path(full_pro_path_str), poly.aspect, start_date, end_date, central_date, assets_path, loc_detector))
+# ---------------------------------------------------------------------------
+# URL Generation
+# ---------------------------------------------------------------------------
 
-    if not tasks:
-        return
+def generate_snowpack_viewer_url(
+    metadata: Dict[str, Any],
+    central_date: Optional[datetime] = None
+) -> Optional[str]:
+    """
+    Constructs URL for the external snowpack visualization tool.
 
-    logging.info(f"Starting analysis on {len(tasks)} polygons...")
-    cpu_cores = os.cpu_count()
-    worker_count = int(max(1, cpu_cores / 4 )) if cpu_cores else 1 
-    with multiprocessing.Pool(processes=worker_count) as pool:
-        results = list(tqdm(pool.map(worker_wrapper, tasks, chunksize=1), total=len(tasks)))
+    Args:
+        metadata: Station metadata (must include lat, lon, aspect)
+        central_date: Reference date for determining the season
 
-    if valid_results := [res for res in results if res is not None]:
-        results_df = pd.DataFrame(valid_results)
-        final_gdf = gpd.GeoDataFrame(pd.concat([linked_gdf.reset_index(drop=True), results_df.reset_index(drop=True)], axis=1))
-        create_folium_map(final_gdf, config.paths.summary_map_html, central_date, assets_path )
+    Returns:
+        Formatted URL string, or None if metadata is insufficient
+    """
+    lat = metadata.get('latitude')
+    lon = metadata.get('longitude')
+    aspect = metadata.get('aspect')
+    
+    if not all([lat, lon, aspect]):
+        logger.debug("Insufficient metadata for viewer URL generation")
+        return None
+    
+    # Determine season (Oct-Sep)
+    date = central_date or datetime.now()
+    season = date.year - 1 if date.month < 10 else date.year
+    
+    # Convert aspect to word format
+    aspect_word = ASPECT_MAP.get(aspect, 'flat') if isinstance(aspect, str) else 'flat'
+    
+    return (
+        f"{SNOWPACK_VIEWER_BASE_URL}?"
+        f"lat={lat}&lon={lon}&aspect={aspect_word}&year={season}"
+    )
+
+
+# ... (imports remain the same) ...
+
+# ---------------------------------------------------------------------------
+# HTML Template Generation
+# ---------------------------------------------------------------------------
+
+def generate_html_template(
+    plotly_fig_html: str,
+    metadata: Dict[str, Any],
+    central_date: Optional[datetime] = None
+) -> str:
+    """
+    Embeds a Plotly figure and metadata into a full HTML page template.
+
+    Args:
+        plotly_fig_html: HTML string of the Plotly figure
+        metadata: Profile metadata for titles and links
+        central_date: Reference date for the analysis
+
+    Returns:
+        Complete HTML page content as string
+    """
+    station_name = metadata.get('stationName', 'Unknown Station')
+    
+    # Format date strings
+    date_title = ""
+    date_header = ""
+    if central_date:
+        date_str = central_date.strftime('%Y-%m-%d %H:%M UTC')
+        date_title = f" | Analysis for {date_str}"
+        date_header = f"Analysis for: {date_str}"
+    
+    # Generate external viewer link
+    viewer_url = generate_snowpack_viewer_url(metadata, central_date)
+    if viewer_url:
+        # UPDATED: Added <a> tag around the title to allow opening in new tab
+        viewer_section = f'''
+        <h2>
+            <a href="{viewer_url}" target="_blank" title="Click to open in new tab" style="text-decoration: none; color: #007bff;">
+                Snowpack Visualization &#x2197;
+            </a>
+        </h2>
+        <p style="text-align:center; font-size:0.9em; color:#666; margin-top:-15px; margin-bottom:15px;">
+            (If the viewer below does not load, click the title above to open it in a new tab)
+        </p>
+        <iframe class="iframe-container" src="{viewer_url}" 
+                title="Snowpack Visualization"></iframe>
+        '''
     else:
-        logging.info("No valid results generated.")
+        viewer_section = "<h2>Snowpack Visualization Link Not Available</h2>"
+
+    return f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Wetting Front Analysis: {station_name}{date_title}</title>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", 
+                         Roboto, "Helvetica Neue", Arial, sans-serif;
+            margin: 0;
+            background-color: #f8f9fa;
+            color: #333;
+        }}
+        .container {{
+            max-width: 1400px;
+            margin: 20px auto;
+            background: #fff;
+            border-radius: 8px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }}
+        .header-container {{
+            padding: 15px 25px;
+            background-color: #343a40;
+            color: white;
+            border-bottom: 4px solid #007bff;
+        }}
+        .header-container h1 {{
+            margin: 0;
+            font-size: 1.6em;
+        }}
+        .iframe-container {{
+            width: 100%;
+            height: 700px;
+            border: 1px solid #dee2e6;
+            border-radius: 4px;
+        }}
+        .content-section {{
+            padding: 20px;
+        }}
+        h2 {{
+            text-align: center;
+            color: #007bff;
+            margin-top: 10px;
+            margin-bottom: 20px;
+            font-weight: 500;
+        }}
+        /* Added hover effect for the link */
+        h2 a:hover {{
+            text-decoration: underline !important;
+            color: #0056b3 !important;
+        }}
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header-container">
+        <h1>Wetting Front Height & Layers of Concern: {station_name}</h1>
+        <p style="margin:0; font-size: 1.1em; color: #ddd;">{date_header}</p>
+    </div>
+    <div class="content-section">
+        {viewer_section}
+    </div>
+    <div class="content-section">
+        <h2>Wetting Front Analysis</h2>
+        {plotly_fig_html}
+    </div>
+</div>
+</body>
+</html>
+"""
+
+# ---------------------------------------------------------------------------
+# Matplotlib Plotting - LWC Colormesh
+# ---------------------------------------------------------------------------
+
+def plot_lwc_colormesh(
+    ax: Axes,
+    lwc_data: xr.Dataset
+) -> Optional[QuadMesh]:
+    """
+    Plots Liquid Water Content (LWC) data as a colormesh.
+
+    Args:
+        ax: Matplotlib axes object
+        lwc_data: xarray Dataset with 'lwc' and 'height' variables
+
+    Returns:
+        Matplotlib QuadMesh object, or None if plotting fails
+    """
+    try:
+        # Extract data (handle both numpy and cupy arrays)
+        try:
+            lwc_values = lwc_data['lwc'].to_numpy().T * 100
+            height_values_raw = lwc_data['height'].to_numpy().T
+            timestamps_num = mdates.date2num(lwc_data.timestamp.to_numpy())
+        except AttributeError:
+            lwc_values = lwc_data['lwc'].values.T * 100
+            height_values_raw = lwc_data['height'].values.T
+            timestamps_num = mdates.date2num(lwc_data.timestamp.values)
+
+        layer_indices = lwc_data.layer_index.values
+        X, _ = np.meshgrid(timestamps_num, layer_indices)
+        
+        # Fill missing height values
+        df_heights = pd.DataFrame(height_values_raw, dtype=np.float64)
+        df_heights_filled = df_heights.ffill(axis=0).bfill(axis=0)
+        
+        if df_heights_filled.isnull().values.any():
+            logger.warning("Cannot plot LWC: persistent NaN height values")
+            return None
+
+        height_values = df_heights_filled.to_numpy()
+        lwc_masked = np.ma.masked_where(df_heights.isnull().to_numpy(), lwc_values)
+
+        # Create colormap and plot
+        cmap = mcolors.LinearSegmentedColormap.from_list(
+            "custom",
+            LWC_COLORMAP_COLORS
+        )
+        norm = mcolors.Normalize(vmin=LWC_VMIN, vmax=LWC_VMAX)
+        
+        return ax.pcolormesh(
+            X,
+            height_values,
+            lwc_masked,
+            cmap=cmap,
+            norm=norm,
+            shading="gouraud",
+            zorder=1
+        )
+    
+    except Exception as e:
+        logger.error(f"Failed to plot LWC colormesh: {e}")
+        return None
 
 
-if __name__ == "__main__":
-    main()
+def clip_colormesh_to_wet_area(
+    ax: Axes,
+    colormesh: QuadMesh,
+    df: pd.DataFrame
+) -> None:
+    """
+    Creates a clipping path to show LWC only within detected wet layer.
+
+    Args:
+        ax: Matplotlib axes object
+        colormesh: Colormesh object to clip
+        df: Summary DataFrame with boundary data
+    """
+    try:
+        # Resample to hourly for smooth boundaries
+        df_resampled = df.asfreq('h')
+        x_dense = mdates.date2num(df_resampled.index)
+        
+        # Interpolate boundaries
+        cy_series = df_resampled['highest_wet_point'].interpolate(
+            method='linear'
+        ).bfill().ffill()
+        sy_series = df_resampled['wet_front_lwc_height'].interpolate(
+            method='linear'
+        ).bfill().ffill()
+
+        # Validate data
+        if cy_series.isnull().all() or sy_series.isnull().all():
+            logger.debug("Insufficient boundary data for clipping")
+            return
+
+        cy = cy_series.to_numpy(dtype=float)
+        sy = sy_series.to_numpy(dtype=float)
+        
+        # Create clipping path
+        verts = np.concatenate([
+            np.column_stack([x_dense, cy]),
+            np.column_stack([x_dense[::-1], sy[::-1]])
+        ])
+        path = MplPath(verts)
+        patch = PathPatch(
+            path,
+            transform=ax.transData,
+            facecolor='none',
+            edgecolor='none'
+        )
+        colormesh.set_clip_path(patch)
+        ax.add_patch(patch)
+    
+    except Exception as e:
+        logger.warning(f"Failed to clip colormesh: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Matplotlib Plotting - Line Series
+# ---------------------------------------------------------------------------
+
+def plot_line_series(
+    ax: Axes,
+    df: pd.DataFrame,
+    central_date: Optional[datetime] = None
+) -> None:
+    """
+    Plots primary data series (HS, LOC, Wet Front) on the axes.
+    UPDATED: Handles multiple LOC columns (Top-N candidates).
+    """
+    # Total snow depth
+    if 'hs' in df.columns:
+        ax.plot(
+            df.index,
+            df['hs'],
+            label='Total Snow Depth (HS)',
+            color='navy',
+            marker='.',
+            linestyle='-',
+            zorder=10
+        )
+    
+    # Identify and plot LOC columns
+    # Look for both the legacy/primary 'weak_layer_height' and indexed ones
+    loc_cols = [c for c in df.columns if c.startswith('weak_layer_height')]
+    
+    # Prioritize indexed columns if available to control style by rank
+    if any(c.startswith('weak_layer_height_') for c in loc_cols):
+        # Sort by index (0, 1, 2...)
+        loc_cols = sorted(
+            [c for c in loc_cols if '_' in c and c.split('_')[-1].isdigit()],
+            key=lambda x: int(x.split('_')[-1])
+        )
+        
+        for i, col in enumerate(loc_cols):
+            # Rank 0 = Solid Black
+            # Rank > 0 = Dashed Black with decreasing opacity
+            style = '-' if i == 0 else '--'
+            alpha = 1.0 if i == 0 else max(0.4, 1.0 - (i * 0.3))
+            width = 2.0 if i == 0 else 1.5
+            label = 'Weak Layer (Primary)' if i == 0 else f'Weak Layer (Alt {i})'
+            
+            if col in df.columns:
+                ax.plot(
+                    df.index,
+                    df[col],
+                    label=label,
+                    color='black',
+                    linestyle=style,
+                    linewidth=width,
+                    alpha=alpha,
+                    zorder=10
+                )
+    # Fallback for backward compatibility (single column)
+    elif 'weak_layer_height' in df.columns:
+        ax.plot(
+            df.index,
+            df['weak_layer_height'],
+            label='Weak Layer Height (LOC)',
+            color='black',
+            zorder=10
+        )
+    
+    # Wet front (plot in segments to avoid connecting across gaps)
+    if 'wet_front_lwc_height' in df.columns:
+        wet_front = df['wet_front_lwc_height']
+        is_valid = wet_front.notna()
+        
+        starts = wet_front.index[
+            is_valid & ~is_valid.shift(1, fill_value=False).astype(bool)
+        ]
+        ends = wet_front.index[
+            is_valid & ~is_valid.shift(-1, fill_value=False).astype(bool)
+        ]
+        
+        for i, (start, end) in enumerate(zip(starts, ends)):
+            segment = wet_front.loc[start:end]
+            label = 'Deepest Wet Front (LWC > 3%)' if i == 0 else None
+            ax.plot(
+                segment.index.to_numpy(),
+                np.asarray(segment, dtype=float),
+                color='red',
+                zorder=10,
+                label=label
+            )
+    
+    # Central date vertical line
+    if central_date:
+        date_num = float(mdates.date2num(central_date))
+        ax.axvline(
+            x=date_num,
+            color='purple',
+            linestyle='--',
+            linewidth=2,
+            label='Central Date',
+            zorder=11
+        )
+        ax.text(
+            date_num,
+            ax.get_ylim()[0],
+            central_date.strftime('%Y-%m-%d'),
+            rotation=90,
+            verticalalignment='bottom',
+            color='purple',
+            fontsize=10
+        )
+
+def configure_plot_aesthetics(
+    fig: Figure,
+    ax: Axes,
+    metadata: Dict[str, Any],
+    colormesh: Optional[QuadMesh] = None,
+    central_date: Optional[datetime] = None
+) -> None:
+    """
+    Configures plot titles, labels, grid, legend, and axes formatting.
+
+    Args:
+        fig: Matplotlib Figure object
+        ax: Matplotlib Axes object
+        metadata: Metadata for plot title
+        colormesh: Colormesh object for colorbar (if applicable)
+        central_date: Central analysis date
+    """
+    # Build title
+    location = (metadata.get("latitude"), metadata.get('longitude'))
+    elevation = metadata.get("altitude")
+    aspect = metadata.get("slopeAzi", "N/A")
+    
+    date_info = ""
+    if central_date:
+        date_info = f"Analysis for: {central_date.strftime('%Y-%m-%d %H:%M UTC')}"
+    
+    title = (
+        f"Wetting Front Tracking: {metadata.get('stationName', 'N/A')}\n"
+        f"Loc: {location}, Elev: {elevation}m, Aspect: {aspect}\n"
+        f"{date_info}"
+    )
+    
+    ax.set_title(title, fontsize=16)
+    ax.set_xlabel('Date', fontsize=12)
+    ax.set_ylabel('Height (cm)', fontsize=12)
+    ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+
+    # Add colorbar if colormesh exists
+    if colormesh:
+        cbar = fig.colorbar(
+            colormesh,
+            ax=ax,
+            label='Liquid Water Content (%)',
+            extend='max'
+        )
+        cbar.set_ticks(LWC_COLORBAR_TICKS)
+        cbar.set_ticklabels(LWC_COLORBAR_LABELS)
+
+    # Configure legend with specific order
+    handles, labels = ax.get_legend_handles_labels()
+    desired_order = [
+        'Total Snow Depth (HS)',
+        'Deepest Wet Front (LWC > 3%)',
+        'Weak Layer Height (LOC)',
+        'Central Date'
+    ]
+    
+    ordered_handles = []
+    ordered_labels = []
+    for key in desired_order:
+        if key in labels:
+            idx = labels.index(key)
+            ordered_handles.append(handles[idx])
+            ordered_labels.append(key)
+    
+    if ordered_handles:
+        ax.legend(ordered_handles, ordered_labels)
+
+    # Format x-axis
+    ax.xaxis.set_major_locator(mdates.HourLocator(interval=12))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %Hh'))
+    fig.autofmt_xdate()
+    plt.tight_layout()
+
+
+# ---------------------------------------------------------------------------
+# Main Plotting Functions - Matplotlib
+# ---------------------------------------------------------------------------
+
+def plot_summary_matplotlib(
+    df: pd.DataFrame,
+    file_stem: str,
+    metadata: Dict[str, Any],
+    lwc_plot_data: Optional[xr.Dataset] = None,
+    central_date: Optional[datetime] = None,
+    assets_dir: Optional[Path] = None
+) -> bool:
+    """
+    Generates and saves a static PNG plot of snowpack analysis.
+
+    Args:
+        df: Summary DataFrame with daily analysis results
+        file_stem: Unique identifier for output file naming
+        metadata: Metadata about the snowpack profile
+        lwc_plot_data: Full-resolution LWC data for colormesh
+        central_date: Reference date for the analysis
+        assets_dir: Directory for saving plot assets
+
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        validate_dataframe(df)
+        validate_metadata(metadata)
+        
+        if assets_dir is None:
+            logger.warning("Assets directory not provided. Cannot save plot.")
+            return False
+        
+        # Create figure
+        fig, ax = plt.subplots(figsize=MATPLOTLIB_FIGSIZE)
+        
+        # Plot LWC colormesh (if available)
+        colormesh = None
+        if lwc_plot_data is not None and 'lwc' in lwc_plot_data:
+            if not lwc_plot_data['lwc'].isnull().to_numpy().all():
+                colormesh = plot_lwc_colormesh(ax, lwc_plot_data)
+                if colormesh:
+                    clip_colormesh_to_wet_area(ax, colormesh, df)
+        
+        # Plot line series
+        plot_line_series(ax, df, central_date)
+        
+        # Configure aesthetics
+        configure_plot_aesthetics(fig, ax, metadata, colormesh, central_date)
+        
+        # Save figure
+        output_path = config.paths.get_png_path(file_stem) #get_png_path(file_stem, assets_dir)
+        plt.savefig(output_path, dpi=MATPLOTLIB_DPI)
+        plt.close(fig)
+        
+        logger.debug(f"Saved Matplotlib plot: {output_path}")
+        return True
+    
+    except PlottingError as e:
+        logger.error(f"Validation error in plot_summary_matplotlib: {e}")
+        return False
+    
+    except Exception as e:
+        logger.error(f"Failed to create Matplotlib plot: {e}", exc_info=True)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Main Plotting Functions - Plotly
+# ---------------------------------------------------------------------------
+
+def create_plotly_figure(
+    df: pd.DataFrame,
+    metadata: Dict[str, Any],
+    central_date: Optional[datetime] = None
+) -> go.Figure:
+    """
+    Creates an interactive Plotly figure from summary data.
+
+    Args:
+        df: Summary DataFrame with analysis results
+        metadata: Profile metadata
+        central_date: Central analysis date
+
+    Returns:
+        Plotly Figure object
+    """
+    fig = go.Figure()
+
+    # Plot filled area for wet layer (in segments)
+    if 'wet_front_lwc_height' in df.columns and 'highest_wet_point' in df.columns:
+        is_valid = (
+            df['wet_front_lwc_height'].notna() &
+            df['highest_wet_point'].notna()
+        )
+        starts = df.index[is_valid & ~is_valid.shift(1, fill_value=False)]
+        ends = df.index[is_valid & ~is_valid.shift(-1, fill_value=False)]
+        
+        for start, end in zip(starts, ends):
+            segment = df.loc[start:end]
+            if len(segment) > 1:
+                x_coords = segment.index.tolist() + segment.index.tolist()[::-1]
+                y_coords = (
+                    segment['highest_wet_point'].tolist() +
+                    segment['wet_front_lwc_height'].tolist()[::-1]
+                )
+                fig.add_trace(go.Scatter(
+                    x=x_coords,
+                    y=y_coords,
+                    fill='toself',
+                    fillcolor='rgba(0, 200, 200, 0.4)',
+                    line=dict(color='rgba(255,255,255,0)'),
+                    hoverinfo="skip",
+                    showlegend=False
+                ))
+
+    # Add legend entry for wet area
+    fig.add_trace(go.Scatter(
+        x=[None],
+        y=[None],
+        mode='markers',
+        marker=dict(color='rgba(0, 200, 200, 0.4)', size=10),
+        name='Wet Layer Extent'
+    ))
+
+    # Plot line series
+    if 'hs' in df.columns:
+        fig.add_trace(go.Scatter(
+            x=df.index,
+            y=df['hs'],
+            name='Total Snow Depth (HS)',
+            mode='lines+markers',
+            line=dict(color='darkblue')
+        ))
+    
+    # --- Plot LOC Candidates (Primary + Alternatives) ---
+    loc_cols = [c for c in df.columns if c.startswith('weak_layer_height_')]
+    
+    # Sort columns numerically (height_0, height_1)
+    loc_cols = sorted(
+        [c for c in loc_cols if c.split('_')[-1].isdigit()],
+        key=lambda x: int(x.split('_')[-1])
+    )
+    
+    if loc_cols:
+        for i, col in enumerate(loc_cols):
+            rank = int(col.split('_')[-1])
+            
+            # Determine Style
+            name = 'Weak Layer (Primary)' if rank == 0 else f'Weak Layer (Alt {rank})'
+            dash = 'solid' if rank == 0 else 'dash'
+            width = 2 if rank == 0 else 1.5
+            
+            # Custom hover text with probability if available
+            prob_col = f'weak_layer_prob_{rank}'
+            hover_template = None
+            if prob_col in df.columns:
+                hover_template = (
+                    "<b>%{y:.2f} cm</b><br>" +
+                    "Date: %{x}<br>" +
+                    "Prob: %{customdata:.2f}<extra></extra>"
+                )
+            
+            fig.add_trace(go.Scatter(
+                x=df.index,
+                y=df[col],
+                name=name,
+                mode='lines',
+                line=dict(color='black', width=width, dash=dash),
+                customdata=df[prob_col] if prob_col in df.columns else None,
+                hovertemplate=hover_template
+            ))
+            
+    elif 'weak_layer_height' in df.columns:
+        # Fallback for legacy data
+        fig.add_trace(go.Scatter(
+            x=df.index,
+            y=df['weak_layer_height'],
+            name='Weak Layer Height (LOC)',
+            mode='lines',
+            line=dict(color='black', width=2)
+        ))
+    
+    if 'wet_front_lwc_height' in df.columns:
+        fig.add_trace(go.Scatter(
+            x=df.index,
+            y=df['wet_front_lwc_height'],
+            name='Deepest Wet Front (LWC > 3%)',
+            mode='lines',
+            line=dict(color='red', width=2),
+            connectgaps=False
+        ))
+    
+    # Configure layout
+    date_str = ""
+    if central_date:
+        date_str = f" | Analysis for {central_date.strftime('%Y-%m-%d %H:%M UTC')}"
+    
+    title = f"Wetting Front Analysis for {metadata.get('stationName', 'N/A')}{date_str}"
+    
+    fig.update_layout(
+        title=title,
+        xaxis_title='Date',
+        yaxis_title='Height (cm)',
+        legend_title_text='Metrics',
+        template='plotly_white',
+    )
+    
+    # Set y-axis range
+    if 'hs' in df.columns and df['hs'].notna().any():
+        fig.update_yaxes(range=[0, df['hs'].max() * 1.1])
+    
+    return fig
+
+
+def plot_summary_plotly(
+    df: pd.DataFrame,
+    file_stem: str,
+    metadata: Dict[str, Any],
+    central_date: Optional[datetime] = None,
+    assets_dir: Optional[Path] = None
+) -> bool:
+    """
+    Generates an interactive HTML page with a Plotly plot.
+
+    Args:
+        df: Summary DataFrame with analysis results
+        file_stem: Unique identifier for output file naming
+        metadata: Metadata about the snowpack profile
+        central_date: Central analysis date
+        assets_dir: Directory for saving plot assets
+
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        validate_dataframe(df)
+        validate_metadata(metadata)
+        
+        if assets_dir is None:
+            logger.warning("Assets directory not provided. Cannot save plot.")
+            return False
+        
+        # Create Plotly figure
+        fig = create_plotly_figure(df, metadata, central_date)
+        
+        # Generate full HTML page
+        plotly_html = fig.to_html(full_html=False, include_plotlyjs='cdn')
+        full_html = generate_html_template(plotly_html, metadata, central_date)
+        
+        # Save HTML file
+        output_path = get_html_path(file_stem, assets_dir)
+        with open(output_path, 'w') as f:
+            f.write(full_html)
+        
+        logger.debug(f"Saved Plotly plot: {output_path}")
+        return True
+    
+    except PlottingError as e:
+        logger.error(f"Validation error in plot_summary_plotly: {e}")
+        return False
+    
+    except Exception as e:
+        logger.error(f"Failed to create Plotly plot: {e}", exc_info=True)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Folium Map - Color Coding
+# ---------------------------------------------------------------------------
+
+def get_time_to_loc_color(time_to_loc: float) -> str:
+    """
+    Determines polygon color based on time_to_loc value.
+
+    Args:
+        time_to_loc: Time in hours for wetting front to reach LOC
+
+    Returns:
+        Color name as string
+    """
+    if pd.isna(time_to_loc):
+        return TIME_TO_LOC_COLORS['unknown'][0]
+    
+    time = float(time_to_loc)
+    
+    for category, (color, min_time, max_time) in TIME_TO_LOC_COLORS.items():
+        if min_time is not None and max_time is not None:
+            if min_time <= time < max_time:
+                return color
+    
+    return TIME_TO_LOC_COLORS['unknown'][0]
+
+
+# ---------------------------------------------------------------------------
+# Folium Map - HTML Generation
+# ---------------------------------------------------------------------------
+
+def generate_tooltip_html(row: pd.Series, assets_dir: Path) -> str:
+    """
+    Generates HTML content for map tooltip.
+
+    Args:
+        row: GeoDataFrame row with polygon data
+        assets_dir: Directory containing plot assets
+
+    Returns:
+        HTML string for tooltip
+    """
+    if pd.isna(row.get('file_stem')):
+        return ""
+    
+    # Create thumbnail
+    png_path = get_png_path(row['file_stem'], assets_dir)
+    thumb_path = png_path.parent / f"{png_path.stem}_thumb.png"
+    create_thumbnail(png_path, thumb_path)
+    
+    # Build HTML
+    image_path = f"{ASSETS_SUBFOLDER_NAME}/{thumb_path.name}"
+    
+    date_str = ""
+    if pd.notna(row.get('central_date_str')):
+        date_str = f"Analysis Date: {row['central_date_str']}<br>"
+    
+    return (
+        f"<b>{row.get('pathName', 'Unknown Path')}</b><br>"
+        f"{date_str}"
+        f"Aspect: {row.get('aspect', 'N/A')}<br>"
+        f'<img src="{image_path}" width="800">'
+    )
+
+
+def generate_popup_html(row: pd.Series, assets_dir: Path) -> str:
+    """
+    Generates HTML content for map popup.
+
+    Args:
+        row: GeoDataFrame row with polygon data
+        assets_dir: Directory containing plot assets
+
+    Returns:
+        HTML string for popup
+    """
+    if pd.isna(row.get('file_stem')):
+        return ""
+    
+    html_path = get_html_path(row['file_stem'], assets_dir)
+    link_path = f"{ASSETS_SUBFOLDER_NAME}/{html_path.name}"
+    
+    date_str = ""
+    if pd.notna(row.get('central_date_str')):
+        date_str = f"Analysis Date: {row['central_date_str']}<br>"
+    
+    return (
+        f"<b>{row.get('station_name', 'Unknown Station')}</b><br>"
+        f"{date_str}"
+        f'<a href="{link_path}" target="_blank">Open Interactive Plot</a>'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Folium Map - Legend and Title
+# ---------------------------------------------------------------------------
+
+def create_map_legend_html() -> str:
+    """
+    Creates HTML for the map legend.
+
+    Returns:
+        HTML string for legend
+    """
+    return """
+     <b>Time for Wetting Front to Reach LOC</b><br>
+     <i style="background:darkred"></i> 0 to 24h (Imminent)<br>
+     <i style="background:orange"></i> 24 to 48h<br>
+     <i style="background:yellow"></i> 48 to 72h<br>
+     <hr style='border-top: 1px solid grey; margin-top: 5px; margin-bottom: 5px;'>
+     <i style="background:red"></i> -24 to 0h (Recent)<br>
+     <i style="background:lightblue"></i> -48 to -24h (Past)<br>
+     <i style="background:darkblue"></i> -72 to -48h (Past)<br>
+     <hr style='border-top: 1px solid grey; margin-top: 5px; margin-bottom: 5px;'>
+     <i style="background:gray"></i> Other / No Data
+"""
+
+
+def create_map_title_html(central_date: Optional[datetime]) -> str:
+    """
+    Creates HTML for the map title.
+
+    Args:
+        central_date: Central analysis date
+
+    Returns:
+        HTML string for title
+    """
+    date_str = ""
+    if central_date:
+        date_str = datetime.now().strftime('%Y-%m-%d %H:%M')
+    
+    return f'<h3 align="center" style="font-size:16px"><b>Wetting Front Analysis | {date_str}</b></h3>'
+
+
+def create_map_persistence_javascript(map_name: str) -> str:
+    """
+    Creates JavaScript for saving/restoring map state in localStorage.
+
+    Args:
+        map_name: The Folium map variable name
+
+    Returns:
+        JavaScript code as string
+    """
+    return f"""
+    <script>
+    document.addEventListener("DOMContentLoaded", function() {{
+        const DEBUG_MODE = false;
+        var mapObj = window.{map_name};
+        if (!mapObj) return;
+
+        function log(message) {{
+            if (DEBUG_MODE) console.log(message);
+        }}
+
+        // Restore last view
+        var lastView = localStorage.getItem('preferredView');
+        if (lastView) {{
+            try {{
+                var view = JSON.parse(lastView);
+                mapObj.setView(view.center, view.zoom);
+            }} catch(e) {{}}
+        }}
+
+        // Restore last basemap
+        setTimeout(function() {{
+            var lastBase = localStorage.getItem('preferredBaseLayer');
+            log("Restoring basemap: " + lastBase);
+
+            var found = false;
+            var layerControl = document.querySelector('.leaflet-control-layers-base');
+            if (layerControl) {{
+                var labels = layerControl.querySelectorAll('label');
+                labels.forEach(function(label) {{
+                    var layerName = label.textContent.trim();
+                    if (layerName === lastBase) {{
+                        var input = label.querySelector('input[type=radio]');
+                        if (input && !input.checked) {{
+                            input.click();
+                            found = true;
+                            log("Restored basemap: " + layerName);
+                        }}
+                    }}
+                }});
+            }}
+        }}, 750);
+
+        // Save on base layer change
+        mapObj.on('baselayerchange', function(e) {{
+            localStorage.setItem('preferredBaseLayer', e.name);
+            log("Saved basemap: " + e.name);
+        }});
+
+        // Save view on move/zoom
+        function saveView() {{
+            var center = mapObj.getCenter();
+            var zoom = mapObj.getZoom();
+            localStorage.setItem('preferredView', JSON.stringify({{
+                center: [center.lat, center.lng],
+                zoom: zoom
+            }}));
+        }}
+        mapObj.on('moveend', saveView);
+        mapObj.on('zoomend', saveView);
+    }});
+    </script>
+    """
+
+
+# ---------------------------------------------------------------------------
+# Folium Map - Main Function
+# ---------------------------------------------------------------------------
+
+def create_folium_map(
+    final_gdf: gpd.GeoDataFrame,
+    map_output_path: Path,
+    central_date: datetime,
+    assets_dir: Path
+) -> bool:
+    """
+    Creates a Folium summary map with polygons colored by risk level.
+
+    Args:
+        final_gdf: GeoDataFrame with polygon geometries and analysis results
+        map_output_path: Path to save the summary_map.html file
+        central_date: Central analysis date for the map title
+        assets_dir: Directory where plot assets are stored
+
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        if final_gdf.empty:
+            logger.warning("GeoDataFrame is empty. Cannot create map.")
+            return False
+        
+        # Repair geometries
+        final_gdf['geometry'] = final_gdf.geometry.buffer(0)
+        
+        # Calculate areas
+        gdf_proj = final_gdf.to_crs("EPSG:3857")
+        final_gdf['area_sq_meters'] = gdf_proj.geometry.area
+        
+        # Add color, tooltip, and popup columns
+        final_gdf['color'] = final_gdf['time_to_loc'].apply(get_time_to_loc_color)
+        final_gdf['tooltip'] = final_gdf.apply(
+            lambda row: generate_tooltip_html(row, assets_dir),
+            axis=1
+        )
+        final_gdf['popup'] = final_gdf.apply(
+            lambda row: generate_popup_html(row, assets_dir),
+            axis=1
+        )
+        
+        # Save map data
+        map_data_path = config.paths.results_path / "map_data.geojson"
+        final_gdf.to_file(map_data_path, driver='GeoJSON')
+        
+        # Calculate map center
+        map_center = final_gdf.to_crs("EPSG:4269").unary_union.centroid
+        center_coords = (
+            [map_center.y, map_center.x]
+            if map_center
+            else MAP_DEFAULT_LOCATION
+        )
+        
+        # Create map
+        m = folium.Map(location=center_coords, zoom_start=MAP_DEFAULT_ZOOM)
+        
+	# Create a mini map
+        minimap = MiniMap(toggle_display=True)
+        minimap.add_to(m)
+        # Add tile layers
+        folium.TileLayer('OpenStreetMap', name='Street View').add_to(m)
+        folium.TileLayer('OpenTopoMap', name='Topographic').add_to(m)
+        folium.TileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+            attr='Esri',
+            name='Satellite'
+        ).add_to(m)
+        
+        # Add GeoJSON layer
+        def style_function(x):
+            return {
+                "fillColor": x['properties']['color'],
+                "color": "black",
+                "weight": 1,
+                "fillOpacity": 0.6
+            }
+        
+        gjson = GeoJson(
+            str(map_data_path.resolve()),
+            style_function=style_function,
+            name='Avalanche Path Risk',
+            tooltip=GeoJsonTooltip(
+                fields=['tooltip'],
+                aliases=[''],
+                localize=True,
+                sticky=True
+            ),
+            popup=GeoJsonPopup(
+                fields=['popup'],
+                aliases=[''],
+                localize=True
+            )
+        )
+        gjson.add_to(m)
+        
+        # Add title and legend
+        title_html = create_map_title_html(central_date)
+        legend_html = create_map_legend_html()
+        
+        template = f"""
+        {{% macro script(this, kwargs) %}}
+            var title = L.control({{position: 'topright'}});
+            title.onAdd = function (map) {{
+                var div = L.DomUtil.create('div', 'info');
+                div.innerHTML = `{title_html}`;
+                return div;
+            }};
+            title.addTo({m.get_name()});
+
+            var legend = L.control({{position: 'bottomleft'}});
+            legend.onAdd = function (map) {{
+                var div = L.DomUtil.create('div', 'info legend');
+                div.innerHTML = `{legend_html}`;
+                return div;
+            }};
+            legend.addTo({m.get_name()});
+
+            var style = document.createElement('style');
+            style.innerHTML = `
+                .legend {{
+                    line-height: 20px;
+                    color: #333;
+                    background-color: rgba(255, 255, 255, 0.8);
+                    padding: 10px;
+                    border-radius: 5px;
+                    border: 2px solid #aaa;
+                }}
+                .legend i {{
+                    width: 18px;
+                    height: 18px;
+                    float: left;
+                    margin-right: 8px;
+                    opacity: 0.9;
+                }}
+            `;
+            document.head.appendChild(style);
+        {{% endmacro %}}
+        """
+        
+        macro = MacroElement()
+        macro._template = Template(template)
+        m.get_root().add_child(macro)
+        
+        # Add layer control
+        folium.LayerControl().add_to(m)
+        
+        # Add persistence JavaScript
+        persistence_js = create_map_persistence_javascript(m.get_name())
+        m.get_root().html.add_child(Element(persistence_js))  # type: ignore
+        
+        # Save map
+        m.save(str(map_output_path))
+        
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        logger.info(f"Summary map saved to: {map_output_path} at {timestamp}")
+        return True
+    
+    except Exception as e:
+        logger.error(f"Failed to create Folium map: {e}", exc_info=True)
+        return False
