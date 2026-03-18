@@ -72,7 +72,6 @@ DEM_TIF = PROCESSED_DATA_PATH / 'dem.tif'
 ASPECT_POLYGONS_GEOJSON = PROCESSED_DATA_PATH / 'aspect_polygons.geojson'
 LINKED_POLYGONS_GEOJSON = PROCESSED_DATA_PATH / 'linked_aspect_polygons.geojson'
 SUMMARY_MAP_HTML = RESULTS_PATH / "summary_map.html"
-PRO_FILE_MANIFEST = PROCESSED_DATA_PATH / "pro_file_manifest.txt"
 
 # Directory Creation
 for path in [DATA_PATH, RESULTS_PATH, REFERENCE_PATH, PROCESSED_DATA_PATH, ASSETS_PATH]:

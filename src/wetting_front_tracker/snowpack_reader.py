@@ -233,7 +233,7 @@ class SnowpackProfile:
                     values = profile.get(param)
                     if values is not None:
                         # ✅ Populate with the correct array type
-                        arr[i, :num_layers] = xp.array(values, dtype=xp.float32)[:num_layers]
+                        arr[i, :num_layers] = xp.array(values, dtype=xp.float64)[:num_layers]
 
         # The second loop is no longer needed.
         

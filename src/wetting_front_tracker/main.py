@@ -434,6 +434,8 @@ def parse_args() -> argparse.Namespace:
     Returns:
         argparse.Namespace: An object containing the parsed command-line arguments.
     """
+    
+    central_date_default = datetime.now().strftime('%Y-%m-%d 12:00')
     parser = argparse.ArgumentParser(
         description="Run wet snow tracker analysis on SNOWPACK .pro files.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -446,7 +448,7 @@ def parse_args() -> argparse.Namespace:
         "-d", "--date", dest="central_date",
         help="Central date and time for analysis (e.g., 'YYYY-MM-DD HH:MM' or 'YYYY-MM-DD'). "
              "Rounds to the closest synoptic time (00, 06, 12, 18).",
-             default="2025-05-09 12:00"  # Default to a future date for demonstration
+             default=central_date_default
     )
     parser.add_argument("-s", "--start", dest="start_date", 
                         help="Start date for analysis (overrides default window)."
@@ -548,7 +550,7 @@ def main():
     # --- Task Generation (Single Day) ---
     tasks = []
     for poly in linked_gdf.itertuples(index=False):
-# Get the filename from the geodataframe
+    # Get the filename from the geodataframe
         file_name = Path(str(poly.pro_file_path)).name
         
         # Look up the full path from our manifest dictionary

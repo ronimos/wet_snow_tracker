@@ -45,39 +45,38 @@ logger = logging.getLogger(__name__)
 
 def largest_fc_dh_gs_diff(df: pd.DataFrame):
     """
-    Finds the faceted (FC) or depth hoar (DH) layer with the largest positive
-    grain size difference relative to the layer below it.
+    Finds the faceted (FC) or depth hoar (DH) layer with the largest grain size
+    contrast relative to the layer below it.
 
-    This metric is a proxy for a potential weak layer. A large, positive
-    `gs_difference` indicates that larger, weaker faceted grains are sitting on
-    top of a layer of smaller grains, which can form a stark structural weakness.
-    This function searches the entire snowpack profile.
+    A large positive signed difference (grain_size[i] - grain_size[i-1]) at an
+    FC/DH layer indicates coarser weak grains sitting on finer grains — a
+    structural weakness. This function computes the signed difference from raw
+    grain sizes since SNOWPACK field 0602 is unsigned.
 
     Args:
         df (pd.DataFrame): A DataFrame representing a single day's snow profile.
-                           It must contain 'grain_type', 'gs_difference', and
-                           'height' columns.
+                           Must contain 'grain_type', 'grain_size', and 'height'.
 
     Returns:
-        tuple or None: A tuple containing (`gs_difference`, `height`) of the most
-                       prominent FC/DH weak layer, or None if no suitable
-                       layer is found.
+        tuple: (signed_gs_diff, height) of the most prominent FC/DH weak layer,
+               or (None, None) if no suitable layer is found.
     """
-    if df.empty or "grain_type" not in df or "gs_difference" not in df:
+    if df.empty or "grain_type" not in df or "grain_size" not in df:
         return None, None
 
-    # SNOWPACK grain codes for FC and DH range from 400 to 599.
-    mask_type = ((df['grain_type'] >= 400) & (df['grain_type'] < 600))
-    # A positive difference indicates larger grains in the upper layer.
-    mask_diff = df['gs_difference'] > 0.5
-    candidates = df[mask_type & mask_diff]
+    # Compute signed grain size difference: positive = coarsening upward
+    signed_diff = df['grain_size'].diff()
+
+    mask_type = (df['grain_type'] >= 400) & (df['grain_type'] < 600)
+    mask_diff = signed_diff > 0.5
+    candidates = df[mask_type & mask_diff].copy()
 
     if candidates.empty:
         return None, None
 
-    # Find the layer with the maximum grain size difference among candidates.
-    best = candidates.loc[candidates['gs_difference'].idxmax()]
-    return best['gs_difference'].astype(float), best['height'].astype(float)
+    candidates['signed_gs_diff'] = signed_diff.loc[candidates.index]
+    best = candidates.loc[candidates['signed_gs_diff'].idxmax()]
+    return float(best['signed_gs_diff'].item()), float(best['height'].item())
 
 # In wet_front_tracker.py
 
@@ -85,57 +84,57 @@ def find_wet_slab_loc(df: pd.DataFrame):
     """
     Finds the LOC for a wet slab avalanche based on a capillary barrier.
 
-    This function identifies the LOC by finding an interface where a layer of
-    smaller grains sits on top of a layer of larger, weak grains (FC or DH).
-    This creates a capillary barrier that can lead to water pooling.
+    Identifies interfaces where a layer of smaller grains sits on top of a
+    layer of larger, weak grains (FC or DH). This fine-over-coarse transition
+    creates a capillary barrier that can lead to water pooling.
+
+    The signed grain size difference is computed from raw grain_size values
+    since SNOWPACK field 0602 (gs_difference) is unsigned.
 
     Args:
         df (pd.DataFrame): A DataFrame representing a single day's snow profile.
-                           It must contain 'grain_type', 'gs_difference', and
-                           'height' columns.
+                           Must contain 'grain_type', 'grain_size', and 'height'.
 
     Returns:
-        tuple or None: A tuple containing (`gs_difference`, `height`) of the
-                       LOC (the lower layer), or (None, None) if no suitable
-                       layer is found.
+        tuple: (signed_gs_diff, height) of the LOC (the lower, coarser layer),
+               or (None, None) if no suitable layer is found.
     """
-    if df.empty or "grain_type" not in df or "gs_difference" not in df or len(df) < 2:
+    if df.empty or "grain_type" not in df or "grain_size" not in df or len(df) < 2:
         return None, None
 
-    # 1. Find all interfaces with a negative grain size difference (small grains over large) 
-    # where the grain size difference >= 0.5 (indicating a significant capillary barrier).
-    # This identifies the upper layer of potential capillary barriers.
-    capillary_interfaces = df[df['gs_difference'] < 0.5].copy()
+    # Signed difference: gs[i] - gs[i-1], layers ordered bottom-to-top.
+    # Negative = fining upward = fine-over-coarse = capillary barrier.
+    signed_diff = df['grain_size'].diff()
+
+    # 1. Find interfaces with significant capillary barrier (fining upward)
+    capillary_mask = signed_diff < -0.5
+    capillary_interfaces = df[capillary_mask]
     if capillary_interfaces.empty:
         return None, None
 
-    # 2. For each interface, identify the layer below it (the LOC candidate)
-    # The index of the lower layer is one less than the index of the upper layer.
+    # 2. The LOC candidate is the layer below each interface (the coarse layer)
     lower_layer_indices = capillary_interfaces.index - 1
-    
-    # Ensure indices are valid
     valid_indices = lower_layer_indices[lower_layer_indices >= df.index.min()]
     if valid_indices.empty:
         return None, None
-        
+
     loc_candidates = df.loc[valid_indices].copy()
 
-    # 3. The LOC must be faceted crystals (FC) or depth hoar (DH)
+    # 3. The LOC must be FC or DH
     mask_type = (loc_candidates['grain_type'] >= 400) & (loc_candidates['grain_type'] < 600)
     final_candidates = loc_candidates[mask_type].copy()
 
     if final_candidates.empty:
         return None, None
 
-    # 4. Find the interface with the most negative gs_difference.
-    # We need to look up the gs_difference from the layer *above* our final candidates.
-    corresponding_upper_layer_indices = final_candidates.index + 1
-    final_candidates['gs_difference_interface'] = df.loc[corresponding_upper_layer_indices, 'gs_difference'].to_numpy()
+    # 4. Look up the signed diff at the layer above each candidate (the interface)
+    upper_indices = final_candidates.index + 1
+    final_candidates['signed_gs_diff'] = signed_diff.loc[upper_indices].to_numpy()
 
-    # Select the LOC with the most significant capillary barrier (most negative gs_diff)
-    best_loc = final_candidates.loc[final_candidates['gs_difference_interface'].idxmin()]
-    
-    return best_loc['gs_difference_interface'], best_loc['height']
+    # Pick the strongest capillary barrier (most negative)
+    best_loc = final_candidates.loc[final_candidates['signed_gs_diff'].idxmin()]
+
+    return float(best_loc['signed_gs_diff'].item()), float(best_loc['height'].item())
 
 
 def find_wet_slab_loc_bottom_half(df: pd.DataFrame):
