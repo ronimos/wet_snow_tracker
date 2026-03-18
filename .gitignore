@@ -6,3 +6,4 @@
 /src/wet_snow_tracker/__pycache__/*pyc
 /src/wetting_front_tracker/__pycache__/*pyc
 /src/wetting_front_stall_analasys/*
+/logs/

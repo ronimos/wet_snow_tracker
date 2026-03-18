@@ -1153,7 +1153,6 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "bottleneck" },
-    { name = "cupy" },
     { name = "dask" },
     { name = "folium" },
     { name = "geopandas" },
@@ -1173,13 +1172,14 @@ dependencies = [
 
 [package.optional-dependencies]
 analysis = [
+    { name = "cupy" },
     { name = "seaborn" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "bottleneck", specifier = ">=1.5.0" },
-    { name = "cupy", specifier = ">=13.6.0" },
+    { name = "cupy", marker = "extra == 'analysis'", specifier = ">=13.6.0" },
     { name = "dask", specifier = ">=2025.7.0" },
     { name = "folium", specifier = ">=0.20.0" },
     { name = "geopandas", specifier = ">=1.1.1" },

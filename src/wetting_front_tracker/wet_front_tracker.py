@@ -76,7 +76,7 @@ def largest_fc_dh_gs_diff(df: pd.DataFrame):
 
     candidates['signed_gs_diff'] = signed_diff.loc[candidates.index]
     best = candidates.loc[candidates['signed_gs_diff'].idxmax()]
-    return float(best['signed_gs_diff'].item()), float(best['height'].item())
+    return best['signed_gs_diff'].item(), best['height'].item()
 
 # In wet_front_tracker.py
 
@@ -134,7 +134,7 @@ def find_wet_slab_loc(df: pd.DataFrame):
     # Pick the strongest capillary barrier (most negative)
     best_loc = final_candidates.loc[final_candidates['signed_gs_diff'].idxmin()]
 
-    return float(best_loc['signed_gs_diff'].item()), float(best_loc['height'].item())
+    return best_loc['signed_gs_diff'].item(), best_loc['height'].item()
 
 
 def find_wet_slab_loc_bottom_half(df: pd.DataFrame):
