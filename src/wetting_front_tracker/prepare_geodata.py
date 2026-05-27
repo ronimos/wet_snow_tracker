@@ -2,417 +2,648 @@
 prepare_geodata.py
 ==================
 
-This module handles all geospatial data preparation for the Wetting Front Tracker
-application. Its primary purpose is to take a GeoJSON file of input polygons 
-(e.g., avalanche paths) and process it into a final, analysis-ready GeoJSON file.
+Geospatial data preparation for the Wetting Front Tracker application.
 
-The workflow orchestrated by this module includes:
-1.  **DEM Acquisition:** Strategically downloads Digital Elevation Model (DEM) data 
-    from the OpenTopography API. It optimizes downloads by identifying clusters of 
-    polygons and fetching only the necessary DEM tiles, which are then mosaicked 
-    into a single raster file.
-2.  **Aspect Classification:** Uses the DEM to calculate the terrain aspect for 
-    the area covered by the input polygons. It then splits each polygon into 
-    sub-polygons based on the four cardinal aspects: North, East, South, and West.
-3.  **Data Cleaning:** Filters out small, insignificant "sliver" polygons that can be 
-    generated during the splitting process. It also repairs and validates 
-    geometries to ensure they are well-formed.
-4.  **Data Linking:** Links each aspect-classified polygon to the most relevant 
-    SNOWPACK (.pro) model output file. This matching is performed based on spatial 
-    proximity and matching terrain aspect, ensuring that each polygon is associated 
-    with the most representative snowpack simulation.
-5.  **Manifest Generation:** Creates a manifest file listing all the unique .pro 
-    files required for the subsequent analysis steps.
-
-This module is designed to be run as a preliminary step before the main snowpack 
-analysis. The final output, `linked_aspect_polygons.geojson`, serves as the primary 
-input for the analysis phase.
+This module handles all geospatial preprocessing, including:
+1. DEM acquisition from OpenTopography API with retry logic
+2. Aspect classification and polygon splitting
+3. Data cleaning and validation
+4. Linking polygons to SNOWPACK model files
 
 Key Dependencies:
 - geopandas for vector data manipulation
 - rioxarray and rasterio for raster data processing
-- requests for API communication
+- requests for API communication with retry logic
 - scipy for spatial indexing (k-d tree)
-- numpy for numerical operations
+
+Author: Ron Simenhois
+Last Updated: October 12, 2025
 """
+
 import itertools
-import math
+import json
 import logging
-import requests
+import math
+import time
 from pathlib import Path
-import pandas as pd
+from typing import Dict, List, Optional, Tuple, Any
+
 import geopandas as gpd
 import numpy as np
-from scipy.spatial import cKDTree  # type: ignore   
-import rioxarray
+import pandas as pd
 import rasterio
-from rasterio.merge import merge
-from rasterio.features import shapes
-from shapely.geometry import shape, Polygon, LinearRing, mapping
-from shapely import union_all
+import requests
+import rioxarray
 from numba import njit
+from rasterio.features import shapes
+from rasterio.merge import merge
+from scipy.spatial import cKDTree
+from shapely import union_all
+from shapely.geometry import LinearRing, Polygon, mapping, shape
 from tqdm import tqdm
-from typing import Optional
 
-from .param_config import (OPENTOPO_API_KEY,
-                           ASPECT_POLYGONS_GEOJSON, DEM_DATASETS, DEM_TIF, 
-                           INPUT_POLYGONS_GEOJSON, LINKED_POLYGONS_GEOJSON,
-                           PRO_FILE_MANIFEST, SNOWPACK_LOCATIONS_CSV)
+try:
+    from .param_config import config
+except ImportError: # For direct script execution
+    from param_config import config 
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# DEM Download Settings
+MAX_DEM_AREA_KM2 = 10000.0  # Maximum area per tile
+MAX_RETRIES = 3  # Maximum number of download retry attempts
+RETRY_DELAY = 2.0  # Initial delay between retries (seconds)
+REQUEST_TIMEOUT = 120  # HTTP request timeout (seconds)
+
+# Aspect Classification
+ASPECT_BINS = {
+    "N": (315, 45),
+    "E": (45, 135),
+    "S": (135, 225),
+    "W": (225, 315),
+}
+
+# Polygon Filtering
+MIN_POLYGON_AREA_M2 = 1600.0  # 40m x 40m minimum
+MIN_AREA_RATIO = 0.1  # 10% of original polygon minimum
+
+# Polygon Clustering
+CLUSTER_BUFFER_DISTANCE = 0.1  # Degrees for clustering nearby polygons
+
+
+# ---------------------------------------------------------------------------
+# Error Handling and Retry Logic
+# ---------------------------------------------------------------------------
+
+class DEMDownloadError(Exception):
+    """Raised when DEM download fails after all retries."""
+    pass
+
+
+class GeodataValidationError(Exception):
+    """Raised when geodata validation fails."""
+    pass
+
+
+def retry_with_backoff(
+    func,
+    max_retries: int = MAX_RETRIES,
+    initial_delay: float = RETRY_DELAY,
+    backoff_factor: float = 2.0
+):
+    """
+    Decorator that retries a function with exponential backoff.
+    
+    Args:
+        func: Function to retry
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay in seconds
+        backoff_factor: Multiplier for delay on each retry
+        
+    Returns:
+        Function result if successful
+        
+    Raises:
+        Last exception if all retries fail
+    """
+    def wrapper(*args, **kwargs):
+        delay = initial_delay
+        last_exception = None
+        
+        for attempt in range(max_retries):
+            try:
+                return func(*args, **kwargs)
+            except requests.RequestException as e:
+                last_exception = e
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        f"Attempt {attempt + 1}/{max_retries} failed: {e}. "
+                        f"Retrying in {delay:.1f}s..."
+                    )
+                    time.sleep(delay)
+                    delay *= backoff_factor
+                else:
+                    logger.error(f"All {max_retries} attempts failed")
+        
+        raise last_exception
+    
+    return wrapper
+
+
+# ---------------------------------------------------------------------------
+# Validation Functions
+# ---------------------------------------------------------------------------
+
+def validate_geodataframe(gdf: gpd.GeoDataFrame, required_cols: Optional[List[str]] = None) -> None:
+    """
+    Validates a GeoDataFrame has required columns and valid geometries.
+    
+    Args:
+        gdf: GeoDataFrame to validate
+        required_cols: List of required column names
+        
+    Raises:
+        GeodataValidationError: If validation fails
+    """
+    if gdf.empty:
+        raise GeodataValidationError("GeoDataFrame is empty")
+    
+    if required_cols:
+        missing_cols = [col for col in required_cols if col not in gdf.columns]
+        if missing_cols:
+            raise GeodataValidationError(f"Missing required columns: {missing_cols}")
+    
+    if not gdf.geometry.is_valid.all():
+        invalid_count = (~gdf.geometry.is_valid).sum()
+        logger.warning(f"Found {invalid_count} invalid geometries. Will attempt to repair.")
+
+
+def validate_api_key(api_key: str) -> None:
+    """
+    Validates that an API key has been properly configured.
+    
+    Args:
+        api_key: The API key to validate
+        
+    Raises:
+        ValueError: If API key is not set
+    """
+    import os
+    import dotenv
+    
+    dotenv.load_dotenv()
+    OPENTOPO_API_KEY = os.getenv("OPENTOPO_API_KEY", "").strip()
+    
+    if api_key == OPENTOPO_API_KEY or not api_key:
+        raise ValueError(
+            "OpenTopography API key not set. "
+            "Set OPENTOPO_API_KEY in your .env file or environment variables."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Polygon Smoothing (Chaikin Algorithm)
+# ---------------------------------------------------------------------------
 
 @njit
-def _chaikin_iteration(coords, ratio=0.25):
+def _chaikin_iteration(coords: np.ndarray, ratio: float = 0.25) -> np.ndarray:
     """
     Performs a single iteration of Chaikin's corner-cutting algorithm.
 
-    This Numba-jitted function efficiently calculates the new vertices for one
-    smoothing pass. It replaces each vertex with two new vertices, one at a
-    `ratio` along the incoming segment and one at `1 - ratio` along the same
-    segment.
+    This Numba-jitted function efficiently calculates new vertices for one
+    smoothing pass. It replaces each vertex with two new vertices.
 
     Args:
-        coords (np.ndarray): An array of (x, y) coordinates for a linestring.
-        ratio (float): The ratio for cutting corners, typically 0.25.
+        coords: Array of (x, y) coordinates
+        ratio: Ratio for cutting corners (typically 0.25)
 
     Returns:
-        np.ndarray: A new array of coordinates after one smoothing iteration.
+        New array of coordinates after smoothing
     """
     new_coords = np.zeros((len(coords) * 2 - 2, 2))
     for i in range(len(coords) - 1):
         x1, y1 = coords[i]
-        x2, y2 = coords[i+1]
+        x2, y2 = coords[i + 1]
         
-        q1_x, q1_y = x1 + (x2 - x1) * ratio, y1 + (y2 - y1) * ratio
-        q2_x, q2_y = x1 + (x2 - x1) * (1 - ratio), y1 + (y2 - y1) * (1 - ratio)
+        q1_x = x1 + (x2 - x1) * ratio
+        q1_y = y1 + (y2 - y1) * ratio
+        q2_x = x1 + (x2 - x1) * (1 - ratio)
+        q2_y = y1 + (y2 - y1) * (1 - ratio)
         
-        new_coords[2*i] = (q1_x, q1_y)
-        new_coords[2*i+1] = (q2_x, q2_y)
-        
+        new_coords[2 * i] = (q1_x, q1_y)
+        new_coords[2 * i + 1] = (q2_x, q2_y)
+    
     return new_coords
 
-def chaikin_smooth(geometry, iterations=5):
+
+def chaikin_smooth(geometry: Polygon, iterations: int = 5) -> Polygon:
     """
     Applies Chaikin's corner-cutting algorithm to smooth a polygon.
 
-    This function iteratively applies the corner-cutting algorithm to the
-    exterior and any interior rings of a polygon, resulting in a smoother,
-    more organic shape.
-
     Args:
-        geometry (Polygon): The input Shapely Polygon to smooth.
-        iterations (int): The number of smoothing iterations to perform.
+        geometry: Input Shapely Polygon to smooth
+        iterations: Number of smoothing iterations
 
     Returns:
-        Polygon: The smoothed Shapely Polygon. Returns the original geometry
-                 if it's not a valid polygon.
+        Smoothed Shapely Polygon
     """
     if not isinstance(geometry, Polygon) or geometry.is_empty:
         return geometry
 
+    # Smooth exterior
     exterior_coords = np.array(geometry.exterior.coords)
     for _ in range(iterations):
         exterior_coords = _chaikin_iteration(exterior_coords)
     
-    smoothed_exterior = LinearRing(np.vstack([exterior_coords, exterior_coords[0]]))
+    smoothed_exterior = LinearRing(
+        np.vstack([exterior_coords, exterior_coords[0]])
+    )
 
+    # Smooth interiors
     smoothed_interiors = []
     for interior in geometry.interiors:
         interior_coords = np.array(interior.coords)
         for _ in range(iterations):
             interior_coords = _chaikin_iteration(interior_coords)
-        smoothed_interiors.append(LinearRing(np.vstack([interior_coords, interior_coords[0]])))
+        smoothed_interiors.append(
+            LinearRing(np.vstack([interior_coords, interior_coords[0]]))
+        )
 
     return Polygon(smoothed_exterior, smoothed_interiors)
 
 
-def _calculate_tiles(bounds: tuple, max_area_km2: float = 10000.0) -> list[tuple]:
-    """
-    Splits a large bounding box into a grid of smaller tiles under a max area.
+# ---------------------------------------------------------------------------
+# DEM Download and Management
+# ---------------------------------------------------------------------------
 
-    This function is used to break down a large DEM request into smaller chunks
-    that are compliant with API limits. It calculates the required number of
-    splits in latitude and longitude to ensure each tile is smaller than
-    `max_area_km2`.
+def _calculate_tiles(bounds: Tuple[float, float, float, float]) -> List[Tuple]:
+    """
+    Splits a large bounding box into smaller tiles under max area constraint.
 
     Args:
-        bounds (tuple): A tuple representing the bounding box (west, south,
-                        east, north).
-        max_area_km2 (float): The maximum desired area for each tile in square km.
+        bounds: Bounding box (west, south, east, north)
 
     Returns:
-        list[tuple]: A list of bounding box tuples for the generated tiles.
+        List of bounding box tuples for tiles
     """
     west, south, east, north = bounds
+    
+    # Calculate approximate dimensions in km
     lat_dist = (north - south) * 111
     lon_dist = (east - west) * 111 * math.cos(math.radians((north + south) / 2))
     
     area = lat_dist * lon_dist
-    if area <= max_area_km2:
+    if area <= MAX_DEM_AREA_KM2:
         return [bounds]
 
-    split_factor = math.sqrt(area / max_area_km2)
-    n_lat_splits = max(2, math.ceil(split_factor * (lat_dist / (lat_dist + lon_dist))))
-    n_lon_splits = max(2, math.ceil(split_factor * (lon_dist / (lat_dist + lon_dist))))
+    # Calculate split factors
+    split_factor = math.sqrt(area / MAX_DEM_AREA_KM2)
+    total_dist = lat_dist + lon_dist
+    n_lat_splits = max(2, math.ceil(split_factor * (lat_dist / total_dist)))
+    n_lon_splits = max(2, math.ceil(split_factor * (lon_dist / total_dist)))
     
+    # Generate tiles
     lat_step = (north - south) / n_lat_splits
     lon_step = (east - west) / n_lon_splits
     
     tiles = [
         (
-            west + j * lon_step, south + i * lat_step,
-            west + (j + 1) * lon_step, south + (i + 1) * lat_step
+            west + j * lon_step,
+            south + i * lat_step,
+            west + (j + 1) * lon_step,
+            south + (i + 1) * lat_step
         )
         for i, j in itertools.product(range(n_lat_splits), range(n_lon_splits))
     ]
-            
-    logging.info(f"Bounding box split into a {n_lon_splits}x{n_lat_splits} grid ({len(tiles)} total tiles).")
+    
+    logger.info(
+        f"Split bounding box into {n_lon_splits}x{n_lat_splits} grid "
+        f"({len(tiles)} tiles)"
+    )
     return tiles
 
 
-def _download_tile(api_key: str, bounds: tuple, output_path: Path, dataset: dict) -> bool:
+@retry_with_backoff
+def _download_tile(
+    api_key: str,
+    bounds: Tuple[float, float, float, float],
+    output_path: Path,
+    dataset_config: Dict
+) -> None:
     """
-    Downloads a single DEM tile from the OpenTopography API.
+    Downloads a single DEM tile from OpenTopography API with retry logic.
 
     Args:
-        api_key (str): The OpenTopography API key.
-        bounds (tuple): The bounding box (west, south, east, north) for the tile.
-        output_path (Path): The local file path to save the downloaded GeoTIFF.
-        dataset (dict): A dictionary containing configuration for the DEM
-                        dataset, including its name and API endpoint.
+        api_key: OpenTopography API key
+        bounds: Bounding box (west, south, east, north)
+        output_path: Local file path to save the GeoTIFF
+        dataset_config: Dictionary with dataset configuration
 
-    Returns:
-        bool: True if the download was successful, False otherwise.
+    Raises:
+        requests.RequestException: If download fails after retries
+        DEMDownloadError: If response is not successful
     """
-    base_url = dataset['api_endpoint']
     west, south, east, north = bounds
-    params = {dataset['param_name']: dataset['name'], 'south': south, 'north': north,
-              'west': west, 'east': east, 'outputFormat': 'GTiff', 'API_Key': api_key}
+    
+    params = {
+        dataset_config['param_name']: dataset_config['name'],
+        'south': south,
+        'north': north,
+        'west': west,
+        'east': east,
+        'outputFormat': 'GTiff',
+        'API_Key': api_key
+    }
 
-    response = requests.get(base_url, params=params)
+    logger.debug(f"Downloading tile: bounds={bounds}")
+    
+    response = requests.get(
+        dataset_config['api_endpoint'],
+        params=params,
+        timeout=REQUEST_TIMEOUT
+    )
+    
     if response.status_code == 200:
         with open(output_path, 'wb') as f:
             f.write(response.content)
-        return True
+        logger.debug(f"Successfully downloaded to {output_path}")
     else:
-        logging.error(f"Failed to download tile for bounds {bounds}. Status: {response.status_code}")
-        logging.error(f"Response: {response.text}")
-        return False
+        error_msg = (
+            f"Failed to download tile for bounds {bounds}. "
+            f"Status: {response.status_code}, Response: {response.text[:200]}"
+        )
+        logger.error(error_msg)
+        raise DEMDownloadError(error_msg)
 
 
-def _mosaic_tiles(tile_paths: list[Path], output_path: Path):
+def _mosaic_tiles(tile_paths: List[Path], output_path: Path) -> None:
     """
-    Merges multiple DEM GeoTIFF tiles into a single, seamless raster file.
+    Merges multiple DEM GeoTIFF tiles into a single seamless raster.
 
     Args:
-        tile_paths (list[Path]): A list of paths to the GeoTIFF tiles.
-        output_path (Path): The path for the final merged GeoTIFF file.
-    """
-    logging.info(f"Mosaicking {len(tile_paths)} tiles into {output_path}...")
-    sources = [rasterio.open(p) for p in tile_paths]
-    mosaic, out_trans = merge(sources)
-    
-    out_meta = sources[0].meta.copy()
-    out_meta.update({"driver": "GTiff", "height": mosaic.shape[1],
-                     "width": mosaic.shape[2], "transform": out_trans})
-    
-    with rasterio.open(output_path, "w", **out_meta) as dest:
-        dest.write(mosaic)
-        
-    for src in sources:
-        src.close()
-    logging.info("Mosaicking complete.")
-
-def _select_dem_dataset(bounds: tuple) -> dict:
-    """
-    Selects the best DEM dataset from the config based on the bounding box.
-
-    This function iterates through available DEM datasets defined in the config
-    and selects the most appropriate one based on whether the centroid of the
-    bounding box falls within the dataset's coverage area. It falls back to a
-    global dataset if no specific regional dataset matches.
-
-    Args:
-        bounds (tuple): The bounding box (west, south, east, north) of interest.
-
-    Returns:
-        dict: The configuration dictionary for the selected DEM dataset.
-    """
-    west, south, east, north = bounds
-    centroid_lon, centroid_lat = (west + east) / 2, (south + north) / 2
-
-    for dem in DEM_DATASETS:
-        bb = dem['bounds']
-        if bb[0] <= centroid_lon <= bb[2] and bb[1] <= centroid_lat <= bb[3]:
-            logging.info(f"Selected DEM dataset: {dem['name']} for location ({centroid_lat:.2f}, {centroid_lon:.2f})")
-            return dem
-    
-    logging.warning("No specific DEM found for location, using global fallback.")
-    return DEM_DATASETS[-1]
-
-
-def download_dem_for_polygons(polygons_gdf: gpd.GeoDataFrame, api_key: str, output_path: Path):
-    """
-    Strategically downloads and mosaics DEM tiles that intersect with polygons.
-
-    This function optimizes the DEM download process. It first groups nearby
-    polygons into clusters, calculates a bounding box for each cluster, and then
-    downloads and mosaics the DEM tiles needed to cover those specific areas,
-    avoiding unnecessary downloads.
-
-    Args:
-        polygons_gdf (gpd.GeoDataFrame): A GeoDataFrame containing the polygons of interest.
-        api_key (str): The OpenTopography API key.
-        output_path (Path): The file path for the final mosaicked DEM.
+        tile_paths: List of paths to GeoTIFF tiles
+        output_path: Path for the final merged GeoTIFF
 
     Raises:
-        ValueError: If the API key has not been set.
-        ConnectionError: If a DEM tile fails to download.
-        FileNotFoundError: If no DEM tiles are downloaded.
+        IOError: If mosaic operation fails
     """
-    if api_key == "YOUR_API_KEY_HERE":
-        raise ValueError("Please set your OPENTOPO_API_KEY in param_config.py")
+    logger.info(f"Mosaicking {len(tile_paths)} tiles into {output_path}...")
+    
+    try:
+        sources = [rasterio.open(p) for p in tile_paths]
+        mosaic, out_trans = merge(sources)
+        
+        out_meta = sources[0].meta.copy()
+        out_meta.update({
+            "driver": "GTiff",
+            "height": mosaic.shape[1],
+            "width": mosaic.shape[2],
+            "transform": out_trans
+        })
+        
+        with rasterio.open(output_path, "w", **out_meta) as dest:
+            dest.write(mosaic)
+        
+        # Clean up sources
+        for src in sources:
+            src.close()
+        
+        logger.info("Mosaicking complete")
+    
+    except Exception as e:
+        logger.error(f"Failed to mosaic tiles: {e}", exc_info=True)
+        raise
 
-    logging.info("Identifying polygon clusters to create optimized download boxes...")
+
+def _identify_polygon_clusters(polygons_gdf: gpd.GeoDataFrame) -> List[gpd.GeoDataFrame]:
+    """
+    Groups nearby polygons into clusters for efficient DEM downloading.
+
+    Args:
+        polygons_gdf: GeoDataFrame containing polygons
+
+    Returns:
+        List of GeoDataFrames, one per cluster
+    """
+    logger.info("Identifying polygon clusters for optimized downloads...")
+    
     polygons_gdf = polygons_gdf.reset_index(drop=True)
     sindex = polygons_gdf.sindex
     visited_indices = set()
     clusters = []
+    
     for index, polygon in polygons_gdf.iterrows():
         if index in visited_indices:
             continue
         
-        buffer_distance = 0.1
-        possible_matches_index_raw = list(sindex.intersection(polygon.geometry.buffer(buffer_distance).bounds))
-        possible_matches_index = [int(i) for i in possible_matches_index_raw]
-        possible_matches = polygons_gdf.iloc[possible_matches_index]
-        cluster_gdf = possible_matches[possible_matches.intersects(polygon.geometry.buffer(buffer_distance))]
+        # Find nearby polygons
+        buffered = polygon.geometry.buffer(CLUSTER_BUFFER_DISTANCE)
+        possible_matches_raw = list(sindex.intersection(buffered.bounds))
+        possible_matches_idx = [int(i) for i in possible_matches_raw]
+        possible_matches = polygons_gdf.iloc[possible_matches_idx]
+        
+        # Get actual intersecting polygons
+        cluster_gdf = possible_matches[possible_matches.intersects(buffered)]
         
         visited_indices.update(cluster_gdf.index)
         clusters.append(cluster_gdf)
+    
+    logger.info(f"Identified {len(clusters)} polygon clusters")
+    return clusters
 
-    logging.info(f"Identified {len(clusters)} polygon clusters.")
 
+def download_dem_for_polygons(
+    polygons_gdf: gpd.GeoDataFrame,
+    api_key: str,
+    output_path: Path
+) -> None:
+    """
+    Strategically downloads and mosaics DEM tiles for polygon areas.
+
+    This function optimizes downloads by clustering nearby polygons and only
+    downloading DEM tiles for those specific areas.
+
+    Args:
+        polygons_gdf: GeoDataFrame containing polygons of interest
+        api_key: OpenTopography API key
+        output_path: Path for the final mosaicked DEM
+
+    Raises:
+        ValueError: If API key is invalid
+        DEMDownloadError: If downloads fail
+        FileNotFoundError: If no tiles are downloaded
+    """
+    validate_api_key(api_key)
+    
+    # Identify clusters
+    clusters = _identify_polygon_clusters(polygons_gdf)
+    
     tile_paths = []
     temp_dir = output_path.parent / "dem_tiles"
     temp_dir.mkdir(exist_ok=True)
 
+    # Process each cluster
     for i, cluster in enumerate(clusters):
         cluster_bounds = tuple(cluster.total_bounds)
-        selected_dem = _select_dem_dataset(cluster_bounds)
         
+        # Select appropriate DEM dataset
+        centroid_lon = (cluster_bounds[0] + cluster_bounds[2]) / 2
+        centroid_lat = (cluster_bounds[1] + cluster_bounds[3]) / 2
+        
+        selected_dem = config.dem.get_dataset_for_location(centroid_lon, centroid_lat)
+        if not selected_dem:
+            logger.warning(f"No DEM dataset found for cluster {i}")
+            continue
+        
+        logger.info(f"Using {selected_dem.name} for cluster {i + 1}/{len(clusters)}")
+        
+        # Get tiles for this cluster
         tiles_for_cluster = _calculate_tiles(cluster_bounds)
         
+        # Download each tile
         for j, tile_bounds in enumerate(tiles_for_cluster):
             tile_path = temp_dir / f"cluster_{i}_tile_{j}.tif"
-            if not tile_path.exists():
-                logging.info(f"Downloading DEM for cluster {i+1}, tile {j+1}/{len(tiles_for_cluster)}...")
-                if not _download_tile(api_key, tile_bounds, tile_path, selected_dem):
-                    raise ConnectionError("Failed to download one or more DEM tiles.")
-            tile_paths.append(tile_path)
             
+            if tile_path.exists():
+                logger.debug(f"Tile already exists: {tile_path}")
+            else:
+                logger.info(
+                    f"Downloading cluster {i + 1}, tile {j + 1}/{len(tiles_for_cluster)}..."
+                )
+                
+                dataset_config = {
+                    'name': selected_dem.name,
+                    'api_endpoint': selected_dem.api_endpoint,
+                    'param_name': selected_dem.param_name
+                }
+                
+                try:
+                    _download_tile(api_key, tile_bounds, tile_path, dataset_config)
+                except Exception as e:
+                    logger.error(f"Failed to download tile after retries: {e}")
+                    raise DEMDownloadError(f"Failed to download tile: {e}")
+            
+            tile_paths.append(tile_path)
+    
     if not tile_paths:
-        raise FileNotFoundError("No DEM tiles were downloaded.")
-    elif len(tile_paths) > 1:
+        raise FileNotFoundError("No DEM tiles were downloaded")
+    
+    # Mosaic or rename single tile
+    if len(tile_paths) > 1:
         _mosaic_tiles(tile_paths, output_path)
     else:
+        logger.info("Single tile, renaming instead of mosaicking")
         tile_paths[0].rename(output_path)
+    
+    logger.info(f"DEM saved to {output_path}")
 
+
+# ---------------------------------------------------------------------------
+# Polygon Filtering and Cleaning
+# ---------------------------------------------------------------------------
 
 def _filter_small_polygons(
     gdf: gpd.GeoDataFrame,
-    min_area_m2: float,
-    min_area_ratio: float
+    min_area_m2: float = MIN_POLYGON_AREA_M2,
+    min_area_ratio: float = MIN_AREA_RATIO
 ) -> gpd.GeoDataFrame:
     """
-    Removes small sliver polygons based on absolute area and relative area.
-
-    This helper function cleans up the results of a split or intersection
-    operation by removing polygons that are either smaller than a fixed
-    area (`min_area_m2`) or smaller than a certain percentage (`min_area_ratio`)
-    of their original parent polygon's area.
+    Removes small sliver polygons based on absolute and relative area.
 
     Args:
-        gdf (gpd.GeoDataFrame): The GeoDataFrame to filter. It must contain an
-                                'original_area' column for ratio filtering.
-        min_area_m2 (float): The minimum absolute area in square meters to keep a polygon.
-        min_area_ratio (float): The minimum area ratio relative to the original
-                                polygon to keep a polygon.
+        gdf: GeoDataFrame to filter (must have 'original_area' column)
+        min_area_m2: Minimum absolute area in square meters
+        min_area_ratio: Minimum ratio relative to original polygon
 
     Returns:
-        gpd.GeoDataFrame: The filtered GeoDataFrame.
+        Filtered GeoDataFrame
     """
     if 'original_area' not in gdf.columns:
-        logging.warning("Missing 'original_area' column. Cannot perform ratio-based filtering.")
+        logger.warning("Missing 'original_area' column. Skipping ratio filter.")
         return gdf
 
     initial_count = len(gdf)
     
-    # The CRS should already be projected from previous steps, allowing for area calculation.
+    # Calculate current area
     if gdf.crs and gdf.crs.is_geographic:
-        logging.warning("Reprojecting to calculate area accurately.")
+        logger.debug("Reprojecting to calculate area accurately")
         gdf['current_area'] = gdf.to_crs("EPSG:3857").geometry.area
     else:
         gdf['current_area'] = gdf.geometry.area
     
-    # Conditions for KEEPING a polygon:
-    # 1. Its area is greater than the absolute minimum.
+    # Filter conditions
     area_condition = gdf['current_area'] >= min_area_m2
-    # 2. Its area is greater than the minimum percentage of its original parent polygon.
     ratio_condition = (gdf['current_area'] / gdf['original_area']) >= min_area_ratio
-
-    # Keep polygons that meet EITHER condition.
-    gdf_to_keep = gdf[area_condition & ratio_condition].copy()
     
-    final_count = len(gdf_to_keep)
-    logging.info(f"Filtered out {initial_count - final_count} small polygons based on area thresholds.")
+    gdf_filtered = gdf[area_condition & ratio_condition].copy()
     
-    return gdf_to_keep.drop(columns=['current_area'])
+    filtered_count = initial_count - len(gdf_filtered)
+    logger.info(f"Filtered out {filtered_count} small polygons")
+    
+    return gdf_filtered.drop(columns=['current_area'])
 
 
-def _ensure_dem_exists(polygons_gdf: gpd.GeoDataFrame, dem_path: Path):
+def _filter_valid_geometries(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """
-    Checks if a mosaicked DEM file exists and triggers a download if it does not.
+    Filters to keep only Polygon and MultiPolygon geometries.
 
     Args:
-        polygons_gdf (gpd.GeoDataFrame): The GeoDataFrame of polygons that require a DEM.
-        dem_path (Path): The expected path to the DEM file.
-    """
-    if not dem_path.exists():
-        logging.info("DEM file not found. Downloading strategically...")
-        bounds_gdf_wgs84 = polygons_gdf.to_crs("EPSG:4326")
-        download_dem_for_polygons(bounds_gdf_wgs84, OPENTOPO_API_KEY, dem_path)
-
-def _calculate_aspect_from_dem(dem_path: Path, polygons_gdf: gpd.GeoDataFrame) -> tuple:
-    """
-    Clips a DEM to the extent of input polygons and calculates terrain aspect.
-
-    This function opens the main DEM, clips it to the bounding box of the
-    input polygons for efficiency, calculates the aspect (direction of steepest
-    slope) for each pixel, and converts it to geographic degrees (0=North).
-
-    Args:
-        dem_path (Path): The path to the DEM GeoTIFF file.
-        polygons_gdf (gpd.GeoDataFrame): GeoDataFrame with polygons to define the clip area.
+        gdf: GeoDataFrame to filter
 
     Returns:
-        tuple: A tuple containing:
-               - aspect_deg_cart (np.ndarray): The aspect raster in degrees.
-               - clipped_dem (xr.DataArray): The clipped DEM raster.
-               - polygons_in_dem_crs (gpd.GeoDataFrame): The input polygons
-                 reprojected to the DEM's CRS.
+        Filtered GeoDataFrame with only valid polygon types
     """
-    logging.info("Opening DEM...")
-    dem_datasets  = rioxarray.open_rasterio(dem_path, chunks={'x': 2048, 'y': 2048})
+    initial_count = len(gdf)
+    valid_types = ['Polygon', 'MultiPolygon']
+    gdf_filtered = gdf[gdf.geometry.geom_type.isin(valid_types)].copy()
     
-    # If open_rasterio returned a list, pick the first Dataset
+    removed_count = initial_count - len(gdf_filtered)
+    if removed_count > 0:
+        logger.info(f"Removed {removed_count} non-polygonal geometries")
+    
+    return gdf_filtered
+
+
+def _postprocess_geometries(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """
+    Applies final cleaning and repairing to geometries.
+
+    Args:
+        gdf: GeoDataFrame to process
+
+    Returns:
+        Processed GeoDataFrame with repaired geometries
+    """
+    logger.info("Repairing invalid geometries...")
+    gdf['geometry'] = gdf.geometry.buffer(0)
+    
+    # Clean up temporary columns
+    columns_to_drop = ['original_area']
+    gdf = gdf.drop(
+        columns=[col for col in columns_to_drop if col in gdf.columns],
+        errors='ignore'
+    )
+    
+    return gdf
+
+
+# ---------------------------------------------------------------------------
+# Aspect Classification
+# ---------------------------------------------------------------------------
+
+def _calculate_aspect_from_dem(
+    dem_path: Path,
+    polygons_gdf: gpd.GeoDataFrame
+) -> Tuple[np.ndarray, Any, gpd.GeoDataFrame]:
+    """
+    Clips DEM and calculates terrain aspect.
+
+    Args:
+        dem_path: Path to the DEM GeoTIFF file
+        polygons_gdf: GeoDataFrame with polygons to define clip area
+
+    Returns:
+        Tuple of (aspect_array, clipped_dem, reprojected_polygons)
+    """
+    logger.info("Opening DEM...")
+    dem_datasets = rioxarray.open_rasterio(
+        dem_path,
+        chunks={'x': 2048, 'y': 2048}
+    )
+    
+    # Handle list or single dataset
     dem_rds = dem_datasets[0] if isinstance(dem_datasets, list) else dem_datasets
     
-    # Ensure polygons are in the same CRS as the DEM
+    # Reproject polygons to DEM CRS
     polygons_in_dem_crs = polygons_gdf.to_crs(dem_rds.rio.crs)
     
-    logging.info("Clipping DEM to polygon boundaries...")
+    logger.info("Clipping DEM to polygon boundaries...")
     clipped_dem = dem_rds.rio.clip(
         polygons_in_dem_crs.geometry.apply(mapping),
         dem_rds.rio.crs,
@@ -420,6 +651,7 @@ def _calculate_aspect_from_dem(dem_path: Path, polygons_gdf: gpd.GeoDataFrame) -
     )
     
     # Calculate gradient and aspect
+    logger.info("Calculating aspect...")
     elevation = clipped_dem.squeeze().values
     gy, gx = np.gradient(elevation)
     aspect_rad = np.arctan2(gy, -gx)
@@ -430,134 +662,106 @@ def _calculate_aspect_from_dem(dem_path: Path, polygons_gdf: gpd.GeoDataFrame) -
     
     return aspect_deg_cart, clipped_dem, polygons_in_dem_crs
 
-def _process_aspect_polygons(aspect_raster, clipped_dem, polygons_in_dem_crs) -> Optional[gpd.GeoDataFrame]:
-    """
-    Vectorizes an aspect raster, intersects, filters, and cleans the result.
 
-    This function takes the raw aspect raster and orchestrates the process of
-    converting it into clean, aspect-classified vector polygons, ensuring they
-    are filtered and repaired.
+def _build_aspect_mask(
+    aspect_raster: np.ndarray,
+    lower: float,
+    upper: float,
+    aspect_name: str
+) -> np.ndarray:
+    """
+    Creates a boolean mask for a given aspect bin.
 
     Args:
-        aspect_raster (np.ndarray): The 2D numpy array of aspect values.
-        clipped_dem: The clipped DEM DataArray from rioxarray.
-        polygons_in_dem_crs (gpd.GeoDataFrame): The source polygons in the DEM's CRS.
+        aspect_raster: Raster of aspect values
+        lower: Lower bound of aspect bin (degrees)
+        upper: Upper bound of aspect bin (degrees)
+        aspect_name: Name of the aspect (e.g., "N")
 
     Returns:
-        Optional[gpd.GeoDataFrame]: A GeoDataFrame of the final, processed,
-                                    aspect-classified polygons in WGS84, or
-                                    None if no polygons are generated.
+        Boolean array where True indicates pixels in the aspect bin
     """
-    if polygons_in_dem_crs.crs.is_geographic:
-        polygons_in_dem_crs['original_area'] = polygons_in_dem_crs.to_crs("EPSG:3857").geometry.area
-    else:
-        polygons_in_dem_crs['original_area'] = polygons_in_dem_crs.geometry.area
-
-    # This function now correctly splits polygons by aspect while retaining attributes.
-    aspect_gdf = _extract_aspect_polygons(aspect_raster, clipped_dem, polygons_in_dem_crs)
-
-    if aspect_gdf is None or aspect_gdf.empty:
-        return None
-
-    # Filter out the small sliver polygons created during the aspect split.
-    filtered_gdf = _filter_small_polygons(
-        aspect_gdf, 
-        min_area_m2=1600.0, 
-        min_area_ratio=0.1
-    )
-    
-    # Post-process the final, filtered geometries.
-    final_gdf = _postprocess_geometries(filtered_gdf)
-
-    return final_gdf.to_crs("EPSG:4326")
+    if aspect_name == "N":
+        # North wraps around 0°
+        return (aspect_raster > lower) | (aspect_raster <= upper)
+    return (aspect_raster > lower) & (aspect_raster <= upper)
 
 
-def prepare_aspect_polygons(input_geojson: Path, 
-                            output_geojson: Path,
-                            force_update: bool = False):
+def _vectorize_aspect(mask: np.ndarray, clipped_dem: Any) -> List:
     """
-    Orchestrates the workflow to split input polygons by terrain aspect.
-
-    This is a main public function for the module. It checks if the output file
-    already exists, and if not (or if `force_update` is True), it manages the
-    process of downloading the DEM, calculating aspect, and processing the
-    polygons.
+    Converts a raster mask into shapely geometries.
 
     Args:
-        input_geojson (Path): Path to the input GeoJSON file of polygons.
-        output_geojson (Path): Path to save the output aspect-classified GeoJSON.
-        force_update (bool): If True, re-runs the process even if the output
-                             file exists.
+        mask: Boolean mask to vectorize
+        clipped_dem: Clipped DEM for transform info
+
+    Returns:
+        List of Shapely geometry objects
     """
-    if output_geojson.exists() and not force_update:
-        logging.info(f"Aspect-classified GeoJSON already exists: {output_geojson}")
-        return
+    aspect_shapes = shapes(
+        mask.astype(np.uint8),
+        mask=mask,
+        transform=clipped_dem.rio.transform()
+    )
+    return [shape(s) for s, v in aspect_shapes if v == 1]
 
-    polygons_gdf = gpd.read_file(input_geojson)
-    dem_path = DEM_TIF
 
-    _ensure_dem_exists(polygons_gdf, dem_path)
-    aspect_raster, clipped_dem, polygons_in_dem_crs = _calculate_aspect_from_dem(dem_path, polygons_gdf)
-    final_gdf = _process_aspect_polygons(aspect_raster, clipped_dem, polygons_in_dem_crs)
-
-    if final_gdf is not None and not final_gdf.empty:
-        logging.info(f"Saving {len(final_gdf)} aspect-classified polygons to: {output_geojson}")
-        final_gdf.to_file(output_geojson, driver='GeoJSON')
-    else:
-        logging.warning("No new polygons were generated after aspect classification.")
-        
-def _extract_aspect_polygons(aspect_raster: np.ndarray, 
-                             clipped_dem, 
-                             polygons_in_dem_crs: gpd.GeoDataFrame
+def _extract_aspect_polygons(
+    aspect_raster: np.ndarray,
+    clipped_dem: Any,
+    polygons_in_dem_crs: gpd.GeoDataFrame
 ) -> Optional[gpd.GeoDataFrame]:
     """
-    Extracts polygons for each aspect bin and intersects them with source polygons.
+    Extracts polygons for each aspect bin and intersects with source polygons.
 
-    This function first vectorizes the entire aspect raster into four large
-    multi-polygons (one for each cardinal direction). Then, it iterates through
-    each individual source polygon and intersects it with these aspect unions.
-    This approach preserves the original attributes of each source polygon for
-    its newly created child polygons.
+    This function vectorizes the aspect raster into four aspect unions (N, E, S, W),
+    then intersects each source polygon with these unions, preserving attributes.
 
     Args:
-        aspect_raster (np.ndarray): The 2D numpy array of aspect values.
-        clipped_dem: The clipped DEM DataArray from rioxarray.
-        polygons_in_dem_crs (gpd.GeoDataFrame): The source polygons.
+        aspect_raster: 2D array of aspect values
+        clipped_dem: Clipped DEM DataArray
+        polygons_in_dem_crs: Source polygons in DEM CRS
 
     Returns:
-        Optional[gpd.GeoDataFrame]: A new GeoDataFrame containing polygons split
-                                    by aspect, or None if no valid polygons result.
+        GeoDataFrame with polygons split by aspect, or None if empty
     """
-    aspect_bins = {
-        "N": (315, 45),
-        "E": (45, 135),
-        "S": (135, 225),
-        "W": (225, 315),
-    }
-
-    # Vectorize the entire aspect raster once for efficiency
+    # Vectorize entire raster once for efficiency
     all_aspect_geoms = {}
-    for aspect_name, (lower, upper) in aspect_bins.items():
+    
+    for aspect_name, (lower, upper) in ASPECT_BINS.items():
         mask = _build_aspect_mask(aspect_raster, lower, upper, aspect_name)
-        if aspect_geoms := _vectorize_aspect(mask, clipped_dem):
+        aspect_geoms = _vectorize_aspect(mask, clipped_dem)
+        
+        if aspect_geoms:
             all_aspect_geoms[aspect_name] = union_all(aspect_geoms)
+    
+    if not all_aspect_geoms:
+        logger.warning("No aspect geometries created")
+        return None
 
+    # Intersect each source polygon with aspect unions
     final_polygons = []
-    # Iterate over each source polygon to process it individually
-    for _, source_poly_row in tqdm(polygons_in_dem_crs.iterrows(), total=len(polygons_in_dem_crs), desc="Splitting by Aspect"):
+    
+    for _, source_poly_row in tqdm(
+        polygons_in_dem_crs.iterrows(),
+        total=len(polygons_in_dem_crs),
+        desc="Splitting by Aspect"
+    ):
         source_geom = source_poly_row.geometry
         
         for aspect_name, aspect_union_geom in all_aspect_geoms.items():
-            # Intersect the source polygon with the union of all polygons for that aspect
             intersected = source_geom.intersection(aspect_union_geom)
 
             if intersected.is_empty:
                 continue
 
-            # Handle both Polygon and MultiPolygon results
-            geoms = intersected.geoms if hasattr(intersected, 'geoms') else [intersected]
+            # Handle Polygon or MultiPolygon results
+            geoms = (
+                intersected.geoms if hasattr(intersected, 'geoms')
+                else [intersected]
+            )
 
-            # Create new features, carrying over attributes from the source polygon
+            # Create new features with source attributes
             for poly in geoms:
                 if not poly.is_empty:
                     properties = source_poly_row.to_dict()
@@ -566,120 +770,160 @@ def _extract_aspect_polygons(aspect_raster: np.ndarray,
                     final_polygons.append(properties)
 
     if not final_polygons:
+        logger.warning("No polygons generated after aspect intersection")
         return None
 
-    # Create the final GeoDataFrame
     final_gdf = gpd.GeoDataFrame(final_polygons, crs=clipped_dem.rio.crs)
     return _filter_valid_geometries(final_gdf)
 
 
-def _build_aspect_mask(aspect_raster, 
-                       lower: float, 
-                       upper: float, 
-                       aspect_name: str
-) -> np.ndarray:
+def _process_aspect_polygons(
+    aspect_raster: np.ndarray,
+    clipped_dem: Any,
+    polygons_in_dem_crs: gpd.GeoDataFrame
+) -> Optional[gpd.GeoDataFrame]:
     """
-    Creates a boolean mask for a given aspect bin.
-
-    Handles the wrap-around case for North, which spans from 315 to 45 degrees.
+    Orchestrates aspect polygon extraction, filtering, and cleaning.
 
     Args:
-        aspect_raster (np.ndarray): The raster of aspect values.
-        lower (float): The lower bound of the aspect bin in degrees.
-        upper (float): The upper bound of the aspect bin in degrees.
-        aspect_name (str): The name of the aspect (e.g., "N").
+        aspect_raster: 2D array of aspect values
+        clipped_dem: Clipped DEM DataArray
+        polygons_in_dem_crs: Source polygons in DEM CRS
 
     Returns:
-        np.ndarray: A boolean numpy array where True indicates a pixel is
-                    within the aspect bin.
+        Processed GeoDataFrame in WGS84, or None if empty
     """
-    if aspect_name == "N":
-        return (aspect_raster > lower) | (aspect_raster <= upper)
-    return (aspect_raster > lower) & (aspect_raster <= upper)
+    # Store original areas for filtering
+    if polygons_in_dem_crs.crs.is_geographic:
+        polygons_in_dem_crs['original_area'] = (
+            polygons_in_dem_crs.to_crs("EPSG:3857").geometry.area
+        )
+    else:
+        polygons_in_dem_crs['original_area'] = polygons_in_dem_crs.geometry.area
 
+    # Extract aspect polygons
+    aspect_gdf = _extract_aspect_polygons(
+        aspect_raster,
+        clipped_dem,
+        polygons_in_dem_crs
+    )
 
-def _vectorize_aspect(mask: np.ndarray, clipped_dem) -> list:
-    """
-    Converts a raster mask into a list of shapely geometries.
+    if aspect_gdf is None or aspect_gdf.empty:
+        return None
 
-    Args:
-        mask (np.ndarray): The boolean mask to vectorize.
-        clipped_dem: The clipped DEM DataArray, used for its transform info.
-
-    Returns:
-        list: A list of Shapely geometry objects derived from the mask.
-    """
-    aspect_shapes = shapes(mask.astype(np.uint8), mask=mask, transform=clipped_dem.rio.transform())
-    return [shape(s) for s, v in aspect_shapes if v == 1]
-
-
-def _filter_valid_geometries(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """
-    Filters a GeoDataFrame to keep only Polygon and MultiPolygon geometries.
-
-    Intersection and other geometric operations can sometimes produce
-    undesirable geometry types like points or lines. This function removes them.
-
-    Args:
-        gdf (gpd.GeoDataFrame): The GeoDataFrame to filter.
-
-    Returns:
-        gpd.GeoDataFrame: The filtered GeoDataFrame containing only valid polygons.
-    """
-    initial_count = len(gdf)
-    gdf = gdf[gdf.geometry.geom_type.isin(['Polygon', 'MultiPolygon'])].copy()
-    removed_count = initial_count - len(gdf)
-    if removed_count > 0:
-        logging.info(f"Removed {removed_count} non-polygonal geometries (e.g., points or lines).")
-    return gdf
-
-
-def _postprocess_geometries(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """
-    Applies final cleaning and repairing steps to geometries.
-
-    This function runs a buffer(0) operation, a common and effective trick to
-    fix invalid geometries (like self-intersections) that may have been created
-    during previous steps. It also cleans up temporary columns.
-
-    Args:
-        gdf (gpd.GeoDataFrame): The GeoDataFrame to process.
-
-    Returns:
-        gpd.GeoDataFrame: The processed GeoDataFrame with repaired geometries.
-    """    
-    # Removed for now
-    #logging.info("Smoothing polygon corners...")
-    #tqdm.pandas(desc="Smoothing Polygons")
-    #gdf['geometry'] = gdf['geometry'].progress_apply(lambda geom: chaikin_smooth(geom))
-
-    #logging.info("Simplifying geometries to reduce file size...")
-    #gdf['geometry'] = gdf.simplify(tolerance=0.001, preserve_topology=True)
-
-    logging.info("Repairing any invalid geometries...")
-    gdf['geometry'] = gdf.geometry.buffer(0)
-
-    # Clean up columns that are no longer relevant after filtering.
-    columns_to_drop = ['original_area']
-    gdf = gdf.drop(columns=[col for col in columns_to_drop if col in gdf.columns], errors='ignore')
+    # Filter small slivers
+    filtered_gdf = _filter_small_polygons(aspect_gdf)
     
-    return gdf
+    # Post-process geometries
+    final_gdf = _postprocess_geometries(filtered_gdf)
+
+    return final_gdf.to_crs("EPSG:4326")
 
 
-def _convert_deg_to_cardinal_from_map(df: pd.DataFrame) -> pd.DataFrame:
+# ---------------------------------------------------------------------------
+# Main Processing Functions
+# ---------------------------------------------------------------------------
+
+def prepare_aspect_polygons(
+    input_geojson: Path,
+    output_geojson: Path,
+    force_update: bool = False
+) -> None:
     """
-    Converts a DataFrame column of aspect degrees to cardinal directions.
+    Orchestrates the workflow to split input polygons by terrain aspect.
 
-    This utility is used to categorize the aspects of the SNOWPACK model
-    locations into the same N, E, S, W bins used for the polygons.
+    This is the main public function for aspect classification. It manages
+    DEM download, aspect calculation, and polygon processing.
 
     Args:
-        df (pd.DataFrame): A DataFrame with an 'aspect' column in degrees.
+        input_geojson: Path to input GeoJSON file of polygons
+        output_geojson: Path to save output aspect-classified GeoJSON
+        force_update: If True, re-runs even if output exists
+
+    Raises:
+        FileNotFoundError: If input file doesn't exist
+        GeodataValidationError: If input data is invalid
+    """
+    if output_geojson.exists() and not force_update:
+        logger.info(f"Aspect-classified GeoJSON already exists: {output_geojson}")
+        return
+
+    # Load and validate input
+    if not input_geojson.exists():
+        raise FileNotFoundError(f"Input file not found: {input_geojson}")
+    
+    logger.info(f"Loading polygons from {input_geojson}")
+    polygons_gdf = gpd.read_file(input_geojson)
+    
+    try:
+        validate_geodataframe(polygons_gdf)
+    except GeodataValidationError as e:
+        logger.error(f"Input validation failed: {e}")
+        raise
+
+    # Ensure DEM exists
+    dem_path = config.paths.dem_tif
+    if not dem_path.exists():
+        logger.info("DEM file not found. Downloading strategically...")
+        bounds_gdf_wgs84 = polygons_gdf.to_crs("EPSG:4326")
+        download_dem_for_polygons(
+            bounds_gdf_wgs84,
+            config.api.opentopo_api_key,
+            dem_path
+        )
+
+    # Calculate aspect and process polygons
+    aspect_raster, clipped_dem, polygons_in_dem_crs = _calculate_aspect_from_dem(
+        dem_path,
+        polygons_gdf
+    )
+    
+    final_gdf = _process_aspect_polygons(
+        aspect_raster,
+        clipped_dem,
+        polygons_in_dem_crs
+    )
+
+    # Save results
+    if final_gdf is not None and not final_gdf.empty:
+        logger.info(
+            f"Saving {len(final_gdf)} aspect-classified polygons to {output_geojson}"
+        )
+        final_gdf.to_file(output_geojson, driver='GeoJSON')
+    else:
+        logger.warning("No polygons generated after aspect classification")
+
+
+def _convert_aspect_to_cardinal(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Converts aspect degrees to cardinal directions, or keeps cardinal aspects as-is.
+    
+    Handles two input formats:
+    1. Numeric degrees (0-360) → converts to N, E, S, W
+    2. Already cardinal (N, E, S, W, flat, Flat) → standardizes capitalization
+
+    Args:
+        df: DataFrame with 'aspect' column in degrees or cardinal directions
 
     Returns:
-        pd.DataFrame: The DataFrame with an added 'aspect_cardinal' column
-                      and the 'aspect' column updated to the new cardinal values.
+        DataFrame with 'aspect' converted to N, E, S, W, or Flat
     """
+    # Make a copy to avoid modifying the original
+    df = df.copy()
+    
+    # Check if aspects are already cardinal (not numeric)
+    # Try to convert first value to numeric to test
+    test_val = str(df['aspect'].iloc[0]).strip().upper()
+    is_already_cardinal = test_val in ['N', 'E', 'S', 'W', 'FLAT']
+    
+    if is_already_cardinal:
+        # Aspects are already cardinal - just standardize capitalization
+        # Handle 'flat' vs 'Flat'
+        df['aspect'] = df['aspect'].astype(str).str.strip().str.upper()
+        df.loc[df['aspect'] == 'FLAT', 'aspect'] = 'Flat'
+        return df
+    
+    # Otherwise, convert numeric degrees to cardinal
     is_flat = df['aspect'] == 'Flat'
     df.loc[is_flat, 'aspect_cardinal'] = 'Flat'
 
@@ -688,122 +932,173 @@ def _convert_deg_to_cardinal_from_map(df: pd.DataFrame) -> pd.DataFrame:
     bins = [0, 45, 135, 225, 315, 360]
     labels = ["N", "E", "S", "W", "N"]
     
-    categorized_aspects = pd.cut(numeric_aspects, bins=bins, labels=labels, right=False, include_lowest=True, ordered=False)
+    categorized_aspects = pd.cut(
+        numeric_aspects,
+        bins=bins,
+        labels=labels,
+        right=False,
+        include_lowest=True,
+        ordered=False
+    )
     
     df.loc[~is_flat, 'aspect_cardinal'] = categorized_aspects
     df['aspect'] = df['aspect_cardinal']
+    
     return df
 
-def link_polygons_to_pro_files(polygons_path: Path, locations_path: Path, output_path: Path):
+
+
+def link_polygons_to_pro_files(
+    polygons_path: Path,
+    locations_path: Path,
+    output_path: Path
+) -> None:
     """
     Finds the most relevant .pro file for each aspect polygon.
 
-    This function matches each processed polygon to the nearest SNOWPACK model
-    location that has the same cardinal aspect. It uses a k-d tree for
-    efficient nearest-neighbor searching.
+    This function matches each polygon to the nearest SNOWPACK model location
+    with the same cardinal aspect using a k-d tree for efficiency.
 
     Args:
-        polygons_path (Path): Path to the aspect-classified polygons GeoJSON.
-        locations_path (Path): Path to the CSV of SNOWPACK model locations.
-        output_path (Path): Path to save the final GeoJSON with linked .pro files.
+        polygons_path: Path to aspect-classified polygons GeoJSON
+        locations_path: Path to CSV of SNOWPACK model locations
+        output_path: Path to save final GeoJSON with linked .pro files
+
+    Raises:
+        FileNotFoundError: If input files don't exist
     """
     if not polygons_path.exists():
-        logging.error(f"Aspect polygon file not found at {polygons_path}. Run aspect preparation first.")
-        return
+        raise FileNotFoundError(
+            f"Aspect polygon file not found at {polygons_path}. "
+            "Run aspect preparation first."
+        )
 
-    logging.info("Linking polygons to closest .pro files by aspect...")
+    logger.info("Linking polygons to closest .pro files by aspect...")
+    
+    # Load data
     polygons_gdf = gpd.read_file(polygons_path)
     locations_df = pd.read_csv(locations_path)
+    
+    # Convert aspects to cardinal directions
+    locations_df = _convert_aspect_to_cardinal(locations_df)
 
-    locations_df = _convert_deg_to_cardinal_from_map(locations_df)
-
+    # Create GeoDataFrame from locations
     locations_gdf = gpd.GeoDataFrame(
         locations_df,
-        geometry=gpd.points_from_xy(locations_df.longitude, locations_df.latitude),
+        geometry=gpd.points_from_xy(
+            locations_df.longitude,
+            locations_df.latitude
+        ),
         crs="EPSG:4326"
     )
 
+    # Project to metric CRS for distance calculations
     projected_crs = "EPSG:3587"
     polygons_proj = polygons_gdf.to_crs(projected_crs)
     locations_proj = locations_gdf.to_crs(projected_crs)
 
+    # Calculate centroids
     polygons_proj['centroid'] = polygons_proj.geometry.centroid
     polygons_gdf['pro_file_path'] = None
 
-    for aspect_name, group in tqdm(polygons_proj.groupby('aspect'), desc="Matching Aspects"):
+    # Match by aspect
+    for aspect_name, group in tqdm(
+        polygons_proj.groupby('aspect'),
+        desc="Matching Aspects"
+    ):
         aspect_locations = locations_proj[locations_proj['aspect'] == aspect_name]
 
         if aspect_locations.empty:
-            logging.warning(f"No .pro files found for aspect '{aspect_name}'. Skipping.")
+            logger.warning(f"No .pro files found for aspect '{aspect_name}'")
             continue
 
-        location_coords = np.array([geom.coords[0] for geom in aspect_locations.geometry])
+        # Build k-d tree for this aspect
+        location_coords = np.array([
+            geom.coords[0] for geom in aspect_locations.geometry
+        ])
         tree = cKDTree(location_coords)
 
-        polygon_coords = np.array([geom.coords[0] for geom in group['centroid']])
+        # Find nearest location for each polygon
+        polygon_coords = np.array([
+            geom.coords[0] for geom in group['centroid']
+        ])
         
         _, indices = tree.query(polygon_coords, k=1)
-
         matched_paths = aspect_locations.iloc[indices]['path'].values
-
+        
         polygons_gdf.loc[group.index, 'pro_file_path'] = matched_paths
 
+    # Remove unmatched polygons
     unmatched_count = polygons_gdf['pro_file_path'].isna().sum()
     if unmatched_count > 0:
-        logging.warning(f"{unmatched_count} polygons could not be matched to a .pro file and will be removed.")
+        logger.warning(
+            f"{unmatched_count} polygons could not be matched and will be removed"
+        )
         polygons_gdf.dropna(subset=['pro_file_path'], inplace=True)
 
+    # Save results
     polygons_gdf.to_file(output_path, driver='GeoJSON')
-    logging.info(f"Saved {len(polygons_gdf)} linked polygons to {output_path}")
+    logger.info(f"Saved {len(polygons_gdf)} linked polygons to {output_path}")
 
-def generate_pro_file_manifest(linked_polygons_path: Path, manifest_path: Path) -> set:
+
+def generate_pro_file_manifest(
+    linked_polygons_path: Path,
+    manifest_path: Path
+) -> set:
     """
-    Reads the linked polygons GeoJSON and creates a manifest of unique .pro files.
-
-    This function generates a simple text file that lists every unique .pro file
-    path required for the subsequent analysis. This can be useful for data
-    staging or validation.
+    Creates a manifest of unique .pro files from linked polygons.
 
     Args:
-        linked_polygons_path (Path): The path to the final linked polygons GeoJSON.
-        manifest_path (Path): The path to write the output manifest.txt file.
+        linked_polygons_path: Path to linked polygons GeoJSON
+        manifest_path: Path to write manifest file
 
     Returns:
-        set: A set of the unique .pro file paths.
+        Set of unique .pro file paths
     """
-    logging.info("Generating .pro file manifest...")
+    logger.info("Generating .pro file manifest...")
+    
     if not linked_polygons_path.exists():
-        logging.error(f"Cannot generate manifest, file not found: {linked_polygons_path}")
+        logger.error(f"File not found: {linked_polygons_path}")
         return set()
 
     gdf = gpd.read_file(linked_polygons_path)
     unique_paths = set(gdf['pro_file_path'].dropna().unique())
 
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
     with open(manifest_path, 'w') as f:
-        for path in sorted(list(unique_paths)):
-            f.write(f"{path}\n")
+        json.dump(sorted(list(unique_paths)), f, indent=4)
     
-    logging.info(f"Manifest created with {len(unique_paths)} unique .pro files at: {manifest_path}")
+    logger.info(
+        f"Manifest created with {len(unique_paths)} unique .pro files "
+        f"at {manifest_path}"
+    )
     return unique_paths
 
+
+# ---------------------------------------------------------------------------
+# Main Entry Point
+# ---------------------------------------------------------------------------
+
 if __name__ == '__main__':
-    
-    if OPENTOPO_API_KEY == "YOUR_API_KEY_HERE":
-        logging.error("Please set your OPENTOPO_API_KEY in param_config.py")
-    else:
+    try:
         prepare_aspect_polygons(
-            input_geojson=INPUT_POLYGONS_GEOJSON,
-            output_geojson=ASPECT_POLYGONS_GEOJSON
+            input_geojson=config.paths.input_polygons,
+            output_geojson=config.paths.aspect_polygons
         )
         
         link_polygons_to_pro_files(
-            polygons_path=ASPECT_POLYGONS_GEOJSON,
-            locations_path=SNOWPACK_LOCATIONS_CSV,
-            output_path=LINKED_POLYGONS_GEOJSON
+            polygons_path=config.paths.aspect_polygons,
+            locations_path=config.paths.snowpack_locations_csv,
+            output_path=config.paths.linked_polygons
         )
 
         generate_pro_file_manifest(
-            linked_polygons_path=LINKED_POLYGONS_GEOJSON,
-            manifest_path=PRO_FILE_MANIFEST
+            linked_polygons_path=config.paths.linked_polygons,
+            manifest_path=config.paths.pro_file_manifest
         )
-
+        
+        logger.info("Geodata preparation complete!")
+    
+    except Exception as e:
+        logger.error(f"Geodata preparation failed: {e}", exc_info=True)
+        raise

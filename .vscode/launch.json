@@ -5,18 +5,22 @@
       "name": "Python: Current File",
       "type": "debugpy",
       "request": "launch",
+      "module": "wetting_front_tracker.main",
+      "justMyCode": true,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src"
+      }
+    },
+    {
+      "name": "Python: Current File",
+      "type": "debugpy",
+      "request": "launch",
       "program": "${file}",
-      "console": "integratedTerminal"
-      },    
-//    {
-//      "name": "Python: Module",
-//      "type": "debugpy",
-//      "request": "launch",
-//      "module": "wetting_front_tracker.main",
-//      "justMyCode": true,
-//      "env": {
-//        "PYTHONPATH": "${workspaceFolder}/src"
-//      }
-//    }
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src"
+      }
+    }
   ]
 }

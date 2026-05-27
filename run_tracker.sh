@@ -7,6 +7,9 @@ cd "$SCRIPT_DIR"
 
 echo "Running analysis from: $(pwd)"
 
+# --- House cleaning, delete old log files ---
+find logs/ -name "*.log" -mtime +30 -delete
+
 # --- Configuration ---
 source .venv/bin/activate
 
