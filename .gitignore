@@ -5,10 +5,10 @@
 /src/wet_snow_tracker/temp.ipynb
 /src/wet_snow_tracker/__pycache__/*pyc
 /src/wetting_front_tracker/__pycache__/*pyc
+/src/wet_snow_tracker.egg-info/*
 /wetting_front_stall_analasys/
 *.pyc
 __pycache__/
-src/wet_snow_tracker.egg-info/
 /.coverage
 /.DS_Store
 /.vscode/
