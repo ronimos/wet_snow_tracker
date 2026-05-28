@@ -4547,12 +4547,7 @@ name = "wetting-front-tracker"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-<<<<<<< HEAD
-    { name = "bottleneck" },
-    { name = "dask" },
-=======
     { name = "dotenv" },
->>>>>>> feat/ml
     { name = "folium" },
     { name = "geopandas", version = "1.0.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "geopandas", version = "1.1.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
@@ -4588,11 +4583,6 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-<<<<<<< HEAD
-analysis = [
-    { name = "cupy" },
-    { name = "seaborn" },
-=======
 all = [
     { name = "black" },
     { name = "cupy" },
@@ -4622,21 +4612,14 @@ dev = [
 ]
 gpu = [
     { name = "cupy" },
->>>>>>> feat/ml
 ]
 
 [package.metadata]
 requires-dist = [
-<<<<<<< HEAD
-    { name = "bottleneck", specifier = ">=1.5.0" },
-    { name = "cupy", marker = "extra == 'analysis'", specifier = ">=13.6.0" },
-    { name = "dask", specifier = ">=2025.7.0" },
-=======
     { name = "black", marker = "extra == 'dev'", specifier = ">=22.0.0" },
     { name = "cupy", marker = "extra == 'gpu'", specifier = ">=10.0.0" },
     { name = "dotenv", specifier = ">=0.9.9" },
     { name = "flake8", marker = "extra == 'dev'", specifier = ">=4.0.0" },
->>>>>>> feat/ml
     { name = "folium", specifier = ">=0.20.0" },
     { name = "geopandas", specifier = ">=1.0.1" },
     { name = "joblib", specifier = ">=1.1.0" },

@@ -73,7 +73,7 @@ class TestLOCDetectionModes:
             end_date,
             central_date,
             tmp_path,
-            loc_detector=None  # Uses rule-based
+            loc_detector_rule=None  # Uses default rule-based
         )
         
         # Should complete without error (result can be None or dict)
@@ -121,11 +121,11 @@ class TestLOCDetectionModes:
             end_date,
             central_date,
             tmp_path,
-            loc_detector=loc_detector
+            loc_detector_ml=loc_detector
         )
-        
+
         assert result is None or isinstance(result, dict)
-    
+
     def test_hybrid_mode(self, sample_real_pro, tmp_path):
         """Test hybrid mode (ML with rule-based fallback)."""
         config = MLModelConfig(
@@ -153,11 +153,11 @@ class TestLOCDetectionModes:
             end_date,
             central_date,
             tmp_path,
-            loc_detector=loc_detector
+            loc_detector_rule=loc_detector  # hybrid callable handles fallback internally
         )
-        
+
         assert result is None or isinstance(result, dict)
-    
+
     def test_multiple_files(self, real_pro_files, tmp_path):
         """Test rule-based detection on all available .pro files."""
         results = []
@@ -180,7 +180,7 @@ class TestLOCDetectionModes:
                 end_date,
                 central_date,
                 tmp_path,
-                loc_detector=None
+                loc_detector_rule=None
             )
             
             results.append({

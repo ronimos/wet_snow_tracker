@@ -115,6 +115,8 @@ class MLDetectorCallable:
     Loads the detector lazily on the worker process to ensure picklability and reduce overhead.
     """
     def __init__(self, model_path: Path, probability_threshold: float, top_n: int):
+        if not Path(model_path).exists():
+            raise FileNotFoundError(f"Model not found: {model_path}")
         self.model_path = model_path
         self.probability_threshold = probability_threshold
         self.top_n = top_n
