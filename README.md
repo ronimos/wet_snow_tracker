@@ -56,7 +56,7 @@ Traditional avalanche forecasting relies on point observations and manual snowpa
                      v
 ┌──────────────────────────────────────────────────────────┐
 │                 Data Processing Layer                    │
-│  • Profile reading & validation (snowpack_reader.py)     │
+│  • Profile reading via xsnow (snowpack_reader.py)        │
 │  • Geospatial polygon linking (prepare_geodata.py)       │
 │  • Time series extraction                                │
 └────────────────────┬─────────────────────────────────────┘
@@ -103,38 +103,50 @@ Traditional avalanche forecasting relies on point observations and manual snowpa
 
 ### Prerequisites
 
-- Python 3.9+
+- Python **3.12+**
+- [`uv`](https://docs.astral.sh/uv/) package manager (`pip install uv`)
 - SNOWPACK model output files (.pro format)
 - Sufficient disk space for time series data
 
 ### Quick Start
 
 ```bash
-# Clone repository
+# 1. Clone this repository
 git clone <repository-url>
-cd wetting_front_tracker
+cd wet_snow_tracker
 
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+# 2. Clone and install xsnow (not on PyPI — install from GitLab)
+git clone git@gitlab.com:avacollabra/postprocessing/xsnow.git ../xsnow
+uv pip install -e ../xsnow
 
-# Install dependencies
-pip install -r requirements.txt
+# 3. Install this project
+uv pip install -e .
 
-# Configure paths (create .env file)
+# 4. Configure paths (create .env file)
 cat > .env << EOF
 PRO_FILES_SOURCE=local
 PRO_FILES_INPUT_DIR=/path/to/snowpack/output
 WFT_RESULTS_OUTPUT_DIR=/path/to/results
+WFT_ASSETS_OUTPUT_DIR=/path/to/results/plot_assets
+ML_ENABLED=true
+ML_MODEL_PATH=src/wetting_front_tracker/assets/models/production
+OPENTOPO_API_KEY=<your_key>   # only needed for DEM downloads
 EOF
 
-# Run analysis
+# 5. Run analysis
 python -m src.wetting_front_tracker.main --loc-mode ml_only --date "2025-04-06 18:00"
+# or use the convenience wrapper:
+./run_tracker.sh
 ```
+
+> **Note on xsnow**: `xsnow` is a companion library developed by the same team and hosted at
+> [gitlab.com/avacollabra/postprocessing/xsnow](https://gitlab.com/avacollabra/postprocessing/xsnow).
+> It handles all `.pro` file I/O.  It must be cloned and installed separately as shown above.
 
 ### Dependencies
 
 Core libraries:
+- `xsnow`: SNOWPACK `.pro` file I/O (replaces the legacy custom parser)
 - `xarray`: Multi-dimensional data handling
 - `pandas`, `numpy`: Data analysis
 - `geopandas`, `shapely`: Geospatial operations
@@ -142,6 +154,17 @@ Core libraries:
 - `matplotlib`, `plotly`, `folium`: Visualization
 
 ## Usage
+
+### Operational Scripts
+
+Two shell scripts are provided for day-to-day use:
+
+| Script | Purpose |
+|--------|---------|
+| `run_tracker.sh` | Runs a full analysis for today's date; activates the venv, sets environment variables, and writes a timestamped log under `logs/` |
+| `train_ml_model.sh` | Full ML pipeline: collects training data from a `.pro` archive, trains an ensemble model, and promotes the best model to `assets/models/production/` |
+
+Both scripts source `.venv/bin/activate` — edit the path variables near the top before first use.
 
 ### Basic Analysis
 
@@ -528,7 +551,7 @@ wetting_front_tracker/
 │       ├── main.py                    # Main orchestrator
 │       ├── wet_front_tracker.py       # Core analysis functions
 │       ├── ml_loc_detector.py         # ML detection
-│       ├── snowpack_reader.py         # Data I/O
+│       ├── snowpack_reader.py         # Data I/O (xsnow-backed)
 │       ├── plotting.py                # Visualization
 │       ├── param_config.py            # Configuration
 │       ├── diagnostic_wrapper.py      # Debugging tools
@@ -548,7 +571,7 @@ wetting_front_tracker/
 1. **New analysis metric**: Add to `wet_front_tracker.py`
 2. **New visualization**: Update `plotting.py`
 3. **New LOC method**: Extend `ml_loc_detector.py`
-4. **New data source**: Modify `snowpack_reader.py`
+4. **New data source**: Modify `snowpack_reader.py` (uses `xsnow.read()` internally)
 
 ### Testing
 

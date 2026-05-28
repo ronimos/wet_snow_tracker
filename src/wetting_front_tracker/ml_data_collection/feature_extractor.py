@@ -44,20 +44,12 @@ except ImportError:
         get_column_name
     )
 
-# Import SnowpackProfile with proper type checking support
-if TYPE_CHECKING:
-    from ..snowpack_reader import SnowpackProfile as SnowpackProfileType
-else:
-    try:
-        from ..snowpack_reader import SnowpackProfile as SnowpackProfileType
-    except ImportError:
-        import sys
-        sys.path.insert(0, str(Path(__file__).parent.parent))
-        try:
-            from ..snowpack_reader import SnowpackProfile as SnowpackProfileType
-        except ImportError:
-            logger.warning("Could not import SnowpackProfile - will fail at runtime if used")
-            SnowpackProfileType = None  # type: ignore
+import xsnow
+
+
+def _squeeze(ds: xsnow.xsnowDataset):
+    """Squeeze singleton dims from a single-file xsnowDataset → (time, layer)."""
+    return ds.data.squeeze(['location', 'slope', 'realization'], drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -119,29 +111,26 @@ class LayerFeatureExtractor:
     
     def find_last_dry_timestamp(
         self,
-        profile: "SnowpackProfileType",
+        ds: xsnow.xsnowDataset,
         stall_time: datetime,
         layer_above_id: int,
         layer_below_id: int
     ) -> Optional[pd.Timestamp]:
         """
         Find the last timestamp where both layers had LWC < threshold.
-        
-        This identifies when both layers were still "dry" before wetting began.
-        
+
         Args:
-            profile: SnowpackProfile object
+            ds: xsnowDataset for the station
             stall_time: When the stall event started
             layer_above_id: Layer ID above the interface
             layer_below_id: Layer ID below the interface
-            
+
         Returns:
             Timestamp when both layers were last dry, or None if not found
         """
-        lwc_threshold = self.config.lwc_threshold_pct / 100.0  # Convert % to fraction
-        
-        # Get all timestamps before stall time
-        all_times = pd.to_datetime(profile.data.timestamp.values)
+        lwc_threshold = self.config.lwc_threshold_pct / 100.0
+
+        all_times = pd.to_datetime(ds.data.time.values)
         
         # Filter to times before stall, within max lookback window
         min_time = stall_time - timedelta(hours=self.config.max_lookback_hours)
@@ -154,11 +143,10 @@ class LayerFeatureExtractor:
         # Sort in reverse chronological order (most recent first)
         valid_times = sorted(valid_times, reverse=True)
         
-        # Search backwards in time for when both layers were dry
+        data = _squeeze(ds)
         for timestamp in valid_times:
             try:
-                # Get profile at this timestamp
-                profile_at_time = profile.data.sel(timestamp=timestamp, method='nearest')
+                profile_at_time = data.sel(time=timestamp, method='nearest')
                 profile_df = profile_at_time.to_dataframe().reset_index()
                 
                 # Find the layers by ID
@@ -238,7 +226,7 @@ class LayerFeatureExtractor:
     
     def extract_features_for_interface(
         self,
-        profile: "SnowpackProfileType",
+        ds: xsnow.xsnowDataset,
         stall_time: datetime,
         stall_layer_id: int,
         layer_above_id: int,
@@ -269,9 +257,8 @@ class LayerFeatureExtractor:
             feature_time = requested_feature_time
             features['lookback_method'] = 'explicit'
         elif self.config.use_dynamic_lookback:
-            # NEW: Find last dry timestamp
             feature_time = self.find_last_dry_timestamp(
-                profile, stall_time, layer_above_id, layer_below_id
+                ds, stall_time, layer_above_id, layer_below_id
             )
             
             if feature_time is None:
@@ -293,10 +280,7 @@ class LayerFeatureExtractor:
             )
             features['lookback_method'] = 'fixed'
         
-        # Get profile at feature extraction time
-        profile_df, actual_time = self._get_profile_at_time(
-            profile, feature_time
-        )
+        profile_df, actual_time = self._get_profile_at_time(ds, feature_time)
         
         if profile_df is None or profile_df.empty:
             logger.warning(f"No profile data available at {feature_time}")
@@ -358,40 +342,33 @@ class LayerFeatureExtractor:
     
     def _get_profile_at_time(
         self,
-        profile: "SnowpackProfileType",
+        ds: xsnow.xsnowDataset,
         target_time: datetime
     ) -> Tuple[Optional[pd.DataFrame], Optional[datetime]]:
         """
         Get profile DataFrame at a specific time.
-        
+
         Args:
-            profile: SnowpackProfile object
+            ds: xsnowDataset for the station
             target_time: Desired time
-            
+
         Returns:
-            Tuple of (profile_df, actual_time)
-            Returns (None, None) if time not available
+            Tuple of (profile_df, actual_time); (None, None) on failure
         """
         try:
-            # Try to get profile at exact time (with nearest neighbor)
-            # Convert tolerance to numpy timedelta64 for xarray compatibility
             tolerance_td = np.timedelta64(
                 int(self.config.max_time_tolerance_hours * 3600), 's'
             )
-            profile_at_time = profile.data.sel(
-                timestamp=target_time,
+            data = _squeeze(ds)
+            profile_at_time = data.sel(
+                time=target_time,
                 method='nearest',
-                tolerance=tolerance_td # type: ignore[arg-type]
+                tolerance=tolerance_td,  # type: ignore[arg-type]
             )
-            
-            # Get actual timestamp
-            actual_time = pd.Timestamp(profile_at_time.timestamp.values)
-            
-            # Convert to DataFrame
+            actual_time = pd.Timestamp(profile_at_time.time.values)
             profile_df = profile_at_time.to_dataframe().reset_index()
-            
             return profile_df, actual_time
-            
+
         except Exception as e:
             logger.error(f"Error getting profile at {target_time}: {e}")
             return None, None
@@ -600,19 +577,16 @@ def extract_features_for_stall_events(
     Returns:
         DataFrame with stall events and their features
     """
-    if SnowpackProfileType is None:
-        raise ImportError("SnowpackProfile not available")
-    
     all_features = []
-    
+
     for event in stall_events:
         try:
-            # Load profile
-            profile = SnowpackProfileType(str(event['pro_file']))
+            ds = xsnow.read(str(event['pro_file']), lazy=False)
+            if ds is None or ds.data.time.size == 0:
+                continue
             
-            # Extract features
             features = extractor.extract_features_for_interface(
-                profile,
+                ds,
                 event['start_time'],
                 event['stall_layer_id'],
                 event['layer_above_id'],
