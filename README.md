@@ -56,7 +56,7 @@ Traditional avalanche forecasting relies on point observations and manual snowpa
                      v
 ┌──────────────────────────────────────────────────────────┐
 │                 Data Processing Layer                    │
-│  • Profile reading & validation (snowpack_reader.py)     │
+│  • Profile reading via xsnow (snowpack_reader.py)        │
 │  • Geospatial polygon linking (prepare_geodata.py)       │
 │  • Time series extraction                                │
 └────────────────────┬─────────────────────────────────────┘
@@ -135,6 +135,7 @@ python -m src.wetting_front_tracker.main --loc-mode ml_only --date "2025-04-06 1
 ### Dependencies
 
 Core libraries:
+- `xsnow`: SNOWPACK `.pro` file I/O (replaces the legacy custom parser)
 - `xarray`: Multi-dimensional data handling
 - `pandas`, `numpy`: Data analysis
 - `geopandas`, `shapely`: Geospatial operations
@@ -528,7 +529,7 @@ wetting_front_tracker/
 │       ├── main.py                    # Main orchestrator
 │       ├── wet_front_tracker.py       # Core analysis functions
 │       ├── ml_loc_detector.py         # ML detection
-│       ├── snowpack_reader.py         # Data I/O
+│       ├── snowpack_reader.py         # Data I/O (xsnow-backed)
 │       ├── plotting.py                # Visualization
 │       ├── param_config.py            # Configuration
 │       ├── diagnostic_wrapper.py      # Debugging tools
@@ -548,7 +549,7 @@ wetting_front_tracker/
 1. **New analysis metric**: Add to `wet_front_tracker.py`
 2. **New visualization**: Update `plotting.py`
 3. **New LOC method**: Extend `ml_loc_detector.py`
-4. **New data source**: Modify `snowpack_reader.py`
+4. **New data source**: Modify `snowpack_reader.py` (uses `xsnow.read()` internally)
 
 ### Testing
 
