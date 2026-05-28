@@ -103,34 +103,45 @@ Traditional avalanche forecasting relies on point observations and manual snowpa
 
 ### Prerequisites
 
-- Python 3.9+
+- Python **3.12+**
+- [`uv`](https://docs.astral.sh/uv/) package manager (`pip install uv`)
 - SNOWPACK model output files (.pro format)
 - Sufficient disk space for time series data
 
 ### Quick Start
 
 ```bash
-# Clone repository
+# 1. Clone this repository
 git clone <repository-url>
-cd wetting_front_tracker
+cd wet_snow_tracker
 
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+# 2. Clone and install xsnow (not on PyPI — install from GitLab)
+git clone git@gitlab.com:avacollabra/postprocessing/xsnow.git ../xsnow
+uv pip install -e ../xsnow
 
-# Install dependencies
-pip install -r requirements.txt
+# 3. Install this project
+uv pip install -e .
 
-# Configure paths (create .env file)
+# 4. Configure paths (create .env file)
 cat > .env << EOF
 PRO_FILES_SOURCE=local
 PRO_FILES_INPUT_DIR=/path/to/snowpack/output
 WFT_RESULTS_OUTPUT_DIR=/path/to/results
+WFT_ASSETS_OUTPUT_DIR=/path/to/results/plot_assets
+ML_ENABLED=true
+ML_MODEL_PATH=src/wetting_front_tracker/assets/models/production
+OPENTOPO_API_KEY=<your_key>   # only needed for DEM downloads
 EOF
 
-# Run analysis
+# 5. Run analysis
 python -m src.wetting_front_tracker.main --loc-mode ml_only --date "2025-04-06 18:00"
+# or use the convenience wrapper:
+./run_tracker.sh
 ```
+
+> **Note on xsnow**: `xsnow` is a companion library developed by the same team and hosted at
+> [gitlab.com/avacollabra/postprocessing/xsnow](https://gitlab.com/avacollabra/postprocessing/xsnow).
+> It handles all `.pro` file I/O.  It must be cloned and installed separately as shown above.
 
 ### Dependencies
 
@@ -143,6 +154,17 @@ Core libraries:
 - `matplotlib`, `plotly`, `folium`: Visualization
 
 ## Usage
+
+### Operational Scripts
+
+Two shell scripts are provided for day-to-day use:
+
+| Script | Purpose |
+|--------|---------|
+| `run_tracker.sh` | Runs a full analysis for today's date; activates the venv, sets environment variables, and writes a timestamped log under `logs/` |
+| `train_ml_model.sh` | Full ML pipeline: collects training data from a `.pro` archive, trains an ensemble model, and promotes the best model to `assets/models/production/` |
+
+Both scripts source `.venv/bin/activate` — edit the path variables near the top before first use.
 
 ### Basic Analysis
 
