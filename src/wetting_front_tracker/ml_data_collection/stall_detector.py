@@ -27,13 +27,19 @@ logger = logging.getLogger(__name__)
 
 # Try to import from main project
 try:
-    from wetting_front_tracker.snowpack_reader import SnowpackProfile
+    from wetting_front_tracker.snowpack_reader import get_full_timeseries_summary
     from wetting_front_tracker.wet_front_tracker import wet_front_lwc
 except ImportError:
-    # This block will be hit if the path wasn't added above
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-    from wetting_front_tracker.snowpack_reader import SnowpackProfile
+    from wetting_front_tracker.snowpack_reader import get_full_timeseries_summary
     from wetting_front_tracker.wet_front_tracker import wet_front_lwc
+
+import xsnow
+
+
+def _squeeze(ds: xsnow.xsnowDataset):
+    """Squeeze singleton dims from a single-file xsnowDataset → (time, layer)."""
+    return ds.data.squeeze(['location', 'slope', 'realization'], drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -217,38 +223,37 @@ def get_adjacent_layers(
 
 
 def verify_layer_id_persistence(
-    profile: SnowpackProfile,
+    ds: xsnow.xsnowDataset,
     layer_id: int,
     start_time: datetime,
     end_time: datetime
 ) -> bool:
     """
     Verify that a layer ID persists across a time range.
-    
+
     Args:
-        profile: SnowpackProfile object
+        ds: xsnowDataset for the station
         layer_id: Element ID to check
         start_time: Start of time range
         end_time: End of time range
-        
+
     Returns:
         True if layer ID exists throughout the time range
     """
     try:
-        # Select time range
-        time_slice = profile.data.sel(timestamp=slice(start_time, end_time))
-        
-        # Check if layer_id appears in each timestamp
-        for timestamp in time_slice.timestamp.values:
-            profile_at_time = time_slice.sel(timestamp=timestamp)
+        data = _squeeze(ds)
+        time_slice = data.sel(time=slice(start_time, end_time))
+
+        for timestamp in time_slice.time.values:
+            profile_at_time = time_slice.sel(time=timestamp)
             if 'element_ID' in profile_at_time:
                 layer_ids = profile_at_time['element_ID'].values
                 if layer_id not in layer_ids:
                     logger.debug(f"Layer {layer_id} missing at {timestamp}")
                     return False
-        
+
         return True
-        
+
     except Exception as e:
         logger.warning(f"Error verifying layer ID persistence: {e}")
         return False
@@ -280,18 +285,20 @@ class StallDetector:
     
     def find_stalls(
         self,
-        profile: SnowpackProfile,
+        ds: xsnow.xsnowDataset,
         wetting_front_timeseries: pd.Series,
-        station_name: str
+        station_name: str,
+        pro_file: Optional[Path] = None,
     ) -> List[StallEvent]:
         """
         Find all stall events with layer ID tracking.
-        
+
         Args:
-            profile: SnowpackProfile object (needed for layer ID lookup)
+            ds: xsnowDataset for the station
             wetting_front_timeseries: Series with datetime index and heights (meters)
             station_name: Station identifier
-            
+            pro_file: Path to the source .pro file (stored in each StallEvent)
+
         Returns:
             List of detected StallEvent objects
         """
@@ -323,9 +330,9 @@ class StallDetector:
         for period in stall_periods:
             event = self._create_stall_event(
                 period,
-                profile,
+                ds,
                 station_name,
-                profile.filename
+                pro_file or Path('unknown'),
             )
             if event is not None:
                 events.append(event)
@@ -479,28 +486,25 @@ class StallDetector:
     def _create_stall_event(
         self,
         stall_period: dict,
-        profile: SnowpackProfile,
+        ds: xsnow.xsnowDataset,
         station_name: str,
-        pro_file: Path
+        pro_file: Path,
     ) -> Optional[StallEvent]:
         """
         Create StallEvent with layer ID information.
-        
+
         Args:
             stall_period: Dictionary describing the stall
-            profile: SnowpackProfile for layer lookup
+            ds: xsnowDataset for the station
             station_name: Station name
             pro_file: Source file path
-            
+
         Returns:
             StallEvent object or None if layer ID lookup fails
         """
         try:
-            # Get profile at start of stall
-            profile_at_stall = profile.data.sel(
-                timestamp=stall_period['start'],
-                method='nearest'
-            )
+            data = _squeeze(ds)
+            profile_at_stall = data.sel(time=stall_period['start'], method='nearest')
             profile_df = profile_at_stall.to_dataframe().reset_index()
             
             # Find layer ID at stall height
@@ -589,44 +593,32 @@ def detect_stalls(
 ) -> List[StallEvent]:
     """
     Convenience function to detect stalls in a .pro file.
-    
+
     Args:
         pro_file: Path to .pro file
         config: Detection configuration
-        
+
     Returns:
         List of StallEvent objects
     """
-    if SnowpackProfile is None or wet_front_lwc is None:
-        raise ImportError("SnowpackProfile or wet_front_lwc not available")
-    
-    # Load profile
-    profile = SnowpackProfile(str(pro_file))
-    
-    # Calculate wetting front
-    parameters_to_calculate = {
-        "wet_front_lwc": wet_front_lwc
-    }
-    summary = profile.get_full_timeseries_summary(
-        parameters_to_calculate=parameters_to_calculate
+    ds = xsnow.read(str(pro_file), lazy=False)
+    if ds is None or ds.data.time.size == 0:
+        return []
+
+    summary = get_full_timeseries_summary(
+        ds, parameters_to_calculate={"wet_front_lwc": wet_front_lwc}
     )
-    
-    # Unpack tuple column
+
     if 'wet_front_lwc' in summary.columns:
         summary[['wet_front_lwc_value', 'wet_front_lwc_height']] = pd.DataFrame(
-            summary['wet_front_lwc'].tolist(),
-            index=summary.index
+            summary['wet_front_lwc'].tolist(), index=summary.index
         )
-    
-    # Extract wetting front
+
     wetting_front = extract_wetting_front_timeseries(summary)
-    
-    # Detect stalls
+
     detector = StallDetector(config)
     station_name = pro_file.stem
-    events = detector.find_stalls(profile, wetting_front, station_name)
-    
-    return events
+    return detector.find_stalls(ds, wetting_front, station_name, pro_file)
 
 
 if __name__ == '__main__':

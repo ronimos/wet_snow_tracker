@@ -51,12 +51,14 @@ except ImportError:
     )
     
 try:
-    from wetting_front_tracker.snowpack_reader import SnowpackProfile
+    from wetting_front_tracker.snowpack_reader import get_full_timeseries_summary
     from wetting_front_tracker.wet_front_tracker import wet_front_lwc
 except ImportError:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-    from wetting_front_tracker.snowpack_reader import SnowpackProfile
+    from wetting_front_tracker.snowpack_reader import get_full_timeseries_summary
     from wetting_front_tracker.wet_front_tracker import wet_front_lwc
+
+import xsnow
     
 logging.basicConfig(
     level=logging.INFO,
@@ -134,34 +136,27 @@ def get_summary_from_pro_file(
     pro_file: Path,
     config: MLDataCollectionConfig
 ) -> pd.DataFrame:
-    """
-    Get summary DataFrame from a .pro file.
-    """
+    """Get summary DataFrame from a .pro file."""
     try:
-        profile = SnowpackProfile(str(pro_file))
-        
-        parameters_to_calculate = {
-            "wet_front_lwc": wet_front_lwc
-        }
-        
-        summary_kwargs: dict[str, Any] = {
-            'parameters_to_calculate': parameters_to_calculate
-        }
-        if config.start_date:
-            summary_kwargs['start_date'] = config.start_date
-        if config.end_date:
-            summary_kwargs['end_date'] = config.end_date
-        
-        summary = profile.get_full_timeseries_summary(**summary_kwargs)
-        
+        ds = xsnow.read(str(pro_file), lazy=False)
+        if ds is None or ds.data.time.size == 0:
+            return pd.DataFrame()
+
+        summary = get_full_timeseries_summary(
+            ds,
+            parameters_to_calculate={"wet_front_lwc": wet_front_lwc},
+            start_date=config.start_date,
+            end_date=config.end_date,
+        )
+
         if 'wet_front_lwc' in summary.columns:
             summary[['wet_front_lwc_value', 'wet_front_lwc_height']] = pd.DataFrame(
-                summary['wet_front_lwc'].tolist(), 
+                summary['wet_front_lwc'].tolist(),
                 index=summary.index
             )
-        
+
         return summary
-        
+
     except Exception as e:
         logger.error(f"Error getting summary for {pro_file.name}: {e}")
         return pd.DataFrame()
@@ -268,9 +263,14 @@ def collect_ml_data(
             continue
         
         try:
-            profile = SnowpackProfile(str(pro_file))
+            ds = xsnow.read(str(pro_file), lazy=False)
+            if ds is None or ds.data.time.size == 0:
+                processed_files.add(str(pro_file))
+                files_since_checkpoint += 1
+                continue
+
             summary_df = get_summary_from_pro_file(pro_file, config)
-            
+
             if summary_df is None or summary_df.empty:
                 logger.debug(f"No summary for {pro_file.name}")
                 processed_files.add(str(pro_file))
@@ -286,11 +286,7 @@ def collect_ml_data(
                 continue
             
             station_name = pro_file.stem
-            events = stall_detector.find_stalls(
-                profile,
-                wetting_front,
-                station_name
-            )
+            events = stall_detector.find_stalls(ds, wetting_front, station_name, pro_file)
             
             all_stall_events.extend([e.to_dict() for e in events])
             processed_files.add(str(pro_file))
@@ -376,10 +372,8 @@ def collect_ml_data(
             continue
         
         try:
-            # Load profile
-            profile = SnowpackProfile(str(event['pro_file']))
-            
-            if profile is None or profile.data is None or profile.data.empty:
+            ds = xsnow.read(str(event['pro_file']), lazy=False)
+            if ds is None or ds.data.time.size == 0:
                 logger.warning(f"Invalid profile from: {event['pro_file']}")
                 failed_extractions += 1
                 continue
@@ -393,7 +387,7 @@ def collect_ml_data(
             # --- 1. Extract Positive Example ---
             # NEW: Pass stall_time directly - extractor finds optimal lookback
             positive_features = feature_extractor.extract_features_for_interface(
-                profile,
+                ds,
                 event['start_time'],  # Stall start time
                 event['stall_layer_id'],
                 event['layer_above_id'],
@@ -447,9 +441,8 @@ def collect_ml_data(
 
             # Get profile at the actual feature extraction time
             try:
-                profile_at_time = profile.data.sel(
-                    timestamp=actual_feature_time, method='nearest'
-                )
+                data = ds.data.squeeze(['location', 'slope', 'realization'], drop=True)
+                profile_at_time = data.sel(time=actual_feature_time, method='nearest')
                 profile_df = profile_at_time.to_dataframe().reset_index()
             except Exception as e:
                 logger.warning(f"Could not get profile at {actual_feature_time} for negatives: {e}")
@@ -498,7 +491,7 @@ def collect_ml_data(
             for neg_interface in negative_samples:
                 # Use the SAME feature extraction time as positive example
                 neg_features = feature_extractor.extract_features_for_interface(
-                    profile,
+                    ds,
                     event['start_time'],  # Reference stall time
                     0,  # Dummy stall_layer_id
                     neg_interface['above_id'],

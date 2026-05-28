@@ -608,6 +608,76 @@ class SnowpackProfile:
 # Convenience Functions
 # ---------------------------------------------------------------------------
 
+def _unpack_summary_result(name: str, result: Any) -> Dict[str, Any]:
+    """Unpack a callable result into named dict entries (shared by class and standalone)."""
+    if result is None:
+        return {name: np.nan}
+    if isinstance(result, tuple):
+        unpacked = {f"{name}_value": result[0] if result[0] is not None else np.nan}
+        if len(result) > 1:
+            unpacked[f"{name}_height"] = result[1] if result[1] is not None else np.nan
+        return unpacked
+    return {name: result}
+
+
+def get_full_timeseries_summary(
+    ds: xsnow.xsnowDataset,
+    parameters_to_calculate: Dict[str, Callable],
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    Standalone equivalent of ``SnowpackProfile.get_full_timeseries_summary``.
+
+    Operates directly on an ``xsnowDataset`` returned by ``xsnow.read()``,
+    squeezing the singleton ``(location, slope, realization)`` dims before
+    iterating over timestamps.
+
+    Args:
+        ds: Dataset returned by ``xsnow.read()`` for a single .pro file.
+        parameters_to_calculate: Dict mapping column names to callables that
+            accept a per-timestamp ``pd.DataFrame`` and return a scalar or
+            ``(value, height)`` tuple.
+        start_date: Optional ISO start date string.
+        end_date:   Optional ISO end date string.
+
+    Returns:
+        DataFrame indexed by timestamp with one column per callable result.
+    """
+    data = ds.data.squeeze(['location', 'slope', 'realization'], drop=True)
+    if start_date or end_date:
+        data = data.sel(time=slice(start_date, end_date))
+
+    if data.time.size == 0:
+        return pd.DataFrame()
+
+    summary_list = []
+    for ts_val in data.time.values:
+        summary_row: Dict[str, Any] = {'timestamp': ts_val}
+        single_ts = data.sel(time=ts_val)
+        profile_layers = single_ts.to_dataframe().reset_index()
+
+        if profile_layers.empty:
+            continue
+
+        for name, calc in parameters_to_calculate.items():
+            if not callable(calc):
+                continue
+            try:
+                result = calc(profile_layers)
+                summary_row.update(_unpack_summary_result(name, result))
+            except Exception as e:
+                logger.warning(f"Function '{name}' failed at {ts_val}: {e}")
+                summary_row[name] = np.nan
+
+        summary_list.append(summary_row)
+
+    if not summary_list:
+        return pd.DataFrame()
+
+    return pd.DataFrame(summary_list).set_index('timestamp')
+
+
 def read_snowpack(pro_file_path: Union[str, Path]) -> Optional[SnowpackProfile]:
     """
     Read a SNOWPACK profile, using a cached NetCDF when available.
