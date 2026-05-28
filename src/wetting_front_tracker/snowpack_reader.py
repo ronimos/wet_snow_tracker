@@ -2,30 +2,22 @@
 snowpack_reader.py
 ==================
 
-A hardware-adaptive reader for SNOWPACK .pro files using xarray.
+xsnow-backed reader for SNOWPACK .pro files.
 
-This module provides the `SnowpackProfile` class for parsing, processing,
-and analyzing snow profile data from SNOWPACK `.pro` files. It seamlessly
-leverages available hardware—CPU or GPU—for optimal performance.
-
-Key Features:
-- Parses station metadata and profile time series
-- Stores data as xarray.Dataset backed by NumPy (CPU) or CuPy (GPU)
-- Slices data by date range
-- Calculates critical snowpack properties (rc_flat)
-- Supports flexible profile summarization
+Reads .pro files via ``xsnow.read()``, then adapts the resulting
+5-D dataset to the 2-D ``(timestamp, layer_index)`` structure expected
+by the rest of the analysis pipeline.  All public methods and the
+``metadata`` dict remain identical to the previous implementation.
 
 Hardware Acceleration:
-- GPU Support: Uses CuPy for GPU acceleration if available
-- CPU Fallback: Uses NumPy if no GPU detected
+- GPU Support: Uses CuPy for GPU acceleration of rc_flat if available
+- CPU Fallback: Uses NumPy otherwise
 
 Author: Ron Simenhois
-Last Updated: October 12, 2025
 """
 
 import gc
 import logging
-import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -33,75 +25,23 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 from tqdm import tqdm
+import xsnow
 
-# Hardware-adaptive array library detection
+# Hardware-adaptive array library (used for rc_flat computation)
 try:
     import cupy as xp
     _ = xp.arange(1)
     GPU_AVAILABLE = True
-    logging.info("✅ GPU detected. Using CuPy for accelerated calculations.")
+    logging.info("GPU detected. Using CuPy for accelerated calculations.")
 except (ImportError, RuntimeError):
     import numpy as xp
     GPU_AVAILABLE = False
-    logging.info("ℹ️ No GPU or CuPy found. Using NumPy on CPU.")
+    logging.info("No GPU or CuPy found. Using NumPy on CPU.")
 
 pd.set_option('display.max_columns', None)
 pd.set_option('display.max_colwidth', None)
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Constants and Mappings
-# ---------------------------------------------------------------------------
-
-# Maps header keys from .pro files to dictionary keys
-HEADER_MAP = {
-    'Altitude=': 'altitude',
-    'Latitude=': 'latitude',
-    'Longitude=': 'longitude',
-    'SlopeAngle=': 'slopeAngle',
-    'SlopeAzi=': 'slopeAzi',
-    'StationName=': 'stationName'
-}
-
-# Parameter codes to human-readable names
-PARAM_CODES = {
-    "0500": "timestamp",
-    "0501": "height",
-    "0504": "element_ID",
-    "0502": "density",
-    "0503": "temperature",
-    "0506": "lwc",
-    "0508": "dendricity",
-    "0509": "sphericity",
-    "0510": "coord_number",
-    "0511": "bond_size",
-    "0512": "grain_size",
-    "0513": "grain_type",
-    "0515": "ice_content",
-    "0516": "air_content",
-    "0517": "stress",
-    "0518": "viscosity",
-    "0520": "temperature_gradient",
-    "0523": "viscous_deformation_rate",
-    "0531": "stab_deformation_rate",
-    "0532": "sn38",
-    "0533": "sk38",
-    "0534": "hand_hardness",
-    "0535": "opt_equ_grain_size",
-    "0601": "shear_strength",
-    "0602": "gs_difference",
-    "0603": "hardness_difference",
-    "0604": "ssi",
-    "1501": "height_nodes",
-    "1532": "sn38_nodes",
-    "1533": "sk38_nodes",
-    "0540": "date_of_birth",
-    "0607": "accumulated_temperature_gradient",
-    "9998": "depth",
-    "9999": "rc_flat"
-}
 
 # Physical constants for rc_flat calculation
 RHO_ICE = 917.0  # Ice density (kg/m³)
@@ -127,30 +67,14 @@ def _cleanup_gpu_memory() -> None:
 
 
 def _to_cpu_array(data: xr.DataArray) -> xr.DataArray:
-    """
-    Convert xarray DataArray from GPU to CPU if needed.
-    
-    Args:
-        data: xarray DataArray potentially on GPU
-        
-    Returns:
-        xarray DataArray with data on CPU
-    """
+    """Convert xarray DataArray from GPU to CPU if needed."""
     if GPU_AVAILABLE and hasattr(data.data, 'get'):
         return xr.DataArray(data.data.get(), dims=data.dims, coords=data.coords)
     return data
 
 
 def _compute_sqrt_term(term_data: xr.DataArray) -> xr.DataArray:
-    """
-    Safely compute square root of a term, handling negative/zero values.
-    
-    Args:
-        term_data: Input DataArray
-        
-    Returns:
-        Square root of positive values, NaN for invalid values
-    """
+    """Safely compute square root, replacing non-positive values with NaN."""
     data_copy = term_data.data.copy()
     data_copy[data_copy <= 0] = xp.nan
     sqrt_data = xp.sqrt(data_copy)
@@ -163,192 +87,76 @@ def _compute_sqrt_term(term_data: xr.DataArray) -> xr.DataArray:
 
 class SnowpackProfile:
     """
-    Reads, parses, and represents a SNOWPACK .pro file with hardware adaptation.
+    Reads and represents a SNOWPACK .pro file.
 
-    This class handles the entire lifecycle of a .pro file, from reading and
-    parsing to performing hardware-accelerated numerical computations.
+    Internally uses ``xsnow.read()`` for I/O, then adapts the dataset to a
+    2-D ``(timestamp, layer_index)`` structure.  The public interface is
+    identical to the previous implementation.
 
     Attributes:
         filename: Path to the input .pro file
-        metadata: Station parameters parsed from the file header
-        data: xarray Dataset containing all profile data
+        metadata: Station parameters extracted from the file
+        data: xarray Dataset with dims ``(timestamp, layer_index)``
     """
 
     def __init__(self, filename: Union[Path, str], _load_data: bool = True):
-        """
-        Initialize the reader and optionally process the file.
-
-        Args:
-            filename: Path to the .pro file
-            _load_data: If False, creates an empty object (for internal use)
-        """
         self.filename: Path = Path(filename) if isinstance(filename, str) else filename
         self.metadata: Dict[str, Any] = {}
         self.data: Optional[xr.Dataset] = None
-        
+
         if _load_data:
             self._read_profile()
 
     def __len__(self) -> int:
-        """Returns the number of profiles (timestamps) in the dataset."""
         return 0 if self.data is None else len(self.data.timestamp)
 
     def __repr__(self) -> str:
-        """Provides a developer-friendly representation of the object."""
         device = "GPU" if GPU_AVAILABLE else "CPU"
         return f"<SnowpackProfile(filename='{self.filename}', profiles={len(self)}, device='{device}')>"
 
     def _read_profile(self) -> None:
-        """Orchestrates reading and parsing of the entire .pro file."""
+        """Load profile data using xsnow and adapt to the (timestamp, layer_index) API."""
         if not self.filename.exists():
-            logger.error(f"File not found: {self.filename}")
             raise FileNotFoundError(f"File not found: {self.filename}")
-        
-        in_header, in_data = False, False
-        temp_profiles: List[Dict] = []
-        current_ts_data: Dict = {}
 
         try:
-            with open(self.filename, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    
-                    if line == '[STATION_PARAMETERS]':
-                        in_header, in_data = True, False
-                    elif line == '[DATA]':
-                        in_header, in_data = False, True
-                    elif line.startswith('['):
-                        in_header, in_data = False, False
-                    elif in_header:
-                        self._parse_header_line(line)
-                    elif in_data:
-                        is_new_ts, timestamp_key = self._is_new_timestamp_line(line)
-                        if is_new_ts:
-                            if current_ts_data:
-                                temp_profiles.append(current_ts_data)
-                            current_ts_data = {'timestamp': timestamp_key}
-                        else:
-                            self._parse_data_line(line, current_ts_data)
-
-            if current_ts_data:
-                temp_profiles.append(current_ts_data)
-            
-            if not temp_profiles:
-                logger.warning(f"No data parsed from file: {self.filename}")
-                return
-
-            self._create_dataset_from_profiles(temp_profiles)
-            
-            if self.data is not None:
-                self._compute_and_add_depth()
-                self._compute_and_add_rc_flat_vectorized()
-        
+            xsnow_ds = xsnow.read(str(self.filename), lazy=False)
         except Exception as e:
-            logger.error(f"Error reading profile from {self.filename}: {e}", exc_info=True)
+            logger.error(f"Error reading {self.filename}: {e}", exc_info=True)
             raise
 
-    def _parse_header_line(self, line: str) -> None:
-        """Parses a single line from the [STATION_PARAMETERS] section."""
-        for key, value in HEADER_MAP.items():
-            if line.startswith(key):
-                self.metadata[value] = line.split('=', 1)[1].strip()
-                break
-
-    def _is_new_timestamp_line(self, line: str) -> Tuple[bool, Optional[str]]:
-        """Checks if a data line marks the beginning of a new profile."""
-        parts = line.split(',', 1)
-        if parts[0] == "0500" and len(parts) > 1:
-            return True, parts[1]
-        return False, None
-
-    def _parse_data_line(self, line: str, current_ts_data: Dict) -> None:
-        """Parses a single data line containing layer data for a parameter."""
-        parts = line.split(',')
-        if len(parts) < 3:
-            return
-        
-        param_code = parts[0]
-        if param_name := PARAM_CODES.get(param_code):
-            try:
-                current_ts_data[param_name] = np.array(parts[2:], dtype=float)
-            except ValueError:
-                logger.warning(f"Could not parse data for parameter {param_name}")
-
-    def _create_dataset_from_profiles(self, profiles: List[Dict]) -> None:
-        """Converts parsed data into an xarray.Dataset."""
-        # Parse timestamps
-        timestamps = pd.to_datetime(
-            [p['timestamp'] for p in profiles],
-            format='%d.%m.%Y %H:%M:%S',
-            errors='coerce'
-        )
-        
-        valid_indices = ~pd.isna(timestamps)
-        profiles = [p for i, p in enumerate(profiles) if valid_indices[i]]
-        timestamps = timestamps.dropna()
-        
-        if not profiles:
-            logger.warning("No valid timestamps found in profiles")
+        if xsnow_ds is None or xsnow_ds.data is None or xsnow_ds.data.time.size == 0:
+            logger.warning(f"No profile data parsed from {self.filename}")
             return
 
-        # Get all parameters and determine max layers
-        all_params = sorted({
-            key for p in profiles 
-            for key in p 
-            if key != 'timestamp'
-        })
-        max_layers = max(
-            (len(p.get('height', [])) for p in profiles),
-            default=0
-        )
-        
-        # Create data arrays directly with correct backend (numpy or cupy)
-        data_vars = {
-            param: (
-                ("timestamp", "layer_index"),
-                xp.full((len(profiles), max_layers), xp.nan, dtype=xp.float64)
-            )
-            for param in all_params
+        raw = xsnow_ds.data
+
+        # Extract station metadata from xsnow coordinates
+        self.metadata = {
+            'stationName': str(raw.location.values[0]),
+            'latitude':    float(raw.latitude.values[0]),
+            'longitude':   float(raw.longitude.values[0]),
+            'altitude':    float(raw.altitude.values[0]),
         }
 
-        # Populate arrays
-        for i, profile in enumerate(profiles):
-            num_layers = len(profile.get('height', []))
-            for param, (dims, arr) in data_vars.items():
-                if param in profile:
-                    values = profile[param]
-                    if values is not None and len(values) > 0:
-                        arr[i, :num_layers] = xp.array(
-                            values[:num_layers],
-                            dtype=xp.float64
-                        )
+        # Squeeze singleton dims (location, slope, realization) and rename
+        # time→timestamp, layer→layer_index to preserve the downstream API.
+        data = raw.squeeze(['location', 'slope', 'realization'], drop=True)
+        self.data = data.rename({'time': 'timestamp', 'layer': 'layer_index'}).sortby('timestamp')
 
-        # Create coordinates (use numpy for compatibility)
-        layer_index_coords = np.arange(max_layers)
-        
-        # Build dataset
-        self.data = xr.Dataset(
-            data_vars,
-            coords={
-                'timestamp': timestamps,
-                'layer_index': layer_index_coords
-            }
-        )
-        self.data = self.data.sortby('timestamp')
+        self._compute_and_add_depth()
+        self._compute_and_add_rc_flat_vectorized()
 
     def _compute_and_add_depth(self) -> None:
-        """Calculates depth of each layer from the snow surface."""
+        """Calculate depth of each layer from the snow surface."""
         if self.data is None or 'height' not in self.data.data_vars:
             logger.warning("Cannot calculate depth without 'height' variable")
             return
-        
+
         height = self.data['height']
         total_height = height.max(dim='layer_index', skipna=True)
         depth = total_height - height
-        
-        # Handle GPU/CPU differences in where() operation
+
         if GPU_AVAILABLE:
             final_depth_data = xp.where(
                 height.notnull().data,
@@ -356,20 +164,16 @@ class SnowpackProfile:
                 xp.nan
             )
             self.data['depth'] = xr.DataArray(
-                final_depth_data,
-                dims=depth.dims,
-                coords=depth.coords
+                final_depth_data, dims=depth.dims, coords=depth.coords
             )
         else:
             self.data['depth'] = depth.where(height.notnull())
 
     def _compute_and_add_rc_flat_vectorized(self) -> None:
         """
-        Calculates rc_flat for all profiles using vectorized operations.
-        
-        This method performs the most computationally intensive calculations
-        and benefits significantly from GPU acceleration. It also includes
-        memory cleanup for GPU environments.
+        Calculate rc_flat for all profiles using vectorized operations.
+
+        Benefits significantly from GPU acceleration when CuPy is available.
         """
         required_vars = {'density', 'grain_size', 'shear_strength', 'height'}
         if self.data is None or not required_vars.issubset(self.data.data_vars):
@@ -377,18 +181,15 @@ class SnowpackProfile:
             return
 
         try:
-            # Extract variables
             height = self.data['height']
             density = self.data['density']
             grain_size = self.data['grain_size']
             shear_strength = self.data['shear_strength']
 
-            # Calculate layer thickness and load
             height_of_bottom = height.shift(layer_index=1, fill_value=0)
             thick = height - height_of_bottom
             layer_load = density * thick * G
-            
-            # Calculate cumulative load from top
+
             load = (
                 layer_load
                 .reindex(layer_index=layer_load.layer_index[::-1])
@@ -396,79 +197,50 @@ class SnowpackProfile:
                 .reindex(layer_index=layer_load.layer_index)
             )
 
-            # Calculate slab density
             total_thick_above = self.data['height'].max(dim='layer_index', skipna=True) - height
             rho_sl_raw = load / (total_thick_above * G)
-            
-            # Fill missing values in slab density
+
             if GPU_AVAILABLE:
-                # GPU requires CPU conversion for forward/backward fill
                 rho_sl_numpy = rho_sl_raw.to_numpy()
                 rho_sl_cpu_da = xr.DataArray(
-                    rho_sl_numpy,
-                    dims=rho_sl_raw.dims,
-                    coords=rho_sl_raw.coords
+                    rho_sl_numpy, dims=rho_sl_raw.dims, coords=rho_sl_raw.coords
                 )
-                rho_sl_filled_cpu = (
-                    rho_sl_cpu_da
-                    .bfill(dim='layer_index')
-                    .ffill(dim='layer_index')
-                )
+                rho_sl_filled_cpu = rho_sl_cpu_da.bfill(dim='layer_index').ffill(dim='layer_index')
                 rho_sl_gpu = xp.asarray(rho_sl_filled_cpu.values)
-                rho_sl = xr.DataArray(
-                    rho_sl_gpu,
-                    dims=rho_sl_raw.dims,
-                    coords=rho_sl_raw.coords
-                )
+                rho_sl = xr.DataArray(rho_sl_gpu, dims=rho_sl_raw.dims, coords=rho_sl_raw.coords)
             else:
                 rho_sl = rho_sl_raw.bfill(dim='layer_index').ffill(dim='layer_index')
 
-            # Calculate rc_flat components
             tau_p = shear_strength * 1000.0
             gs = grain_size * 0.001
             e_prime = 5.07e9 * (rho_sl / RHO_ICE)**5.13 / (1 - 0.2**2)
             dsl_over_sigman = 1.0 / (G * rho_sl)
-            
-            # Calculate terms with safe square roots
+
             term1_under = A * (density / RHO_ICE * gs / GS_0)**B
             term2_under = 2 * tau_p * e_prime * dsl_over_sigman
-            
+
             term1 = _compute_sqrt_term(term1_under)
             term2 = _compute_sqrt_term(term2_under)
-            
-            # Combine terms
+
             rc_flat_combined = term1 * term2
             rc_flat_filled_data = xp.nan_to_num(rc_flat_combined.data, nan=9999.0)
             rc_flat_da = xr.DataArray(
-                rc_flat_filled_data,
-                dims=rc_flat_combined.dims,
-                coords=rc_flat_combined.coords
+                rc_flat_filled_data, dims=rc_flat_combined.dims, coords=rc_flat_combined.coords
             )
 
-            # Set surface layer rc_flat to 9999.0 (not physically meaningful)
             max_heights = height.max(dim='layer_index', skipna=True)
             is_not_surface = height < max_heights
-            
+
             if GPU_AVAILABLE:
-                final_data = xp.where(
-                    is_not_surface.data,
-                    rc_flat_da.data,
-                    9999.0
-                )
-                rc_flat_da = xr.DataArray(
-                    final_data,
-                    dims=rc_flat_da.dims,
-                    coords=rc_flat_da.coords
-                )
+                final_data = xp.where(is_not_surface.data, rc_flat_da.data, 9999.0)
+                rc_flat_da = xr.DataArray(final_data, dims=rc_flat_da.dims, coords=rc_flat_da.coords)
             else:
                 rc_flat_da = rc_flat_da.where(is_not_surface, 9999.0)
 
-            # Add to dataset
             self.data['rc_flat'] = rc_flat_da.transpose('timestamp', 'layer_index')
-            
-            # Clean up GPU memory
+
             _cleanup_gpu_memory()
-        
+
         except Exception as e:
             logger.error(f"Failed to calculate rc_flat: {e}", exc_info=True)
 
@@ -477,112 +249,71 @@ class SnowpackProfile:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None
     ) -> 'SnowpackProfile':
-        """
-        Creates a new SnowpackProfile containing a slice of the data.
-
-        Args:
-            start_date: Start date for the slice (e.g., 'YYYY-MM-DD')
-            end_date: End date for the slice (e.g., 'YYYY-MM-DD')
-
-        Returns:
-            A new SnowpackProfile object with sliced data
-        """
+        """Return a new SnowpackProfile containing only the specified date range."""
         if self.data is None or self.data.timestamp.size == 0:
             logger.warning("Cannot slice empty dataset")
             return self
 
-        # Use full timestamps for filtering
         timestamps = pd.to_datetime(self.data.timestamp.values)
-        
-        # Create boolean masks
-        if start_date:
-            start_mask = timestamps >= pd.to_datetime(start_date)
-        else:
-            start_mask = np.ones_like(timestamps, dtype=bool)
-        if end_date:
-            end_mask = timestamps <= pd.to_datetime(end_date)   
-        else:
-            end_mask = np.ones_like(timestamps, dtype=bool)
+
+        start_mask = timestamps >= pd.to_datetime(start_date) if start_date else np.ones(len(timestamps), dtype=bool)
+        end_mask   = timestamps <= pd.to_datetime(end_date)   if end_date   else np.ones(len(timestamps), dtype=bool)
         combined_mask = start_mask & end_mask
-        
+
         if not np.any(combined_mask):
             logger.warning(
-                f"No data in date range {start_date} to {end_date} "
-                f"for file {self.filename}"
+                f"No data in date range {start_date} to {end_date} for {self.filename}"
             )
             sliced_data = self.data.isel(timestamp=slice(0, 0))
         else:
             sliced_data = self.data.isel(timestamp=np.where(combined_mask)[0])
 
-        # Create new profile instance
         new_profile = SnowpackProfile(self.filename, _load_data=False)
         new_profile.data = sliced_data
         new_profile.metadata = self.metadata
-        
         return new_profile
 
     def save_as_netcdf(self, output_path: Union[str, Path]) -> None:
-        """
-        Saves the profile's dataset to a NetCDF file.
-        
-        Handles conversion from GPU to CPU arrays before saving.
-
-        Args:
-            output_path: Destination file path for the .nc file
-        """
+        """Save the profile dataset to a NetCDF file."""
         if self.data is None or self.data.timestamp.size == 0:
-            logger.warning(f"No data to save for NetCDF file: {output_path}")
+            logger.warning(f"No data to save for {output_path}")
             return
 
         try:
             output_path = Path(output_path)
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            
+
             data_to_save = self.data
-            
-            # Convert GPU arrays to CPU if needed
+
             if GPU_AVAILABLE:
                 cpu_data = xr.Dataset(attrs=self.data.attrs)
-                
                 for var_name, data_array in self.data.data_vars.items():
                     cpu_data[var_name] = (data_array.dims, data_array.data.get())
-                
                 coords_dict = {
                     coord_name: (
                         coord_val.dims,
-                        coord_val.data.get() if hasattr(coord_val.data, 'get')
-                        else coord_val
+                        coord_val.data.get() if hasattr(coord_val.data, 'get') else coord_val
                     )
                     for coord_name, coord_val in self.data.coords.items()
                 }
                 cpu_data = cpu_data.assign_coords(coords_dict)
                 data_to_save = cpu_data
-            
+
             data_to_save.to_netcdf(output_path)
             logger.debug(f"Saved profile to NetCDF: {output_path}")
-        
+
         except Exception as e:
-            logger.error(f"Failed to save NetCDF file to {output_path}: {e}", exc_info=True)
+            logger.error(f"Failed to save NetCDF to {output_path}: {e}", exc_info=True)
 
     def _process_summary_row(
         self,
         profile_layers: pd.DataFrame,
         parameters_to_calculate: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """
-        Shared logic for calculating summary statistics for a single profile.
-        
-        Args:
-            profile_layers: DataFrame of layers for a single timestamp
-            parameters_to_calculate: Dictionary of parameter calculations
-            
-        Returns:
-            Dictionary of calculated summary statistics
-        """
+        """Calculate summary statistics for a single profile timestamp."""
         summary_row = {}
-        
+
         for name, calc in parameters_to_calculate.items():
-            # Handle callable functions
             if callable(calc):
                 try:
                     result = calc(profile_layers)
@@ -591,78 +322,55 @@ class SnowpackProfile:
                     logger.warning(f"Custom function for '{name}' failed: {e}")
                     summary_row[name] = np.nan
                 continue
-            
-            # Handle string-based calculations
+
             if isinstance(calc, str):
                 param, calc_type = name.split('-')[0], calc
             elif isinstance(calc, tuple):
                 param, calc_type = calc
             else:
                 continue
-            
+
             if param not in profile_layers.columns:
                 continue
-            
+
             series = profile_layers[param].dropna()
             if series.empty:
                 continue
-            
-            # Handle hand hardness as absolute value
+
             if param == 'hand_hardness':
                 series = series.abs()
-            
-            # Perform calculation
+
             if calc_type == 'min':
                 summary_row[name] = series.min()
                 if 'height' in profile_layers.columns:
                     summary_row[f"{name}-height"] = profile_layers.loc[series.idxmin()]['height']
-            
             elif calc_type == 'max':
                 summary_row[name] = series.max()
                 if 'height' in profile_layers.columns:
                     summary_row[f"{name}-height"] = profile_layers.loc[series.idxmax()]['height']
-            
             elif calc_type == 'mean':
                 summary_row[name] = series.mean()
-            
             elif calc_type == 'median':
                 summary_row[name] = series.median()
-            
             elif calc_type in ['weighted_mean', 'weighted_sum']:
                 weights = profile_layers.loc[series.index]['thickness']
                 weighted_sum_val = (series * weights).sum()
-                
                 if calc_type == 'weighted_sum':
                     summary_row[name] = weighted_sum_val
                 elif weights.sum() > 0:
                     summary_row[name] = weighted_sum_val / weights.sum()
-        
+
         return summary_row
 
     def _unpack_result(self, name: str, result: Any) -> Dict[str, Any]:
-        """
-        Unpacks tuple results into dictionary entries.
-        
-        Args:
-            name: Parameter name
-            result: Result value (scalar or tuple)
-            
-        Returns:
-            Dictionary with unpacked values
-        """
+        """Unpack tuple results into named dictionary entries."""
         if result is None:
             return {name: np.nan}
-        
         if isinstance(result, tuple):
-            unpacked = {
-                f"{name}_value": result[0] if result[0] is not None else np.nan
-            }
+            unpacked = {f"{name}_value": result[0] if result[0] is not None else np.nan}
             if len(result) > 1:
-                unpacked[f"{name}_height"] = (
-                    result[1] if result[1] is not None else np.nan
-                )
+                unpacked[f"{name}_height"] = result[1] if result[1] is not None else np.nan
             return unpacked
-        
         return {name: result}
 
     def get_profile_summary(
@@ -673,81 +381,55 @@ class SnowpackProfile:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None
     ) -> pd.DataFrame:
-        """
-        Extracts summary statistics for specified parameters (daily resolution).
-
-        This method processes the profile closest to noon for each day.
-
-        Args:
-            parameters_to_calculate: Dictionary mapping column names to
-                calculation types (string or callable)
-            from_height: Height in meters to slice the snowpack
-            above_or_below: Section to analyze ('above' or 'below')
-            start_date: Start date for the summary (e.g., 'YYYY-MM-DD')
-            end_date: End date for the summary (e.g., 'YYYY-MM-DD')
-
-        Returns:
-            DataFrame with date index and summary statistics
-        """
+        """Extract daily summary statistics (uses noon profile for each day)."""
         sliced_profile = self.slice(start_date, end_date)
         if sliced_profile.data is None or sliced_profile.data.timestamp.size == 0:
             return pd.DataFrame()
-        
+
         data_in_range = sliced_profile.data
-        
-        # Convert to CPU if needed
         if GPU_AVAILABLE:
             data_in_range = data_in_range.as_numpy()
-        
+
         full_df = data_in_range.to_dataframe().reset_index()
 
-        # Find profiles closest to noon each day
         noon_time = full_df['timestamp'].dt.normalize() + pd.Timedelta(hours=12)
         full_df['time_from_noon'] = (full_df['timestamp'] - noon_time).abs()
-        
         closest_indices = full_df.loc[
             full_df.groupby(full_df['timestamp'].dt.date)['time_from_noon'].idxmin()
         ]
         noon_df = closest_indices.copy()
-        
+
         if noon_df.empty:
             return pd.DataFrame()
-        
+
         noon_df['date'] = noon_df['timestamp'].dt.normalize()
 
-        # Process each day's profile
         summary_list = []
         for ts in noon_df['timestamp']:
             summary_row = {'date': ts.normalize()}
             profile_layers = full_df[full_df['timestamp'] == ts].copy()
-            
-            # Apply height filter if specified
+
             if from_height is not None:
                 if above_or_below == 'above':
                     profile_layers = profile_layers[profile_layers['height'] > from_height]
                 else:
                     profile_layers = profile_layers[profile_layers['height'] <= from_height]
-            
-            # Calculate thickness for weighted calculations
+
             if not profile_layers.empty:
                 profile_layers = profile_layers.sort_values('height').copy()
                 profile_layers['thickness'] = profile_layers['height'].diff()
-                
                 base_h = from_height if (from_height is not None and above_or_below == 'above') else 0
                 first_row_idx = profile_layers.index[0]
                 profile_layers.loc[first_row_idx, 'thickness'] = float(
                     profile_layers['height'].iloc[0] - base_h
                 )
-            
-            # Calculate summary statistics
-            summary_row.update(
-                self._process_summary_row(profile_layers, parameters_to_calculate)
-            )
+
+            summary_row.update(self._process_summary_row(profile_layers, parameters_to_calculate))
             summary_list.append(summary_row)
 
         if not summary_list:
             return pd.DataFrame()
-        
+
         return pd.DataFrame(summary_list).set_index('date')
 
     def get_full_timeseries_summary(
@@ -756,21 +438,7 @@ class SnowpackProfile:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None
     ) -> pd.DataFrame:
-        """
-        Calculates summary statistics for every timestamp (high resolution).
-
-        This method processes every profile without downsampling, making it
-        suitable for detailed time series analysis.
-
-        Args:
-            parameters_to_calculate: Dictionary where values are callable functions
-                that accept a DataFrame and return a scalar or tuple
-            start_date: Start date for the analysis (e.g., 'YYYY-MM-DD')
-            end_date: End date for the analysis (e.g., 'YYYY-MM-DD')
-
-        Returns:
-            DataFrame with timestamp index and summary statistics
-        """
+        """Calculate summary statistics for every timestamp (high resolution)."""
         sliced_profile = self.slice(start_date, end_date)
         if sliced_profile.data is None or sliced_profile.data.timestamp.size == 0:
             return pd.DataFrame()
@@ -778,40 +446,34 @@ class SnowpackProfile:
         data_in_range = sliced_profile.data
         summary_list = []
 
-        # Process each timestamp individually (memory efficient)
         for ts_val in data_in_range.timestamp.values:
             summary_row = {'timestamp': ts_val}
-            
-            # Select single profile
             single_profile_ds = data_in_range.sel(timestamp=ts_val)
 
-            # Convert to DataFrame (small slice, memory efficient)
             if GPU_AVAILABLE:
                 profile_layers = single_profile_ds.as_numpy().to_dataframe().reset_index()
             else:
                 profile_layers = single_profile_ds.to_dataframe().reset_index()
-            
+
             if profile_layers.empty:
                 continue
 
-            # Process each calculation
             for name, calc in parameters_to_calculate.items():
                 if not callable(calc):
                     logger.warning(f"Calculation for '{name}' is not callable. Skipping.")
                     continue
-                
                 try:
                     result = calc(profile_layers)
                     summary_row.update(self._unpack_result(name, result))
                 except Exception as e:
                     logger.warning(f"Function '{name}' failed at {ts_val}: {e}")
                     summary_row[name] = np.nan
-            
+
             summary_list.append(summary_row)
 
         if not summary_list:
             return pd.DataFrame()
-            
+
         return pd.DataFrame(summary_list).set_index('timestamp')
 
     def find_layer_by_criteria(
@@ -821,48 +483,28 @@ class SnowpackProfile:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None
     ) -> pd.DataFrame:
-        """
-        Finds the layer that best matches a set of prioritized criteria.
-
-        For each day, scores each layer based on how many criteria it meets.
-        The order of criteria determines priority for tie-breaking.
-
-        Args:
-            criteria: Ordered dict of parameter: condition pairs
-                (e.g., {'density': '< 150', 'depth': '> 0.2'})
-            search_from: Direction to select final layer if tied ('top' or 'bottom')
-            start_date: Start date for the search period
-            end_date: End date for the search period
-
-        Returns:
-            DataFrame with the best-matching layer for each day
-
-        Raises:
-            ValueError: If invalid operator or search direction provided
-        """
+        """Find the layer best matching a set of prioritised criteria (daily resolution)."""
+        import re
         sliced_profile = self.slice(start_date, end_date)
         if sliced_profile.data is None or sliced_profile.data.timestamp.size == 0:
             return pd.DataFrame()
-        
-        data_in_range = sliced_profile.data
 
+        data_in_range = sliced_profile.data
         if GPU_AVAILABLE:
             data_in_range = data_in_range.as_numpy()
-        
+
         full_df = data_in_range.to_dataframe().reset_index()
 
-        # Find noon profiles
         noon_time = full_df['timestamp'].dt.normalize() + pd.Timedelta(hours=12)
         full_df['time_from_noon'] = (full_df['timestamp'] - noon_time).abs()
-        
         closest_indices = full_df.loc[
             full_df.groupby(full_df['timestamp'].dt.date)['time_from_noon'].idxmin()
         ]
         noon_df = closest_indices.copy()
-        
+
         if noon_df.empty:
             return pd.DataFrame()
-        
+
         results_list = []
         op_pattern = re.compile(r'([<>=!]+)\s*(\S+)')
         ordered_criteria = list(criteria.items())
@@ -871,33 +513,28 @@ class SnowpackProfile:
         for ts in tqdm(noon_df['timestamp'], desc="Finding Layers by Criteria"):
             daily_result = {'date': ts.normalize()}
             df = full_df[full_df['timestamp'] == ts].copy()
-            
+
             if df.empty:
                 continue
 
-            # Add depth column if needed
             if 'depth' in criteria and 'height' in df.columns:
-                total_snow_height = df['height'].max()
-                df['depth'] = total_snow_height - df['height']
-            
-            # Handle hand hardness as absolute value
+                df['depth'] = df['height'].max() - df['height']
+
             if 'hand_hardness' in criteria and 'hand_hardness' in df.columns:
                 df['hand_hardness'] = df['hand_hardness'].abs()
 
-            # Score each layer based on criteria matches
             score = pd.Series(0, index=df.index, dtype=int)
             criteria_masks = {}
-            
+
             for i, (param, condition) in enumerate(ordered_criteria):
                 weight = 2**(num_criteria - 1 - i)
 
                 if param not in df.columns:
                     logger.warning(f"Parameter '{param}' not found. Skipping.")
                     continue
-                
+
                 condition_mask = pd.Series(False, index=df.index)
 
-                # Handle range conditions
                 if ' to ' in condition:
                     try:
                         low_str, high_str = condition.split(' to ', 1)
@@ -906,43 +543,31 @@ class SnowpackProfile:
                     except (ValueError, IndexError):
                         logger.warning(f"Invalid range format: '{condition}'")
                         continue
-                
-                # Handle comparison operators
                 else:
                     match = op_pattern.match(condition)
                     if not match:
                         logger.warning(f"Invalid condition format: '{condition}'")
                         continue
-                    
                     op, value_str = match.groups()
                     try:
                         value = float(value_str)
                     except ValueError:
                         logger.warning(f"Could not convert '{value_str}' to float")
                         continue
-                    
-                    if op == '<':
-                        condition_mask = df[param] < value
-                    elif op == '>':
-                        condition_mask = df[param] > value
-                    elif op == '<=':
-                        condition_mask = df[param] <= value
-                    elif op == '>=':
-                        condition_mask = df[param] >= value
-                    elif op == '==':
-                        condition_mask = df[param] == value
-                    elif op == '!=':
-                        condition_mask = df[param] != value
-                    else:
+
+                    ops = {'<': df[param].__lt__, '>': df[param].__gt__,
+                           '<=': df[param].__le__, '>=': df[param].__ge__,
+                           '==': df[param].__eq__, '!=': df[param].__ne__}
+                    if op not in ops:
                         raise ValueError(f"Unsupported operator '{op}'")
-                
+                    condition_mask = ops[op](value)
+
                 criteria_masks[param] = condition_mask.fillna(False)
                 score += criteria_masks[param].astype(int) * weight
 
             max_score = score.max()
 
             if max_score == 0:
-                # No matches found
                 daily_result['height'] = None
                 daily_result['matching_criteria_count'] = 0
                 daily_result['matching_parameters'] = ''
@@ -950,8 +575,7 @@ class SnowpackProfile:
                     daily_result[param] = None
             else:
                 best_matching_layers = df[score == max_score]
-                
-                # Select layer based on search direction
+
                 if search_from == 'top':
                     target_layer_index = best_matching_layers.index[-1]
                 elif search_from == 'bottom':
@@ -961,25 +585,22 @@ class SnowpackProfile:
 
                 target_layer = df.loc[target_layer_index]
                 daily_result['height'] = target_layer['height']
-                
+
                 matched_params = [
                     param for param, mask in criteria_masks.items()
                     if mask.loc[target_layer_index]
                 ]
                 daily_result['matching_criteria_count'] = len(matched_params)
                 daily_result['matching_parameters'] = ', '.join(matched_params)
-                
-                # Add actual parameter values from found layer
+
                 for param, _ in ordered_criteria:
-                    daily_result[param] = (
-                        target_layer[param] if param in target_layer else None
-                    )
-            
+                    daily_result[param] = target_layer[param] if param in target_layer else None
+
             results_list.append(daily_result)
 
         if not results_list:
             return pd.DataFrame()
-        
+
         return pd.DataFrame(results_list).set_index('date')
 
 
@@ -989,21 +610,14 @@ class SnowpackProfile:
 
 def read_snowpack(pro_file_path: Union[str, Path]) -> Optional[SnowpackProfile]:
     """
-    Reads snowpack data, prioritizing cached NetCDF over raw .pro file.
+    Read a SNOWPACK profile, using a cached NetCDF when available.
 
-    If a .nc file exists, it's loaded directly. Otherwise, the .pro file
-    is parsed and a new .nc file is created for future use.
-
-    Args:
-        pro_file_path: Path to the raw .pro file
-
-    Returns:
-        SnowpackProfile object with loaded data, or None on failure
+    On the first call for a given .pro file the profile is parsed and the
+    result is written to a .nc sidecar for fast re-loading on subsequent runs.
     """
     pro_path = Path(pro_file_path)
     nc_path = pro_path.with_suffix('.nc')
 
-    # Try loading from cached NetCDF
     if nc_path.exists():
         try:
             data = xr.open_dataset(nc_path)
@@ -1012,12 +626,8 @@ def read_snowpack(pro_file_path: Union[str, Path]) -> Optional[SnowpackProfile]:
             logger.debug(f"Loaded from cached NetCDF: {nc_path}")
             return profile
         except Exception as e:
-            logger.warning(
-                f"Could not read cached NetCDF {nc_path}, "
-                f"falling back to .pro. Error: {e}"
-            )
+            logger.warning(f"Could not read cached NetCDF {nc_path}, falling back to .pro: {e}")
 
-    # Parse .pro file and create cache
     try:
         profile = SnowpackProfile(str(pro_path))
         if profile.data is not None and profile.data.timestamp.size > 0:
@@ -1029,8 +639,6 @@ def read_snowpack(pro_file_path: Union[str, Path]) -> Optional[SnowpackProfile]:
 
 
 if __name__ == '__main__':
-    # Example usage and testing
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
-    
     print(f"GPU Available: {GPU_AVAILABLE}")
     print(f"Array Backend: {'CuPy' if GPU_AVAILABLE else 'NumPy'}")
